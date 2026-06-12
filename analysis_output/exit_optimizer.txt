@@ -1,0 +1,84 @@
+==============================================================================
+  EXIT OPTIMIZER  (entry @ 10:00, time-stop = original ExitDate close)
+==============================================================================
+  Full-path trades: 922
+  Baseline (no stop / no TP / no trail): EV $3.21/trade, total $2,951, win 50.5%
+
+  [A] HARD STOP only (no TP, no trail)
+      Stop          EV $    Win %    Total $  % stopped
+      -------------------------------------------------
+      none          3.21     50.5       2951        0.0
+      0.5%          1.41      9.4       1294       90.6
+      0.75%         1.19     13.2       1094       86.8
+      1%            0.29     16.9        269       82.8
+      1.5%         -0.04     23.5        -38       75.4
+      2%           -0.89     28.9       -820       68.5
+      3%           -3.05     37.7      -2803       56.2
+      5%           -0.61     46.6       -561       31.6
+      8%            2.26     50.2       2077       11.0
+
+  [B] TAKE PROFIT only (no stop, no trail)
+      TP            EV $    Win %    Total $   % hit TP
+      -------------------------------------------------
+      none          3.21     50.5       2951        0.0
+      3%           -0.88     61.1       -812       53.8
+      5%           -0.89     53.2       -816       34.6
+      8%            1.84     50.9       1690       18.5
+      12%           3.36     50.5       3084        8.5
+      20%           3.33     50.5       3061        1.7
+
+  [C] TRAILING STOP only (no hard stop, no TP)
+      Trail         EV $    Win %    Total $  % trailed
+      -------------------------------------------------
+      none          3.21     50.5       2951        0.0
+      3%           -2.91     36.5      -2674       91.1
+      5%           -4.01     41.2      -3683       63.0
+      8%            0.73     48.6        671       21.0
+      12%           2.57     50.4       2355        4.4
+
+  [D] TOP 12 COMBOS by EV/trade  (caveat: in-sample maxima are noisy)
+      Stop   TP     Trail       EV $   Win %    Total $   %stop    %tp   %cls
+      -----------------------------------------------------------------------
+      nan%   12%    nan%        3.36    50.5       3084     0.0    8.5   91.5
+      nan%   20%    nan%        3.33    50.5       3061     0.0    1.7   98.3
+      nan%   nan%   nan%        3.21    50.5       2951     0.0    0.0  100.0
+      nan%   12%    12%         2.75    50.5       2522     3.9    8.5   87.6
+      nan%   20%    12%         2.70    50.4       2476     4.2    1.7   94.0
+      nan%   nan%   12%         2.57    50.4       2355     4.4    0.0   95.6
+      8%     12%    nan%        2.41    50.2       2210    11.0    8.5   80.5
+      8%     20%    nan%        2.38    50.2       2187    11.0    1.7   87.3
+      8%     12%    12%         2.34    50.2       2151    11.4    8.5   80.1
+      8%     20%    12%         2.29    50.1       2105    11.8    1.7   86.5
+      8%     nan%   nan%        2.26    50.2       2077    11.0    0.0   89.0
+      8%     nan%   12%         2.16    50.1       1985    11.9    0.0   88.1
+
+  [E] OUT-OF-SAMPLE CHECK  (pick best on earlier 60%, score on later 40%)
+      Train n=553 (<= 2026-01-13),  Test n=369
+      Best-on-train combo : stop nan%, TP nan%, trail nan%
+                                TRAIN EV     TEST EV
+      no exits (baseline)           9.67       -6.48
+      best combo                    9.67       -6.48
+      => OOS verdict: does NOT beat baseline OOS
+
+  [F] YOUR SETUP: hard catastrophe stop + trailing stop (no TP)
+      Trail can be profit-ARMED: it only engages once the trade is up 'ArmAt'%, so
+      the hard stop covers the downside and the trail locks gains without bailing early.
+      HardStop ArmAt  Trail       EV $   Win %    Total $  %trail  %hard   %cls
+      -----------------------------------------------------------------------
+      12%      2%     12%         2.80    50.4       2567     2.3    1.4   96.3
+      12%      3%     8%          2.74    49.6       2514     8.1    1.7   90.2
+      12%      3%     12%         2.70    50.4       2475     2.0    1.7   96.3
+      12%      5%     12%         2.64    50.4       2423     1.0    2.1   96.9
+      12%      entry  12%         2.57    50.4       2355     4.4    0.0   95.6
+      10%      3%     8%          2.40    49.6       2204     8.1    4.9   87.0
+      10%      5%     12%         2.39    50.4       2191     1.0    5.6   93.5
+      10%      entry  12%         2.37    50.4       2173     2.3    4.6   93.1
+      10%      2%     12%         2.37    50.4       2173     2.3    4.6   93.1
+      10%      3%     12%         2.36    50.4       2165     2.0    4.9   93.1
+      (ride-to-close baseline EV $3.21/trade for reference)
+      Best [F]: hard 12%, arm 2%, trail 12%  ->  train EV 9.15 | test EV -6.75 (vs no-exit test -6.48)
+
+  NOTE: levels assume a fill at the level (gap-throughs filled at bar open). Trailing
+  references the prior-bar high. Treat [D] maxima with suspicion; trust [A]-[C] shapes,
+  the [F] config search, and the [E]/[F] out-of-sample results.
+==============================================================================

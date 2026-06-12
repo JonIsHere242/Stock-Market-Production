@@ -13,7 +13,7 @@ import ib_insync as ibi
 import numpy as np
 import pandas as pd
 
-from Util import read_signals, get_logger, PositionSizer
+from Util import get_logger, PositionSizer
 
 # ── Entry filter thresholds — derived from EDA_IntradayEntry.ipynb ────────────
 # N = 1,231 signal-day observations, all exit at close.
@@ -36,9 +36,23 @@ SPY_STRONG_THRESHOLD=  0.5    # Log "strong market" if SPY > +0.5%
 STOCK_GAP_SKIP      =  1.5    # Skip stock if it gapped up > 1.5% from open
 STOCK_DIP_GOOD_LO   = -1.5    # Favorable dip-entry band lower bound
 STOCK_DIP_GOOD_HI   = -0.5    # Favorable dip-entry band upper bound
-HARD_STOP_PCT       =  0.5    # Hard stop-loss: exit immediately if stock drops this % from entry
+HARD_STOP_PCT       =  1.9    # Hard stop-loss % from entry. 2026-06-10: raised 0.5 -> 1.9 to
+                              # MATCH the validated backtest (~2% stop), slightly tighter. The old
+                              # 0.5% was effectively a different strategy: a ~2%-daily-vol name
+                              # entered at 10:00 has a 60-80% chance of touching -0.5% before the
+                              # close even on green days, so it exited most trades on noise — the
+                              # backtest win-rate/expectancy never described that system.
 
 SLIPPAGE_LOG = os.path.join(os.path.dirname(__file__), "Data", "slippage_log.csv")
+
+# Final narrowed book the broker trades. This is the post-FilterRubric shortlist
+# (≤4 names), written in the 0__signals rich schema. Replaces the legacy
+# read_signals() -> Z_signals.parquet path.
+BUY_SIGNALS_FILE = os.path.join(os.path.dirname(__file__), "_Buy_Signals.parquet")
+# Fail-safe: the broker only trades a NARROWED book. If _Buy_Signals.parquet has no
+# Status column (looks like the raw ledger) or more than MAX_BOOK pending rows (not
+# narrowed), the broker refuses to place any orders.
+MAX_BOOK = 12
 
 ET = ZoneInfo('America/New_York')
 
@@ -61,7 +75,10 @@ class AsyncFastExecutor:
 
         self.position_sizer = PositionSizer(
             cash_buffer_pct=10.0,
-            max_positions=5
+            max_positions=10  # 5->8->10 (2026-06-08): matches the 10-name book
+                              # (MacroFilter TARGET_BOOK_SIZE=10). 90% working capital /10
+                              # = ~9% per name. Joint seed x config x book grid: k10 most
+                              # robust marginally (lowest variance / best worst-case).
         )
 
         self.account_value    = 0.0
@@ -250,9 +267,10 @@ class AsyncFastExecutor:
     def _calculate_dynamic_trail(self, price, atr_fallback=None):
         atr = atr_fallback if atr_fallback and atr_fallback > 0 else (price * 0.02)
         atr_percent = (atr / price) * 100
-        # Floor at 1.2% (vs 1.5% in backtest) and cap at 4.0% (vs 5.0%) — intentionally
-        # tighter than the backtester to give back less from peak in live trading.
-        trailing_percent = max(1.2, 0.75 * atr_percent)
+        # 2026-06-10: floor raised 1.2% -> 1.5% to MATCH the backtest trail floor (was
+        # intentionally tighter; now aligned with the validated params). Cap stays 4.0%
+        # (vs the backtest's 5.0%) — still "closer but a touch more restrictive".
+        trailing_percent = max(1.5, 0.75 * atr_percent)
         return min(trailing_percent, 4.0)
 
     # ── Step 3 + 4: Execute with entry filters ─────────────────────────────────
@@ -274,9 +292,35 @@ class AsyncFastExecutor:
         (plain LMT at ask) to ~2–5 bps on typical S&P 500 names.
         limit_price is a ceiling/safety cap, not the expected fill price.
         """
-        signals_df = read_signals(status_filter="Pending")
+        # Read the final narrowed book from _Buy_Signals.parquet (not the legacy
+        # Z_signals.parquet that read_signals() points at). Filter to Pending if the
+        # column is present; the post-rubric file may omit it.
+        if not os.path.exists(BUY_SIGNALS_FILE):
+            self.logger.info(f"Signals file {BUY_SIGNALS_FILE} not found.")
+            return
+        signals_df = pd.read_parquet(BUY_SIGNALS_FILE)
+
+        # ── Fail-safe: only ever trade a NARROWED book ────────────────────────────
+        # If the file has no Status column it's the raw backtester ledger, not a
+        # post-rubric shortlist — refuse. If it has more than MAX_BOOK pending rows
+        # it hasn't been narrowed — refuse. Either way, place NO orders rather than
+        # fire at an un-narrowed / wrong file.
+        if 'Status' not in signals_df.columns:
+            self.logger.error(
+                f"ABORT: {BUY_SIGNALS_FILE} has no 'Status' column — looks like the raw "
+                f"trading ledger, not a narrowed book. No orders placed. "
+                f"Run the morning narrowing step first."
+            )
+            return
+        signals_df = signals_df[signals_df['Status'] == 'Pending']
+        if len(signals_df) > MAX_BOOK:
+            self.logger.error(
+                f"ABORT: {len(signals_df)} pending signals in {BUY_SIGNALS_FILE} exceeds "
+                f"MAX_BOOK={MAX_BOOK} — file has not been narrowed. No orders placed."
+            )
+            return
         if signals_df.empty:
-            self.logger.info("No pending signals found in parquet.")
+            self.logger.info("No pending signals found in _Buy_Signals.parquet.")
             return
 
         symbols = signals_df['Symbol'].unique().tolist()
@@ -426,19 +470,15 @@ class AsyncFastExecutor:
                 transmit=False
             )
 
-            trail_stop_ord = ibi.Order(
-                orderId=stop_id,
-                action='SELL',
-                totalQuantity=size,
-                orderType='TRAIL',
-                trailingPercent=trail_pct,
-                tif='GTC',
-                outsideRth=True,
-                parentId=parent_id,
-                ocaGroup=oca_group,
-                ocaType=1,
-                transmit=False
-            )
+            # ── STAGE-2 (2026-06-12): TRAILING STOP REMOVED ──────────────────────
+            # The 5-min intraday replay + the full strategy exit-sweep BOTH found the
+            # trailing stop was the whipsaw culprit: with the trail, 68% of trades stop
+            # out (34% on the trail alone) for -0.05%/trade; dropping it -> 55% stop-outs,
+            # +0.06%/trade, and the strategy backtest jumps 154%->182% ann at HALF the max
+            # drawdown (22.7%->12.2%, ret/DD 6.8->14.9). Bracket is now TP + hard-stop only.
+            # To re-enable: restore a TRAIL ibi.Order(orderType='TRAIL', trailingPercent=
+            # trail_pct, ... ocaGroup=oca_group, transmit=False) and re-add it to the
+            # orders_staged list below. See STAGE2_VERDICT.md.
 
             # Hard stop: fires immediately if price falls HARD_STOP_PCT% from entry.
             # Sits inside the same OCA group — whichever of TP / trail / hard-stop
@@ -463,9 +503,9 @@ class AsyncFastExecutor:
             self.logger.info(
                 f"[{symbol}] Staging: Buy {size} @ lmt=${limit_price:.2f} (mid=${mid:.2f}) | "
                 f"HardStop: ${hard_stop_price:.2f} ({HARD_STOP_PCT}%) | "
-                f"Trail: {trail_pct:.2f}% | TP: ${take_profit:.2f} | OCA: {oca_group}{spy_tag}"
+                f"TP: ${take_profit:.2f} | trail=OFF | OCA: {oca_group}{spy_tag}"
             )
-            orders_staged.append((contract, [parent, take_profit_ord, trail_stop_ord, hard_stop_ord]))
+            orders_staged.append((contract, [parent, take_profit_ord, hard_stop_ord]))
 
         if orders_staged:
             self.logger.info(f"Transmitting {len(orders_staged)} brackets to exchange...")
@@ -506,7 +546,7 @@ class AsyncFastExecutor:
             self.logger.info(f"Batch Execution Time: {duration:.4f}s")
 
             # Keep alive briefly to ensure transmission confirmation
-            await asyncio.sleep(2)
+            await asyncio.sleep(10)
 
         except Exception as e:
             self.logger.error(f"Runtime Error: {e}")

@@ -1,0 +1,12 @@
+# momentum_score -> expand3  (sep 0.022 -> 0.051, redund 0.34)
+# expand3: custom
+# momentum_score -> expand5  (sep 0.022 -> 0.050, redund 0.32)
+df['momentum_score__expand5'] = df['momentum_score'] / (df['momentum_score'].shift(1).rolling(5, min_periods=2).mean().abs() + 1e-9)
+# Mean_Reversion_Z_Score_151_std_3 -> accel  (sep 0.027 -> 0.046, redund 0.15)
+# accel: custom
+# trading_signal_composite -> expand3  (sep 0.033 -> 0.051, redund 0.37)
+# expand3: custom
+# trading_signal_composite -> expand5  (sep 0.033 -> 0.050, redund 0.37)
+df['trading_signal_composite__expand5'] = df['trading_signal_composite'] / (df['trading_signal_composite'].shift(1).rolling(5, min_periods=2).mean().abs() + 1e-9)
+# low_close_ratio -> over_close  (sep 0.039 -> 0.046, redund 0.60)
+df['low_close_ratio__over_close'] = df['low_close_ratio'] / (df['Close'].abs() + 1e-9)

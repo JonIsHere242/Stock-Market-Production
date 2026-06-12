@@ -1,0 +1,10 @@
+STOP SWEEP (full universe, sample 100; hard/trail in %, 100=off; no take-profit)
+hard100/trail100 ret=  344.31  sharpe= 3.30  sortino=12.17  maxDD= 22.35  win=59.28  trades= 307  stopexits=   0  medHold=4.0  
+hard100/trail2   ret=  462.42  sharpe= 3.92  sortino=19.42  maxDD= 22.57  win=55.67  trades= 379  stopexits= 261  medHold=4.0  
+hard100/trail3   ret=  403.61  sharpe= 3.56  sortino=15.73  maxDD= 14.83  win=55.49  trades= 355  stopexits= 197  medHold=4.0  
+hard100/trail5   ret=  622.37  sharpe= 4.32  sortino=23.46  maxDD= 16.95  win=60.31  trades= 325  stopexits=  90  medHold=4.0  
+hard100/trail8   ret=  383.76  sharpe= 3.55  sortino=14.53  maxDD= 17.80  win=58.06  trades= 310  stopexits=  31  medHold=4.0  
+hard100/trail12  ret=  405.69  sharpe= 3.57  sortino=14.70  maxDD= 22.28  win=59.34  trades= 305  stopexits=   3  medHold=4.0  
+hard8/trail100   ret=  436.53  sharpe= 3.65  sortino=15.40  maxDD= 22.34  win=59.54  trades= 304  stopexits=  12  medHold=4.5  
+hard15/trail100  ret=  344.31  sharpe= 3.30  sortino=12.17  maxDD= 22.35  win=59.28  trades= 307  stopexits=   2  medHold=4.0  
+=== STOP SWEEP DONE ===

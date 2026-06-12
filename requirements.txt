@@ -1,0 +1,69 @@
+# =============================================================================
+#  Stock-Market — curated core requirements
+# =============================================================================
+#  These are the third-party packages the codebase actually imports, pinned to
+#  the versions currently known-good in the stock_env venv (Python 3.13).
+#
+#  DO NOT `pip install -r` this file by itself for a full setup — two things are
+#  handled separately by setup.ps1 because they are platform-/source-specific:
+#
+#    * torch         -> installed from the correct CPU or CUDA wheel index
+#                       (auto-detected). transformers below pulls no torch on
+#                       its own, so the bare wheel is chosen for your machine.
+#    * backtrader    -> installed from pinned git commits (see bottom of file).
+#
+#  Run  .\setup.ps1  to get a complete, working environment.
+# =============================================================================
+
+# --- core data / numerics ----------------------------------------------------
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.16.0
+pyarrow==21.0.0
+numba==0.61.2
+joblib==1.5.1
+
+# --- machine learning --------------------------------------------------------
+scikit-learn==1.7.1
+xgboost==3.0.2
+optuna==4.4.0
+transformers==4.53.3          # sentiment model in 5__NightlyBackTester (lazy); needs torch (see setup.ps1)
+
+# --- market data / calendars -------------------------------------------------
+yfinance==0.2.65
+finvizfinance==1.2.0
+exchange-calendars==4.11
+pandas-market-calendars==5.1.1
+ib-insync==0.9.86             # Interactive Brokers live/exec (9_SuperFastBroker, Util)
+
+# --- signal processing / graph features --------------------------------------
+pykalman==0.10.1
+networkx==3.5
+ts2vg==1.2.4
+
+# --- plotting / dashboards ---------------------------------------------------
+matplotlib==3.10.3
+seaborn==0.13.2
+plotly==6.2.0
+streamlit==1.58.0             # dashboard_panel.py
+
+# --- utilities / IO ----------------------------------------------------------
+requests==2.32.4
+tqdm==4.67.1
+xmltodict==0.14.2
+watchdog==6.0.0
+nest-asyncio==1.6.0
+pyperclip==1.9.0
+pywin32==311                  # win32clipboard — Windows only
+anthropic==0.75.0             # 7__MacroFilter (LLM macro overlay)
+
+# =============================================================================
+#  Handled by setup.ps1 — listed here for reference only (do not uncomment
+#  unless you know which variant your machine needs):
+#
+#    torch                      # CPU:  --index-url https://download.pytorch.org/whl/cpu
+#                               # CUDA: --index-url https://download.pytorch.org/whl/cu118
+#
+#    backtrader @ git+https://github.com/mementum/backtrader.git@b853d7c90b6721476eb5a5ea3135224e33db1f14
+#    backtrader_ib_insync @ git+https://github.com/ultra1971/backtrader_ib_insync@20a450a1908a6866e0529d5bde4bbe52b576babf
+# =============================================================================

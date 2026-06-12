@@ -1,0 +1,55 @@
+==================================================================================================
+FILTER STACKING & INDEPENDENCE  -  new ensemble trades
+==================================================================================================
+Covered trades: 240.  Gate 'at minute t' -> decide on bar t, fill bar t+1 open.
+
+--- BASELINE: take ALL, market in ~minute 5 ---
+  EV/trade=1.447%  win=57.9%  n=240
+
+--- 1) VWAP gate sweep (above session VWAP at minute t) ---
+  gate                      n  cov%       EV%   win%    PF  Sharpe
+  vwap_2min               100    42     1.161   57.0  1.68    3.17
+  vwap_3min               111    46     1.108   55.0  1.56    2.49
+  vwap_5min               104    43     0.543   52.9  1.25    1.39
+  vwap_7min               119    50     2.332   66.4  2.46    4.82  >EV
+  vwap_10min              104    43     1.397   62.5  1.75    3.34
+  vwap_15min              125    52     1.676   53.6  1.86    3.35  >EV
+  vwap_30min              116    48     1.675   56.9  1.92    3.78  >EV
+
+--- 2) red gate sweep (not below open at minute t) ---
+  gate                      n  cov%       EV%   win%    PF  Sharpe
+  red_2min                140    58     1.743   60.7  1.99    3.80  >EV
+  red_3min                140    58     0.999   56.4  1.50    2.45
+  red_5min                140    58     0.945   54.3  1.45    2.29
+  red_7min                140    58     1.400   57.1  1.71    3.02
+  red_10min               138    57     1.266   58.7  1.65    2.88
+  red_15min               136    57     1.311   57.4  1.68    3.19
+  red_30min               141    59     1.128   54.6  1.66    3.09
+
+==================================================================================================
+3) INDEPENDENCE: red_2min  vs  vwap_7min  (do they catch the SAME trades?)
+==================================================================================================
+  P(red passes)            = 0.583
+  P(vwap passes)           = 0.496
+  P(both pass)             = 0.267
+  If INDEPENDENT, P(both)  = 0.289   (P(red)*P(vwap))
+  ratio P(both)/indep      = 0.92   (~1 = independent, >1 = redundant/catch same, <1 = complementary)
+  correlation (phi)        = -0.09
+
+--- 4) STACK: red_2min AND vwap_t  (take only if BOTH pass) ---
+  gate                      n  cov%       EV%   win%    PF  Sharpe
+  red_2 alone             140    58     1.743   60.7  1.99    3.80
+  red2+vwap_2              69    29     1.001   59.4  1.56    2.74  +EV-0.74 vs best-alone
+  red2+vwap_3              68    28     1.430   58.8  1.73    2.98  +EV-0.31 vs best-alone
+  red2+vwap_5              58    24     0.347   56.9  1.14    0.82  +EV-1.40 vs best-alone
+  red2+vwap_7              64    27     2.468   70.3  2.68    5.00  +EV+0.14 vs best-alone
+  red2+vwap_10             64    27     2.308   71.9  3.04    6.90  +EV+0.56 vs best-alone
+  red2+vwap_15             71    30     2.310   59.2  2.34    4.34  +EV+0.57 vs best-alone
+  red2+vwap_30             67    28     1.671   58.2  1.85    3.67  +EV-0.07 vs best-alone
+
+READ THE STACK: if 'red+vwap' EV > BOTH components' EV, the filters are COMPLEMENTARY
+(catch different bad trades) -> stacking adds real edge. If EV ~ the better component but
+coverage drops, they're REDUNDANT -> stacking just starves the book. The independence
+ratio above predicts which: ~1 independent (stack helps), >>1 redundant (stack wastes).
+Caveat: ~240 trades, many cells -> trust consistent patterns, confirm on a 2nd trade set.
+==================================================================================================

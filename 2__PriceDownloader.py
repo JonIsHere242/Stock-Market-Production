@@ -35,6 +35,7 @@ RF_PREDICTIONS_DIRECTORY = os.path.join(BASE_DIRECTORY, 'Data', 'RFpredictions')
 LOG_DIRECTORY = os.path.join(BASE_DIRECTORY, 'Data', 'logging')
 TICKERS_CIK_DIRECTORY = os.path.join(BASE_DIRECTORY, 'Data', 'TickerCikData')
 PROGRESS_FILE = os.path.join(LOG_DIRECTORY, 'download_progress.json')
+INVALID_TICKERS_FILE = os.path.join(LOG_DIRECTORY, 'invalid_tickers.json')
 
 DAILY_BAR_SIZE = '1 day'
 DEFAULT_BATCH_SIZE = 8
@@ -49,7 +50,7 @@ os.makedirs(LOG_DIRECTORY, exist_ok=True)
 os.makedirs(RF_PREDICTIONS_DIRECTORY, exist_ok=True) 
 
 class ConnectionPool:
-    def __init__(self, host='127.0.0.1', port=7497, max_connections=CONNECTION_POOL_SIZE):
+    def __init__(self, host='127.0.0.1', port=7496, max_connections=CONNECTION_POOL_SIZE):
         self.host = host
         self.port = port
         self.max_connections = max_connections
@@ -137,7 +138,7 @@ class ConnectionPool:
         except Exception as e:
             self.connections_failed += 1
             self.consecutive_failures += 1
-            error_msg = str(e)
+            error_msg = str(e) or repr(e) or type(e).__name__
             logger.error(f"Failed to create connection {tag}: {error_msg}")
             tqdm.write(f"✗ Failed to create connection {tag}: {error_msg}")
             
@@ -524,6 +525,33 @@ def load_progress():
         logger.error(f"Could not load progress file: {str(e)}")
         return [], []
 
+def load_invalid_tickers():
+    if not os.path.exists(INVALID_TICKERS_FILE):
+        return set()
+    try:
+        with open(INVALID_TICKERS_FILE, 'r') as f:
+            data = json.load(f)
+        return set(data.get('tickers', []))
+    except Exception:
+        return set()
+
+def save_invalid_ticker(ticker):
+    try:
+        existing = load_invalid_tickers()
+        existing.add(ticker)
+        with open(INVALID_TICKERS_FILE, 'w') as f:
+            json.dump({'tickers': sorted(existing), 'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving invalid ticker {ticker}: {e}")
+
+_invalid_tickers_cache = None
+
+def get_invalid_tickers():
+    global _invalid_tickers_cache
+    if _invalid_tickers_cache is None:
+        _invalid_tickers_cache = load_invalid_tickers()
+    return _invalid_tickers_cache
+
 def find_latest_ticker_cik_file(directory):
     files = glob.glob(os.path.join(directory, 'TickerCIKs_*.parquet'))
     if not files:
@@ -560,7 +588,10 @@ async def process_ticker_incremental(ticker, data_directory, use_rth=True, max_r
     if not ticker or not isinstance(ticker, str):
         logger.error(f"Invalid ticker: {ticker}")
         return False
-    
+
+    if ticker in get_invalid_tickers():
+        return None  # known-bad, skip silently
+
     retry_count = 0
     success = False
     connection_established = False
@@ -585,10 +616,12 @@ async def process_ticker_incremental(ticker, data_directory, use_rth=True, max_r
                 use_rth=use_rth
             )
             
-            if fail_reason == "SECURITY_NOT_FOUND":
+            if fail_reason in ("SECURITY_NOT_FOUND", "No contract details found"):
                 logger.info(f"{ticker}: Security not found in IBKR")
+                save_invalid_ticker(ticker)
+                get_invalid_tickers().add(ticker)
                 await connection_pool.release_connection(tag, ib)
-                return False
+                return None  # not a failure, just not available on IBKR
             
             if fail_reason == "UP_TO_DATE":
                 success = True
@@ -632,63 +665,74 @@ async def process_ticker_incremental(ticker, data_directory, use_rth=True, max_r
 async def process_batch(tickers, data_directory, use_rth=True, pbar=None, semaphore=None):
     success_count = 0
     fail_count = 0
-    
+    not_found_count = 0
+
     async def process_with_semaphore(ticker):
         try:
             async with semaphore:
-                success = await process_ticker_incremental(
+                result = await process_ticker_incremental(
                     ticker=ticker,
                     data_directory=data_directory,
                     use_rth=use_rth
                 )
-                
+
                 if pbar:
                     pbar.update(1)
                     postfix_str = str(pbar.postfix) if hasattr(pbar, 'postfix') and pbar.postfix else ""
                     current_fails = 0
-                    if postfix_str and "failed=" in postfix_str:
+                    current_not_found = 0
+                    if postfix_str:
                         try:
-                            current_fails = int(postfix_str.split('failed=')[1].split(',')[0])
+                            if "err=" in postfix_str:
+                                current_fails = int(postfix_str.split('err=')[1].split(',')[0])
+                            if "n/a=" in postfix_str:
+                                current_not_found = int(postfix_str.split('n/a=')[1].split(',')[0])
                         except (IndexError, ValueError):
-                            current_fails = 0
-                    
-                    if not success:
+                            pass
+
+                    if result is False:
                         current_fails += 1
-                    success_rate = (pbar.n - current_fails) / pbar.n * 100 if pbar.n > 0 else 0
-                    pbar.set_postfix(failed=current_fails, success_rate=f"{success_rate:.1f}%", last=ticker)
-                
-                return success
+                    elif result is None:
+                        current_not_found += 1
+                    eligible = pbar.n - current_not_found
+                    success_rate = (eligible - current_fails) / eligible * 100 if eligible > 0 else 100.0
+                    pbar.set_postfix(err=current_fails, na=current_not_found,
+                                     ok=f"{success_rate:.1f}%", last=ticker)
+
+                return result
         except Exception as e:
             logger.error(f"Error processing ticker {ticker}: {str(e)}")
             if pbar:
                 pbar.update(1)
             return False
-    
+
     if semaphore is None:
         semaphore = asyncio.Semaphore(MAX_WORKERS_PER_BATCH)
-    
+
     tasks = []
     for ticker in tickers:
         if ticker:
             tasks.append(process_with_semaphore(ticker))
-    
+
     if not tasks:
-        return 0, 0
-        
+        return 0, 0, 0
+
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     for result in results:
         if isinstance(result, Exception):
             fail_count += 1
             logger.error(f"Task failed with exception: {result}")
         elif result is True:
             success_count += 1
+        elif result is None:
+            not_found_count += 1
         else:
             fail_count += 1
-    
-    return success_count, fail_count
 
-async def process_all_tickers(tickers, host='127.0.0.1', port=7497, batch_size=DEFAULT_BATCH_SIZE, 
+    return success_count, fail_count, not_found_count
+
+async def process_all_tickers(tickers, host='127.0.0.1', port=7496, batch_size=DEFAULT_BATCH_SIZE, 
                              use_rth=True, resume=False, max_workers=MAX_WORKERS_PER_BATCH):
     global connection_pool
     
@@ -708,7 +752,13 @@ async def process_all_tickers(tickers, host='127.0.0.1', port=7497, batch_size=D
     
     success_count = len(processed_tickers)
     fail_count = 0
+    not_found_count = 0
     total_count = len(tickers)
+
+    invalid_cached = get_invalid_tickers()
+    pre_skipped = sum(1 for t in remaining_tickers if t in invalid_cached)
+    if pre_skipped:
+        print(f"Skipping {pre_skipped} tickers known to be unavailable on IBKR (cached from previous runs)")
     
     print(f"Processing {len(remaining_tickers)} tickers in batches of {batch_size}")
     
@@ -737,16 +787,17 @@ async def process_all_tickers(tickers, host='127.0.0.1', port=7497, batch_size=D
             
             pbar.set_description(f"Batch {batch_num}/{total_batches}")
             
-            batch_success, batch_fail = await process_batch(
+            batch_success, batch_fail, batch_not_found = await process_batch(
                 tickers=batch,
                 data_directory=DATA_DIRECTORY,
                 use_rth=use_rth,
                 pbar=pbar,
                 semaphore=semaphore
             )
-            
+
             success_count += batch_success
             fail_count += batch_fail
+            not_found_count += batch_not_found
             
             batch_processed = [t for idx, t in enumerate(batch) if idx < batch_success]
             processed_tickers.extend(batch_processed)
@@ -775,10 +826,12 @@ async def process_all_tickers(tickers, host='127.0.0.1', port=7497, batch_size=D
     print("\n" + "="*80)
     print("DOWNLOAD COMPLETE")
     print("="*80)
-    print(f"Total processed: {success_count + fail_count} tickers")
-    success_rate = (success_count/(success_count+fail_count)*100) if (success_count+fail_count) > 0 else 0
-    print(f"Successful: {success_count} ({success_rate:.1f}%)")
-    print(f"Failed: {fail_count}")
+    eligible = success_count + fail_count
+    print(f"Total tickers: {success_count + fail_count + not_found_count}")
+    print(f"  Downloaded:    {success_count}")
+    success_rate = (success_count / eligible * 100) if eligible > 0 else 100.0
+    print(f"  Failed:        {fail_count}  (download success rate: {success_rate:.1f}%)")
+    print(f"  Not on IBKR:   {not_found_count}  (delisted/OTC — cached, won't be retried)")
     
     stats = connection_pool.get_stats()
     print("\nConnection pool stats:")
@@ -787,14 +840,14 @@ async def process_all_tickers(tickers, host='127.0.0.1', port=7497, batch_size=D
     print(f"Connections failed: {stats['connections_failed']}")
     print("="*80)
     
-    return success_count, fail_count, total_count
+    return success_count, fail_count, not_found_count, total_count
 
 
 
 def main(logger):
     parser = argparse.ArgumentParser(description='Download stock data from IBKR with incremental updates')
     
-    parser.add_argument('--port', type=int, default=7497, help='TWS/Gateway port (7497 for paper, 7496 for real)')
+    parser.add_argument('--port', type=int, default=7496, help='TWS/Gateway port (7497 for paper, 7496 for real)')
     parser.add_argument('--ticker', type=str, help='Single ticker symbol to process')
     parser.add_argument('--RefreshMode', action='store_true', help='Refresh existing data by appending the latest missing data')
     parser.add_argument('--ColdStart', action='store_true', help='Initial download of all tickers from the CIK file')
@@ -855,7 +908,8 @@ def main(logger):
 
     try:
         start_time = time.time()
-        
+        not_found_count = 0
+
         if len(tickers) == 1:
             print(f"Processing single ticker {tickers[0]}...")
             
@@ -925,7 +979,7 @@ def main(logger):
                     pass
         else:
             # Process multiple tickers
-            success_count, fail_count, total_count = asyncio.run(process_all_tickers(
+            success_count, fail_count, not_found_count, total_count = asyncio.run(process_all_tickers(
                 tickers=tickers,
                 host='127.0.0.1',
                 port=args.port,
@@ -942,10 +996,12 @@ def main(logger):
         print("DOWNLOAD SUMMARY")
         print("="*80)
         print(f"Process completed in {elapsed_time/60:.2f} minutes")
+        eligible = success_count + fail_count
         print(f"Total tickers: {total_count}")
-        print(f"Successfully processed: {success_count}")
-        print(f"Failed/Skipped: {fail_count}")
-        print(f"Success rate: {(success_count/total_count)*100:.2f}%")
+        print(f"  Downloaded:   {success_count}")
+        success_rate = (success_count / eligible * 100) if eligible > 0 else 100.0
+        print(f"  Failed:       {fail_count}  (download success rate: {success_rate:.2f}%)")
+        print(f"  Not on IBKR:  {not_found_count}  (delisted/OTC)")
         
         if success_count > 0:
             print(f"Data saved to {DATA_DIRECTORY}")

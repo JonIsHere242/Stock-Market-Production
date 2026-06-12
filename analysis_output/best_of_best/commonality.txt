@@ -1,0 +1,22 @@
+COMMONALITY among top-25 elite-vs-okay separators
+======================================================================
+
+Family tally (top separators):
+   9  matrix_power
+   7  other
+   2  price_differential
+   2  atr
+   1  trend
+   1  high_close
+   1  distance_to_level
+   1  volatility
+   1  momentum/return
+
+Correlation clusters (|corr|>=0.5 within the pool):
+  cluster 1 [matrix_power,other,price_differential,trend]: G_Price_Volatility_Trend_Measure, mp_d5_b39_sym_trace, G_Price_Differential_Analyzer, Price_Differential_Ratio, High_Low, intraday_range_pct, percent_range, low_close_ratio, mp_d4_b173_sym_top_left
+  cluster 2 [high_close,matrix_power,momentum/return,other]: mp_d4_b396_sym_trace, mp_d4_b65_sym_frob, F4_Price_Ratio, High_Close, mp_d4_b267_sym_trace, mp_d4_b291_sym_frob, mp_d4_b185_sym_trace, mp_d5_b108_sym_trace, Log_Return, mp_d4_b477_skew_trace
+  cluster 3 [atr]: atr_percentage, ATR%
+  cluster 4 [distance_to_level]: VWAP%_from_high
+  cluster 5 [other]: rapid_price_change_zscore
+  cluster 6 [volatility]: Realized_Vol_10d
+  cluster 7 [other]: information_rate_of_change

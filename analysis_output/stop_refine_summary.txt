@@ -1,0 +1,7 @@
+REFINE around peak (full universe, sample 100, hard off)
+hard100/trail4   ret=  367.86  sharpe= 3.37  sortino=13.58  maxDD= 18.09  win=56.72  trades= 335  stopexits= 136  medHold=4.0  
+hard100/trail4.5 ret=  524.06  sharpe= 3.97  sortino=20.17  maxDD= 21.78  win=58.41  trades= 327  stopexits= 106  medHold=4.0  
+hard100/trail5.5 ret=  420.99  sharpe= 3.89  sortino=17.39  maxDD= 16.93  win=59.06  trades= 320  stopexits=  69  medHold=4.0  
+hard100/trail6   ret=  447.64  sharpe= 3.87  sortino=17.28  maxDD= 17.52  win=58.18  trades= 318  stopexits=  56  medHold=4.0  
+hard100/trail7   ret=  430.23  sharpe= 3.68  sortino=15.88  maxDD= 24.40  win=58.10  trades= 315  stopexits=  45  medHold=4.0  
+=== REFINE DONE ===

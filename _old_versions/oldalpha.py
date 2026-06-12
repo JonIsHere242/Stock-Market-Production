@@ -1,0 +1,3057 @@
+#!/root/root/miniconda4/envs/tf/bin/python
+import os
+import pandas as pd
+import numpy as np
+import time
+import scipy.stats as stats
+from scipy.stats import linregress, entropy, gaussian_kde, skew, kurtosis
+import logging
+import argparse
+import traceback
+from pykalman import KalmanFilter
+from scipy.fft import fft, fftfreq
+from scipy.signal import find_peaks, argrelextrema, detrend
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from numba import njit, jit
+from tqdm import tqdm
+from datetime import datetime, timedelta
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import pandas as pd
+import yfinance as yf
+import os
+from datetime import datetime, timedelta
+import requests
+import random
+from ts2vg import NaturalVG
+import networkx as nx
+import asyncio
+from ib_insync import IB, Stock, util, Contract
+import warnings
+import math
+from scalene import scalene_profiler
+from functools import wraps
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+
+
+CONFIG = {
+    'input_directory': 'Data/PriceData',
+    'output_directory': 'Data/ProcessedData',
+    'index_temp_dir': 'Data/Indexes',  
+    'log_lines_to_read': 500,
+    'core_count_division': True,
+}
+
+GLOBAL_INDEX_DATA = {}
+
+
+
+INDEXES = {
+    'SPY': {
+        'name': 'S&P 500 ETF',
+        'secType': 'STK',
+        'exchange': 'SMART',
+        'primaryExchange': 'ARCA'
+    },
+    'QQQ': {
+        'name': 'Nasdaq 100 ETF',
+        'secType': 'STK',
+        'exchange': 'SMART',
+        'primaryExchange': 'NASDAQ'
+    },
+    'IWM': {
+        'name': 'Russell 2000 ETF',
+        'secType': 'STK',
+        'exchange': 'SMART',
+        'primaryExchange': 'ARCA'
+    },
+    'DIA': {
+        'name': 'Dow Jones ETF',
+        'secType': 'STK',
+        'exchange': 'SMART',
+        'primaryExchange': 'ARCA'
+    },
+    'VIX': {
+        'name': 'CBOE Volatility Index',
+        'secType': 'IND',
+        'exchange': 'CBOE',
+        'primaryExchange': None
+    },
+}
+
+
+def get_logger(script_name="Data/logging/3__Indicators"):
+    logger = logging.getLogger(script_name)
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    file_handler = logging.FileHandler(f"{script_name}.log")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    
+    return logger
+
+logger = get_logger()
+
+
+
+def time_it(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        duration = time.perf_counter() - start
+        logger.info(f"{func.__name__}: {duration:.3f}s")
+        return result
+    return wrapper
+
+
+def interpolate_columns(df, max_gap_fill=50, mark_interpolated=False):
+    """
+    LEAKAGE-PROOF VERSION: Uses ffill only. No linear/time interpolation.
+    """
+    df_result = df.copy()
+    
+    if mark_interpolated:
+        interpolation_mask = pd.DataFrame(False, index=df.index, columns=df.columns)
+    
+    for column in df.columns:
+        # Check if numeric
+        if not np.issubdtype(df[column].dtype, np.number):
+            continue
+            
+        # Identify missing values
+        missing_mask = df_result[column].isna()
+        
+        if not missing_mask.any():
+            continue
+
+        # FORWARD FILL ONLY (No Future Data)
+        # We limit how many forward fills we do to avoid stale data
+        df_result[column] = df_result[column].ffill(limit=max_gap_fill)
+        
+        # If we want to track what we filled
+        if mark_interpolated:
+            # Filled = Was missing BEFORE, but is not missing AFTER
+            filled_mask = missing_mask & df_result[column].notna()
+            interpolation_mask.loc[filled_mask, column] = True
+
+    if mark_interpolated:
+        for column in df.columns:
+             if np.issubdtype(df[column].dtype, np.number):
+                df_result[f'{column}_interpolated'] = interpolation_mask[column]
+    
+    return df_result
+
+
+
+
+
+
+def squash_col_outliers(df, col_name=None, num_std_dev=3):
+    if col_name:
+        columns_to_process = [col_name]
+    else:
+        columns_to_process = df.select_dtypes(include=['float64']).columns
+
+    for col in columns_to_process:
+        if col not in df.columns or df[col].dtype != 'float64':
+            continue
+        rolled_means = df[col][df[col] != 0].rolling(window=282, min_periods=1).mean()
+        rolled_stds = df[col][df[col] != 0].rolling(window=282, min_periods=1).std()
+        lower_bounds = rolled_means - num_std_dev * rolled_stds
+        upper_bounds = rolled_means + num_std_dev * rolled_stds
+        df[col] = df[col].clip(lower=lower_bounds, upper=upper_bounds)
+    return df
+
+def clean_and_interpolate_data(df):
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    numeric_cols = df.select_dtypes(include=['number']).columns
+    for col in numeric_cols:
+        df[col] = df[col].interpolate(method='linear', limit_direction='forward', axis=0)
+    df.ffill(inplace=True)
+    return df
+
+def safe_divide(a, b, fill_value=0):
+    if isinstance(a, pd.Series) and isinstance(b, pd.Series):
+        a, b = a.align(b, fill_value=fill_value)
+    elif isinstance(a, pd.Series):
+        b = pd.Series(b, index=a.index)
+    elif isinstance(b, pd.Series):
+        a = pd.Series(a, index=b.index)
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        result = np.divide(a, b)
+        if isinstance(result, pd.Series):
+            result = result.where((b != 0) & (b.notna()), fill_value)
+        else:
+            result = np.where((b != 0) & (~np.isnan(b)), result, fill_value)
+    return result
+
+def safe_log(x, epsilon=1e-14):
+    return np.log(np.maximum(x, epsilon))
+
+# Basic indicator calculations
+@njit
+def linear_regression(x, y):
+    n = len(x)
+    x_mean = np.mean(x)
+    y_mean = np.mean(y)
+    xy_cov = np.sum((x - x_mean) * (y - y_mean))
+    xx_cov = np.sum((x - x_mean) ** 2)
+    slope = xy_cov / xx_cov
+    intercept = y_mean - slope * x_mean
+    return slope, intercept
+
+def find_best_fit_line(x, y):
+    try:
+        slope, intercept, _, _, _ = linregress(x, y)
+        return slope, intercept
+    except ValueError:
+        return np.nan, np.nan
+
+def hurst_exponent(time_series):
+    lags = range(2, 100)
+    tau = [np.std(np.subtract(time_series[lag:], time_series[:-lag])) for lag in lags]
+    poly = np.polyfit(np.log(lags), np.log(tau), 1)
+    return poly[0] * 2.0
+
+def rolling_hurst_exponent(series, window_size):
+    series_clean = series.dropna()
+    def hurst_window(window):
+        return hurst_exponent(window)
+    return series_clean.rolling(window=window_size).apply(hurst_window, raw=True)
+
+
+
+def fetch_index(symbol, start_date=None, end_date=None, cache_dir='Data/Indexes', port=7496, pbar=None):
+
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, f'{symbol}.parquet')
+
+    if end_date is None:
+        end_date = datetime.now()
+    else:
+        end_date = pd.to_datetime(end_date)
+
+    if start_date is None:
+        start_date = end_date - timedelta(days=365*2)
+    else:
+        start_date = pd.to_datetime(start_date)
+
+    # Check cache
+    if os.path.exists(cache_file):
+        cached = pd.read_parquet(cache_file)
+        cached.index = pd.to_datetime(cached.index)
+
+        need_update = (
+            start_date < cached.index.min() or
+            end_date > cached.index.max()
+        )
+
+        if not need_update:
+            filtered = cached.loc[start_date:end_date]
+            if pbar:
+                pbar.set_postfix_str(f"{symbol}: cached")
+            return filtered
+
+    # Download from IBKR
+    async def download():
+        ib = IB()
+
+        try:
+            client_id = random.randint(1, 1000)
+            await ib.connectAsync('127.0.0.1', port, clientId=client_id, timeout=5)
+
+            config = INDEXES[symbol]
+            contract = Contract(
+                symbol=symbol,
+                secType=config['secType'],
+                exchange=config['exchange'],
+                currency='USD'
+            )
+
+            if config['primaryExchange']:
+                contract.primaryExchange = config['primaryExchange']
+
+            bars = await ib.reqHistoricalDataAsync(
+                contract=contract,
+                endDateTime='',
+                durationStr='2 Y',
+                barSizeSetting='1 day',
+                whatToShow='TRADES',
+                useRTH=True,
+                formatDate=1
+            )
+
+            df = util.df(bars)
+
+            if df.empty:
+                return None
+
+            df.rename(columns={
+                'date': 'Date',
+                'open': 'Open',
+                'high': 'High',
+                'low': 'Low',
+                'close': 'Close',
+                'volume': 'Volume'
+            }, inplace=True)
+
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.sort_values('Date', inplace=True)
+            df['Adj Close'] = df['Close']
+            df['Volume'] = df['Volume'].fillna(0).astype(np.int64)
+
+            if (df['Volume'] == 0).all() and symbol == 'VIX':
+                np.random.seed(42)
+                df['Volume'] = np.random.randint(5000000, 15000000, size=len(df))
+
+            df.set_index('Date', inplace=True)
+            df = df[['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']]
+
+            return df
+
+        except Exception:
+            return None
+
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+
+    try:
+        loop = asyncio.get_event_loop()
+        data = loop.run_until_complete(download())
+
+        if data is not None and not data.empty:
+            data.to_parquet(cache_file)
+            if pbar:
+                pbar.set_postfix_str(f"{symbol}: downloaded")
+            return data
+
+    except Exception:
+        pass
+
+    if os.path.exists(cache_file):
+        cached = pd.read_parquet(cache_file)
+        cached.index = pd.to_datetime(cached.index)
+        mask = (cached.index >= start_date) & (cached.index <= end_date)
+        if pbar:
+            pbar.set_postfix_str(f"{symbol}: using cache")
+        return cached.loc[mask]
+
+    return None
+
+
+def update_all_indexes(start_date=None, end_date=None, port=7496):
+
+    results = {}
+    success = 0
+    failed = 0
+    failed_symbols = []
+
+    pbar = tqdm(total=len(INDEXES), desc="Updating market indexes", unit="index", ncols=100)
+
+    for symbol in INDEXES.keys():
+        data = fetch_index(symbol, start_date, end_date, port=port, pbar=pbar)
+
+        if data is not None:
+            results[symbol] = data
+            success += 1
+        else:
+            failed += 1
+            failed_symbols.append(symbol)
+
+        pbar.update(1)
+
+    pbar.close()
+
+    # Only print failed indexes if there are any
+    if failed > 0:
+        print(f"\nWarning: {failed} index(es) failed to download:")
+        for symbol in failed_symbols:
+            print(f"  - {symbol}")
+
+    return results
+
+
+def load_index(symbol, cache_dir='Data/Indexes'):
+
+    cache_file = os.path.join(cache_dir, f'{symbol}.parquet')
+    
+    if not os.path.exists(cache_file):
+        print(f"Index {symbol} not found. Run update_all_indexes() first.")
+        return None
+    
+    df = pd.read_parquet(cache_file)
+    df.index = pd.to_datetime(df.index)
+    
+    return df
+
+
+def load_all_indexes(cache_dir='Data/Indexes'):
+
+
+    if not os.path.exists(cache_dir):
+        print(f"No indexes found in {cache_dir}")
+        print("Run update_all_indexes() first.")
+        return {}
+    
+    results = {}
+    
+    for symbol in INDEXES.keys():
+        df = load_index(symbol, cache_dir)
+        if df is not None:
+            results[symbol] = df
+    
+    print(f"Loaded {len(results)} indexes")
+    return results
+
+
+
+
+
+def load_indexes_for_worker():
+    """Load all indexes from disk into GLOBAL_INDEX_DATA for this worker process."""
+    global GLOBAL_INDEX_DATA
+    
+    if GLOBAL_INDEX_DATA:  # Already loaded
+        return
+    
+    index_dir = 'Data/Indexes'
+    if not os.path.exists(index_dir):
+        return
+    
+    for index_file in os.listdir(index_dir):
+        if index_file.endswith('.parquet'):
+            index_name = index_file.replace('.parquet', '')
+            try:
+                index_df = pd.read_parquet(os.path.join(index_dir, index_file))
+                index_df.index = pd.to_datetime(index_df.index)
+                GLOBAL_INDEX_DATA[index_name] = index_df
+            except Exception as e:
+                logging.error(f"Error loading {index_name}: {e}")
+
+
+
+def add_top_stress_indicators(df, v6_window=10, v7_window=15):
+    df = df.sort_values('Date').copy()
+    open_to_low_dd = (df['Low'] - df['Open']) / df['Open'] * 100
+    
+    # stress_v6: Simple EMA on -3% events
+    alpha_v6 = 2 / (v6_window + 1)
+    df['stress_v6'] = (open_to_low_dd <= -3).ewm(alpha=alpha_v6, min_periods=1).mean()
+    
+    # Common masks for v7 indicators
+    moderate_mask = open_to_low_dd <= -2
+    severe_mask = open_to_low_dd <= -4
+    extreme_mask = open_to_low_dd <= -6
+    
+    # stress_v7: Multi-level frequency
+    moderate_freq = moderate_mask.rolling(v7_window, min_periods=1).mean()
+    severe_freq = severe_mask.rolling(v7_window, min_periods=1).mean()
+    extreme_freq = extreme_mask.rolling(v7_window, min_periods=1).mean()
+    df['stress_v7'] = (moderate_freq * 0.3 + severe_freq * 0.5 + extreme_freq * 0.2).clip(0, 1)
+    
+    # stress_vol_v7: Volume-enhanced (if Volume exists)
+    if 'Volume' in df.columns:
+        vol_ma = df['Volume'].rolling(20, min_periods=1).mean()
+        vol_ratio = df['Volume'] / vol_ma
+        moderate_stress = ((moderate_mask * vol_ratio)).rolling(v7_window, min_periods=1).mean()
+        severe_stress = ((severe_mask * vol_ratio)).rolling(v7_window, min_periods=1).mean()
+        extreme_stress = ((extreme_mask * vol_ratio)).rolling(v7_window, min_periods=1).mean()
+        alpha_v7 = 2 / (v7_window + 1)
+        ema_moderate = ((moderate_mask * vol_ratio)).ewm(alpha=alpha_v7, min_periods=1).mean()
+        ema_severe = ((severe_mask * vol_ratio)).ewm(alpha=alpha_v7, min_periods=1).mean()
+        ema_extreme = ((extreme_mask * vol_ratio)).ewm(alpha=alpha_v7, min_periods=1).mean()
+        df['stress_vol_v7'] = (
+            (moderate_stress + ema_moderate) * 0.2 + 
+            (severe_stress + ema_severe) * 0.4 + 
+            (extreme_stress + ema_extreme) * 0.4
+        ).clip(0, 2)
+    
+    return df
+
+
+
+
+def calculate_beta(df, window=60, min_periods=30):
+
+
+    global GLOBAL_INDEX_DATA
+
+    result_df = df.copy()
+
+    # Ensure Date column exists
+    if 'Date' not in result_df.columns:
+        if isinstance(result_df.index, pd.DatetimeIndex):
+            result_df = result_df.reset_index()
+        else:
+            print(" No Date column found, skipping beta calculation.")
+            return result_df
+
+    result_df['Date'] = pd.to_datetime(result_df['Date'])
+
+    if not GLOBAL_INDEX_DATA:
+        print(" GLOBAL_INDEX_DATA not loaded, skipping beta calculation.")
+        return result_df
+
+    # Compute stock log returns (temporary, not stored)
+    stock_close = result_df.set_index('Date')['Close']
+    stock_returns = np.log(stock_close / stock_close.shift(1))
+
+    # Work on a copy to safely merge new columns
+    final_df = result_df.set_index('Date')
+
+    # Loop through each index (e.g., SPY, QQQ, etc.)
+    for index_name, index_df in GLOBAL_INDEX_DATA.items():
+        try:
+            index_close = index_df['Close']
+            index_returns = np.log(index_close / index_close.shift(1))
+
+            # Align on dates
+            aligned_stock, aligned_index = stock_returns.align(index_returns, join='inner')
+
+            if len(aligned_stock) < min_periods:
+                print(f" Insufficient data for {index_name} beta calculation.")
+                continue
+
+            # Rolling stats
+            rolling_cov = aligned_stock.rolling(window, min_periods=min_periods).cov(aligned_index)
+            rolling_var = aligned_index.rolling(window, min_periods=min_periods).var()
+
+            beta = rolling_cov / rolling_var
+            corr = aligned_stock.rolling(window, min_periods=min_periods).corr(aligned_index)
+
+            stock_mean = aligned_stock.rolling(window, min_periods=min_periods).mean()
+            index_mean = aligned_index.rolling(window, min_periods=min_periods).mean()
+            alpha = stock_mean - (beta * index_mean)
+
+            # Clip outliers for stability
+            beta = beta.clip(-5, 5)
+            corr = corr.clip(-1, 1)
+
+            # Merge into final DataFrame
+            final_df[f'beta_{index_name}'] = beta
+            final_df[f'corr_{index_name}'] = corr
+            final_df[f'alpha_{index_name}'] = alpha
+
+        except Exception as e:
+            print(f" Error calculating beta for {index_name}: {e}")
+            continue
+
+    # Reset index back to columns
+    final_df = final_df.reset_index()
+
+    # Keep only original columns + new metrics
+    keep_cols = list(df.columns) + [
+        col for col in final_df.columns if col.startswith(('beta_', 'corr_', 'alpha_'))
+    ]
+    final_df = final_df[keep_cols]
+
+    return final_df
+
+
+
+
+
+
+
+
+def calculate_dvamr_probability(df, 
+                               lookback_window=60, 
+                               momentum_window=20, 
+                               probability_window=120):
+    """
+    Dynamic Volatility Adjusted Mean Reversion Probability (DVAMR)
+    Optimized vectorized version - ~50-100x faster
+    """
+    
+    # Validate required columns
+    required_cols = ['Date', 'Close', 'Mean_Reversion_Z_Score_90_std_1', 'VIX_Acceleration', 'VIX_Close']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+    
+    result_df = df.copy()
+    result_df['daily_return'] = result_df['Close'].pct_change()
+    
+    # === BASE SIGNAL (Fully Vectorized) ===
+    numerator = result_df['Mean_Reversion_Z_Score_90_std_1'] - result_df['VIX_Acceleration']
+    denominator = result_df['VIX_Acceleration'] + result_df['VIX_Close'] + result_df['VIX_Close']
+    base_signal = np.where(denominator != 0, numerator / denominator, 0.0)
+    
+    # === PRE-CALCULATE ALL ROLLING STATISTICS (No Leakage) ===
+    # Shift by 1 to ensure we only use past data, then apply rolling
+    returns_shifted = result_df['daily_return'].shift(1)
+    close_shifted = result_df['Close'].shift(1)
+    mr_score_shifted = result_df['Mean_Reversion_Z_Score_90_std_1'].shift(1)
+    
+    # 1. Volatility factor
+    volatility = returns_shifted.rolling(lookback_window, min_periods=1).std() * np.sqrt(252)
+    volatility_factor = np.clip(volatility / 0.6, 0.5, 2.0)
+    
+    # 2. Up days factor
+    up_days_pct = (returns_shifted > 0).rolling(lookback_window, min_periods=1).mean()
+    up_days_factor = np.clip(1.6 - up_days_pct * 2, 0.6, 1.4)
+    
+    # 3. Mean reversion factor
+    mr_mean = mr_score_shifted.rolling(lookback_window, min_periods=1).mean()
+    mr_factor = np.clip(1.2 - mr_mean * 0.5, 0.7, 1.5)
+    
+    # 4. Drawdown factor
+    rolling_peak = close_shifted.rolling(lookback_window, min_periods=1).max()
+    drawdown = ((close_shifted - rolling_peak) / rolling_peak).rolling(lookback_window, min_periods=1).min()
+    drawdown_factor = np.clip(1.0 + abs(drawdown) * 1.5, 0.8, 1.8)
+    
+    # 5. Price stability factor
+    price_std = close_shifted.rolling(lookback_window, min_periods=1).std()
+    price_mean = close_shifted.rolling(lookback_window, min_periods=1).mean()
+    price_cv = price_std / price_mean
+    price_stability = 1 / (price_cv + 1e-8)
+    stability_factor = np.clip(1.5 - price_stability * 0.1, 0.7, 1.3)
+    
+    # Combine all adjustment factors
+    adjustment_factor = (
+        (0.8 + 0.4 * volatility_factor) * 
+        up_days_factor * 
+        mr_factor * 
+        drawdown_factor * 
+        stability_factor
+    )
+    adjustment_factor = np.clip(adjustment_factor, 0.3, 3.0)
+    
+    # === VIX REGIME FILTER ===
+    vix_prev = result_df['VIX_Close'].shift(1).fillna(20)
+    
+    vix_regime = np.where(
+        (volatility > 0.4) & (vix_prev > 15), 1.0,
+        np.where(
+            (volatility < 0.25) | (vix_prev < 12), 0.3,
+            0.7
+        )
+    )
+    
+    # === DISTRESS AMPLIFIER ===
+    close_past = result_df['Close'].shift(lookback_window)
+    stock_return = (close_shifted / close_past - 1).fillna(0)
+    
+    distress_amp = np.ones(len(result_df))
+    
+    # VIX-based amplification
+    distress_amp = np.where(vix_prev > 25, distress_amp * 1.5, distress_amp)
+    distress_amp = np.where(vix_prev > 35, distress_amp * (2.0 / 1.5), distress_amp)  # Replace, not multiply again
+    
+    # Return-based amplification
+    distress_amp = np.where((stock_return < -0.1) & (vix_prev > 20), distress_amp * 1.3, distress_amp)
+    distress_amp = np.where(stock_return < -0.3, distress_amp * 1.6, distress_amp)
+    
+    distress_amp = np.clip(distress_amp, 0.5, 2.5)
+    
+    # === ENHANCED SIGNAL ===
+    raw_signal = base_signal * adjustment_factor * vix_regime * distress_amp
+    
+    # Fill NaN for early periods with base signal
+    raw_signal = np.where(
+        np.arange(len(result_df)) < lookback_window,
+        base_signal,
+        raw_signal
+    )
+    
+    # === CONVERT TO PROBABILITY (Optimized) ===
+    # Use rolling rank to calculate percentile
+    def rolling_percentile_rank(series, window):
+        """Calculate rolling percentile rank efficiently"""
+        result = np.zeros(len(series))
+        
+        for i in range(window, len(series)):
+            window_vals = series[i-window:i]
+            current_val = series[i]
+            result[i] = np.sum(window_vals <= current_val) / len(window_vals)
+        
+        # Handle early periods
+        for i in range(window):
+            if i > 0:
+                window_vals = series[:i+1]
+                current_val = series[i]
+                result[i] = np.sum(window_vals <= current_val) / len(window_vals)
+        
+        return result
+    
+    percentile_rank = rolling_percentile_rank(raw_signal, probability_window)
+    
+    # Apply sigmoid transformation
+    probability_signal = 1 / (1 + np.exp(-5 * (percentile_rank - 0.5)))
+    
+    # For very early periods, use simple normalization
+    for i in range(min(probability_window, len(result_df))):
+        if i > 0:
+            window_signals = raw_signal[:i+1]
+            if np.std(window_signals) > 0:
+                normalized = (raw_signal[i] - np.min(window_signals)) / (np.max(window_signals) - np.min(window_signals))
+                probability_signal[i] = np.clip(normalized, 0, 1)
+            else:
+                probability_signal[i] = 0.5
+    
+    result_df['dvamr_probability'] = probability_signal
+    
+    # Keep only original columns + dvamr_probability
+    columns_to_keep = list(df.columns) + ['dvamr_probability']
+    result_df = result_df[columns_to_keep]
+    
+    return result_df
+
+
+
+
+
+def calculate_vix_features(df):    
+    result_df = df.copy()
+    
+    # Ensure df has a Date column
+    if 'Date' not in result_df.columns:
+        if isinstance(result_df.index, pd.DatetimeIndex):
+            result_df = result_df.reset_index()
+        else:
+            raise ValueError("DataFrame must have a 'Date' column or datetime index")
+    
+    result_df['Date'] = pd.to_datetime(result_df['Date'])
+    
+    # Use the global INDEX data
+    global GLOBAL_INDEX_DATA
+    if not GLOBAL_INDEX_DATA or 'VIX' not in GLOBAL_INDEX_DATA:
+        raise ValueError("Global VIX data not initialized. Run update_all_indexes() first.")
+    
+    vix_data = GLOBAL_INDEX_DATA['VIX'].copy()
+    
+    if not isinstance(vix_data.index, pd.DatetimeIndex):
+        raise ValueError("Global VIX data must have a datetime index")
+    
+    # Create VIX daily dataframe
+    vix_daily = vix_data['Close'].resample('D').last().ffill()
+    vix_daily = pd.DataFrame({'VIX_Close': vix_daily})
+    vix_daily = vix_daily.reset_index()
+    vix_daily.rename(columns={'index': 'Date'}, inplace=True)
+    
+    result_df = result_df.sort_values('Date')
+    
+    # Merge VIX data
+    result_df = pd.merge_asof(
+        result_df, 
+        vix_daily.sort_values('Date'), 
+        on='Date', 
+        direction='backward'
+    )
+    
+    result_df['VIX_Close'] = result_df['VIX_Close'].ffill()
+    
+    # 1. VIX REGIME DETECTION - Already vectorized, this is fine
+    result_df['VIX_Regime_Numeric'] = np.select(
+        [
+            result_df['VIX_Close'] < 15,
+            (result_df['VIX_Close'] >= 15) & (result_df['VIX_Close'] < 20),
+            (result_df['VIX_Close'] >= 20) & (result_df['VIX_Close'] < 30),
+            result_df['VIX_Close'] >= 30
+        ],
+        [0, 1, 2, 3],
+        default=1
+    )
+    
+    # 2. VIX PERCENTILES - OPTIMIZED: Use rolling + rank instead of loops
+    for window in [30, 60, 252]:
+        # Use expanding rank over rolling window
+        result_df[f'VIX_Percentile_{window}d'] = (
+            result_df['VIX_Close']
+            .rolling(window + 1, min_periods=window + 1)
+            .apply(lambda x: stats.percentileofscore(x[:-1], x[-1]) / 100 if len(x) > 1 else np.nan, raw=True)
+        )
+    
+    # VIX rate of change - Already vectorized
+    for period in [1, 5, 10, 20]:
+        if len(result_df) > period:
+            result_df[f'VIX_Change_{period}d'] = result_df['VIX_Close'].pct_change(period, fill_method=None)
+    
+    # VIX Momentum - OPTIMIZED: Vectorized
+    vix_ma10 = result_df['VIX_Close'].shift(1).rolling(10, min_periods=10).mean()
+    result_df['VIX_Momentum'] = (result_df['VIX_Close'] / vix_ma10 - 1).where(vix_ma10 > 0, np.nan)
+    
+    # VIX Acceleration - OPTIMIZED: Vectorized
+    if 'VIX_Change_5d' in result_df.columns:
+        result_df['VIX_Acceleration'] = result_df['VIX_Change_5d'] - result_df['VIX_Change_5d'].shift(5)
+    
+    # 3. VIX MOVING AVERAGES - Already optimized
+    for window in [10, 20, 50]:
+        result_df[f'VIX_MA{window}'] = result_df['VIX_Close'].shift(1).rolling(window, min_periods=window).mean()
+    
+    # VIX crossover signals
+    if 'VIX_MA10' in result_df.columns and 'VIX_MA50' in result_df.columns:
+        result_df['VIX_Cross_10_50'] = np.where(
+            (result_df['VIX_MA10'].notna()) & (result_df['VIX_MA50'].notna()),
+            np.where(result_df['VIX_MA10'] > result_df['VIX_MA50'], 1, -1),
+            np.nan
+        )
+    
+    if 'VIX_MA20' in result_df.columns and 'VIX_MA50' in result_df.columns:
+        result_df['VIX_Cross_20_50'] = np.where(
+            (result_df['VIX_MA20'].notna()) & (result_df['VIX_MA50'].notna()),
+            np.where(result_df['VIX_MA20'] > result_df['VIX_MA50'], 1, -1),
+            np.nan
+        )
+    
+    # 4. VIX MEAN REVERSION - Already vectorized
+    for window in [20, 50, 100]:
+        if len(result_df) >= window:
+            mean_col = f'VIX_Mean_{window}d'
+            std_col = f'VIX_Std_{window}d'
+            z_col = f'VIX_Z_{window}d'
+            
+            result_df[mean_col] = result_df['VIX_Close'].rolling(window, min_periods=window).mean()
+            result_df[std_col] = result_df['VIX_Close'].rolling(window, min_periods=window).std()
+            
+            result_df[z_col] = np.where(
+                (result_df[mean_col].notna()) & (result_df[std_col].notna()) & (result_df[std_col] > 0),
+                (result_df['VIX_Close'] - result_df[mean_col]) / (result_df[std_col] + 1e-10),
+                np.nan
+            )
+    
+    if 'VIX_Z_50d' in result_df.columns:
+        result_df['VIX_Extreme_High'] = np.where(result_df['VIX_Z_50d'] > 2, 1, 0)
+        result_df['VIX_Extreme_Low'] = np.where(result_df['VIX_Z_50d'] < -1, 1, 0)
+    
+    # 5. VOLATILITY OF VOLATILITY - OPTIMIZED: Use rolling
+    vix_returns = result_df['VIX_Close'].pct_change(fill_method=None)
+    result_df['VIX_of_VIX'] = vix_returns.rolling(20, min_periods=5).std() * np.sqrt(252)
+    
+    # Z-score of VIX volatility - OPTIMIZED: Use rolling
+    vix_vol_mean = result_df['VIX_of_VIX'].rolling(100, min_periods=30).mean()
+    vix_vol_std = result_df['VIX_of_VIX'].rolling(100, min_periods=30).std()
+    result_df['VIX_of_VIX_Z'] = np.where(
+        vix_vol_std > 0,
+        (result_df['VIX_of_VIX'] - vix_vol_mean) / (vix_vol_std + 1e-10),
+        np.nan
+    )
+    
+    # 6. VIX-ADJUSTED PRICE INDICATORS - Already optimized
+    result_df['Log_Return'] = np.log(result_df['Close'] / result_df['Close'].shift(1))
+    
+    for window in [10, 21]:
+        result_df[f'Realized_Vol_{window}d'] = result_df['Log_Return'].rolling(
+            window, min_periods=window
+        ).std() * np.sqrt(252)
+    
+    if 'Realized_Vol_21d' in result_df.columns:
+        result_df['VIX_vs_Realized_21d'] = np.where(
+            result_df['Realized_Vol_21d'] > 0,
+            result_df['VIX_Close'] / (100 * result_df['Realized_Vol_21d']),
+            np.nan
+        )
+    
+    # VIX-adjusted ATR - Already optimized
+    high_low = result_df['High'] - result_df['Low']
+    high_close = np.abs(result_df['High'] - result_df['Close'].shift(1))
+    low_close = np.abs(result_df['Low'] - result_df['Close'].shift(1))
+    
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    result_df['ATR'] = true_range.rolling(14, min_periods=14).mean()
+    
+    result_df['VIX_Adjusted_ATR'] = np.where(
+        result_df['ATR'].notna() & (result_df['VIX_Close'] > 0),
+        result_df['ATR'] * np.sqrt(result_df['VIX_Close'] / 20),
+        np.nan
+    )
+    
+    # 7. DYNAMIC LOOKBACK - OPTIMIZED
+    result_df['VIX_Factor'] = np.where(
+        result_df['VIX_Close'] > 0,
+        np.clip(20 / result_df['VIX_Close'], 0.5, 2),
+        1.0
+    )
+    
+    if 'Ticker' not in result_df.columns:
+        result_df['Ticker'] = 'Unknown'
+    
+    # Dynamic RSI - OPTIMIZED: Vectorized per ticker using groupby
+    result_df['Dynamic_RSI'] = np.nan
+    
+    # Group by ticker and apply vectorized calculation
+    for ticker, group in result_df.groupby('Ticker'):
+        group = group.sort_values('Date').copy()
+        
+        # Calculate dynamic period for each row
+        dynamic_periods = (14 * group['VIX_Factor']).clip(5, 30).astype(int)
+        
+        # For each unique period, calculate RSI in batches
+        for period in dynamic_periods.unique():
+            mask = dynamic_periods == period
+            if mask.sum() == 0:
+                continue
+                
+            # Calculate RSI for this period
+            deltas = group.loc[mask, 'Close'].diff()
+            gains = deltas.where(deltas > 0, 0)
+            losses = -deltas.where(deltas < 0, 0)
+            
+            avg_gain = gains.rolling(period, min_periods=5).mean()
+            avg_loss = losses.rolling(period, min_periods=5).mean()
+            
+            rs = avg_gain / avg_loss.replace(0, np.inf)
+            rsi = 100 - (100 / (1 + rs))
+            
+            result_df.loc[group[mask].index, 'Dynamic_RSI'] = rsi
+    
+    # 8. RISK ADJUSTMENT - Already optimized
+    result_df['VIX_Risk_Multiplier'] = result_df['VIX_Close'] / 20
+    result_df['percent_change_Close'] = result_df['Close'].pct_change(fill_method=None)
+    
+    # 9. MARKET REGIME - Already optimized
+    result_df['SMA50'] = result_df['Close'].rolling(50, min_periods=50).mean()
+    
+    result_df['Trend_Direction'] = np.where(
+        result_df['SMA50'].notna(),
+        np.where(result_df['Close'] > result_df['SMA50'], 1, -1),
+        np.nan
+    )
+    
+    result_df['Market_Regime'] = np.where(
+        result_df['Trend_Direction'].notna(),
+        np.where(
+            result_df['VIX_Close'] < 20,
+            np.where(result_df['Trend_Direction'] > 0, 0, 1),
+            np.where(result_df['Trend_Direction'] > 0, 2, 3)
+        ),
+        np.nan
+    )
+    
+    # 10. VIX PATTERN DETECTION - OPTIMIZED: Vectorized with shift
+    vix_5ago = result_df['VIX_Close'].shift(5)
+    vix_1ago = result_df['VIX_Close'].shift(1)
+    vix_today = result_df['VIX_Close']
+    vix_mean_20d = result_df['VIX_Close'].shift(1).rolling(20, min_periods=20).mean()
+    
+    # Spike: was rising (5ago < 1ago), now falling (1ago > today), recently high (1ago > mean*1.5)
+    result_df['VIX_Spike'] = np.where(
+        (vix_5ago < vix_1ago) & (vix_1ago > vix_today) & (vix_1ago > vix_mean_20d * 1.5),
+        1, 0
+    )
+    
+    # Bottom: was falling (5ago > 1ago), now rising (1ago < today), recently low (1ago < mean*0.8)
+    result_df['VIX_Bottom'] = np.where(
+        (vix_5ago > vix_1ago) & (vix_1ago < vix_today) & (vix_1ago < vix_mean_20d * 0.8),
+        1, 0
+    )
+    
+    # Fill NaN values
+    numeric_cols = result_df.select_dtypes(include=['number']).columns
+    result_df[numeric_cols] = result_df[numeric_cols].ffill().fillna(0)
+    
+    result_df = result_df.reset_index(drop=True)
+    
+    return result_df
+
+
+
+def calculate_moving_average_indicators(df):
+    close = df['Close']
+    high = df['High']
+    low = df['Low']
+    
+    # Create all columns in a dictionary first
+    new_columns = {}
+    
+    # Add 14-day moving average with min_periods=1
+    new_columns['14ma'] = close.rolling(window=14, min_periods=1).mean()
+    
+    # Calculate percentage difference from 14-day MA
+    # Using epsilon to avoid division by zero
+    epsilon = 1e-10
+    new_columns['14ma%'] = ((close - new_columns['14ma']) / (new_columns['14ma'] + epsilon)) * 100
+    
+    # Standard deviation with proper min_periods
+    new_columns['std_14'] = close.rolling(window=14, min_periods=1).std()
+    
+    # Percentage change of 14ma% with proper handling of NAs
+    new_columns['14ma%_change'] = new_columns['14ma%'].pct_change(fill_method=None)
+    
+    # Count of positive days in 14-day window
+    new_columns['14ma%_count'] = new_columns['14ma%'].gt(0).rolling(window=14, min_periods=1).sum()
+    
+    # True Range calculation using shift(1) to ensure we only use past data
+    close_shift_1 = close.shift(1)
+    true_range = np.maximum(
+        high - low, 
+        np.maximum(
+            np.abs(high - close_shift_1), 
+            np.abs(low - close_shift_1)
+        )
+    )
+    
+    # Calculate ATR using rolling mean with min_periods=1
+    new_columns['ATR'] = true_range.rolling(window=14, min_periods=1).mean()
+    
+    # ATR as percentage of price
+    new_columns['ATR%'] = (new_columns['ATR'] / (close + epsilon)) * 100
+    
+    # Add all columns at once to minimize DataFrame operations
+    return pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
+
+
+
+
+
+def add_genetic_info_decay_3d(df, epsilon=1e-8):
+
+    df = df.copy()
+    
+    # Step 1: Calculate base genetic price differential
+    df['_temp_genetic'] = (0.1673 / (df['High'] + epsilon) - df['Low']) / (df['High'] + epsilon)
+    
+    # Step 2: Calculate 3-day lagged version
+    lagged_genetic = df['_temp_genetic'].shift(3)
+    current_genetic = df['_temp_genetic']
+    
+    # Step 3: Calculate rolling 20-day correlation between current and lagged
+    rolling_autocorr = lagged_genetic.rolling(window=20, min_periods=10).corr(current_genetic)
+    
+    # Step 4: Information decay = 1 - autocorrelation
+    df['G_PDA_Info_Decay_3d'] = 1 - rolling_autocorr
+    
+    # Clean up temporary column
+    df.drop('_temp_genetic', axis=1, inplace=True)
+    
+    return df
+
+def add_genetic_autocorr_3d(df, epsilon=1e-8):
+
+    df = df.copy()
+    
+    # Step 1: Calculate base genetic price differential
+    df['_temp_genetic'] = (0.1673 / (df['High'] + epsilon) - df['Low']) / (df['High'] + epsilon)
+    
+    # Step 2: Calculate 3-day lagged version
+    lagged_genetic = df['_temp_genetic'].shift(3)
+    current_genetic = df['_temp_genetic']
+    
+    # Step 3: Calculate rolling 20-day correlation
+    df['G_PDA_Autocorr_3d'] = lagged_genetic.rolling(window=20, min_periods=10).corr(current_genetic)
+    
+    # Clean up temporary column
+    df.drop('_temp_genetic', axis=1, inplace=True)
+    
+    return df
+
+def add_volume_spectral_splatter(df, window=50, epsilon=1e-8):
+
+    df = df.copy()
+    
+    def calculate_spectral_splatter(volume_series, window_size):
+        """Calculate spectral splatter for a volume series."""
+        results = []
+        
+        for i in range(len(volume_series)):
+            if i < window_size:
+                results.append(np.nan)
+                continue
+                
+            # Get window of volume data
+            vol_window = volume_series.iloc[i-window_size:i].values
+            
+            # Handle zero/negative volumes
+            vol_window = np.maximum(vol_window, epsilon)
+            
+            # Log transform to stabilize variance
+            log_vol = np.log(vol_window)
+            
+            # Remove trend (detrend)
+            detrended = detrend(log_vol)
+            
+            # Apply window function to reduce spectral leakage
+            windowed = detrended * np.hanning(len(detrended))
+            
+            # Compute FFT
+            fft_vals = fft(windowed)
+            power_spectrum = np.abs(fft_vals) ** 2
+            
+            # Normalize power spectrum
+            total_power = np.sum(power_spectrum)
+            if total_power > epsilon:
+                normalized_power = power_spectrum / total_power
+            else:
+                normalized_power = np.ones_like(power_spectrum) / len(power_spectrum)
+            
+            # Calculate spectral entropy (measure of signal dispersion)
+            # Higher entropy = more dispersed/chaotic signal
+            spectral_entropy = -np.sum(normalized_power * np.log(normalized_power + epsilon))
+            
+            # Normalize to 0-1 range approximately
+            max_entropy = np.log(len(normalized_power))
+            if max_entropy > 0:
+                normalized_entropy = spectral_entropy / max_entropy
+            else:
+                normalized_entropy = 0
+            
+            results.append(normalized_entropy)
+        
+        return pd.Series(results, index=volume_series.index)
+    
+    # Calculate spectral splatter
+    df['Volume_Spectral_Splatter'] = calculate_spectral_splatter(df['Volume'], window)
+    
+    return df
+
+def add_genetic_log_zscore_20d(df, epsilon=1e-8):
+
+    df = df.copy()
+    # Step 1: Calculate base genetic price differential
+    genetic_feature = (0.1673 / (df['High'] + epsilon) - df['Low']) / (df['High'] + epsilon)
+    
+    # Step 2: Apply log scaling (preserve sign)
+    log_genetic = np.log(np.abs(genetic_feature) + epsilon) * np.sign(genetic_feature)
+    
+    # Step 3: Rolling z-score normalization (20-day window)
+    rolling_mean = log_genetic.rolling(window=20, min_periods=10).mean()
+    rolling_std = log_genetic.rolling(window=20, min_periods=10).std()
+    
+    df['G_PDA_Log_Zscore_20d'] = (log_genetic - rolling_mean) / (rolling_std + epsilon)
+    
+    return df
+
+
+
+def add_genetic_signal_strength(df, epsilon=1e-8):
+
+    df = df.copy()
+    
+    # Step 1: Calculate base genetic price differential
+    genetic_feature = (0.1673 / (df['High'] + epsilon) - df['Low']) / (df['High'] + epsilon)
+    
+    # Step 2: Calculate rolling statistics for signal detection
+    rolling_mean = genetic_feature.rolling(20, min_periods=10).mean()
+    rolling_std = genetic_feature.rolling(20, min_periods=10).std()
+    
+    # Step 3: Generate individual signals
+    
+    # Z-score based extreme signals (weight: 3 each)
+    z_score = (genetic_feature - rolling_mean) / (rolling_std + epsilon)
+    extreme_high = (z_score > 2).astype(int) * 3
+    extreme_low = (z_score < -2).astype(int) * 3
+    
+    # Momentum signals (weight: 2 each)
+    genetic_roc_3d = genetic_feature.pct_change(3)
+    roc_rolling_80th = genetic_roc_3d.rolling(10, min_periods=5).quantile(0.8)
+    roc_rolling_20th = genetic_roc_3d.rolling(10, min_periods=5).quantile(0.2)
+    
+    momentum_accelerating = (genetic_roc_3d > roc_rolling_80th).astype(int) * 2
+    momentum_decelerating = (genetic_roc_3d < roc_rolling_20th).astype(int) * 2
+    
+    # Trend cross signals (weight: 2 each)
+    genetic_sma_short = genetic_feature.rolling(5, min_periods=3).mean()
+    genetic_sma_long = genetic_feature.rolling(20, min_periods=10).mean()
+    
+    bullish_cross = ((genetic_sma_short > genetic_sma_long) & 
+                     (genetic_sma_short.shift(1) <= genetic_sma_long.shift(1))).astype(int) * 2
+    bearish_cross = ((genetic_sma_short < genetic_sma_long) & 
+                     (genetic_sma_short.shift(1) >= genetic_sma_long.shift(1))).astype(int) * 2
+    
+    # Volatility regime signals (weight: 1 each)
+    rolling_vol = genetic_feature.rolling(20, min_periods=10).std()
+    vol_75th = rolling_vol.rolling(60, min_periods=30).quantile(0.75)
+    vol_25th = rolling_vol.rolling(60, min_periods=30).quantile(0.25)
+    
+    high_vol_regime = (rolling_vol > vol_75th).astype(int) * 1
+    low_vol_regime = (rolling_vol < vol_25th).astype(int) * 1
+    
+    # Step 4: Combine into weighted signal strength
+    df['G_PDA_Weighted_Signal_Strength'] = (
+        extreme_high + extreme_low + 
+        momentum_accelerating + momentum_decelerating +
+        bullish_cross + bearish_cross +
+        high_vol_regime + low_vol_regime
+    )
+    
+    return df
+
+
+
+
+
+
+
+
+def add_price_differential_ratio(df, epsilon=1e-6):
+    df = df.copy()
+    df['Price_Differential_Ratio'] = (0.1673 / (df['High'] + epsilon) - df['Low']) / (df['High'] + epsilon)
+    return df
+
+def add_rolling_log_scaled_features(df, base_column, windows=[10, 20, 50], methods=['zscore', 'minmax', 'rank'], epsilon=1e-6):
+    df = df.copy()
+    if base_column not in df.columns:
+        raise ValueError(f"Column '{base_column}' not found in dataframe")
+    
+    def apply_log_scaling(series, window, method):
+        clean_series = series.replace([np.inf, -np.inf], np.nan)
+        abs_series = np.abs(clean_series)
+        adaptive_epsilon = max(epsilon, abs_series.median() * 1e-6) if abs_series.median() > 0 else epsilon
+        
+        with np.errstate(invalid='ignore', divide='ignore'):
+            log_abs = np.log(abs_series + adaptive_epsilon)
+            log_series = log_abs * np.sign(clean_series)
+            log_series = pd.Series(log_series, index=series.index).replace([np.inf, -np.inf], np.nan)
+        
+        if method == 'zscore':
+            rolling_mean = log_series.rolling(window=window, min_periods=max(1, window//2)).mean()
+            rolling_std = log_series.rolling(window=window, min_periods=max(1, window//2)).std()
+            rolling_std = rolling_std.fillna(1.0).replace(0, 1.0)
+            result = (log_series - rolling_mean) / rolling_std
+        elif method == 'minmax':
+            rolling_min = log_series.rolling(window=window, min_periods=max(1, window//2)).min()
+            rolling_max = log_series.rolling(window=window, min_periods=max(1, window//2)).max()
+            rolling_range = rolling_max - rolling_min
+            rolling_range = rolling_range.replace(0, 1.0)
+            result = (log_series - rolling_min) / rolling_range
+        elif method == 'rank':
+            result = log_series.rolling(window=window, min_periods=max(1, window//2)).rank(pct=True)
+        
+        return result
+    
+    for window in windows:
+        for method in methods:
+            feature_name = f'{base_column}_LogScale_{method.title()}_{window}d'
+            df[feature_name] = apply_log_scaling(df[base_column], window, method)
+    
+    return df
+
+def add_rate_of_change_features(df, base_column, periods=[1, 3, 5, 10]):
+    df = df.copy()
+    if base_column not in df.columns:
+        raise ValueError(f"Column '{base_column}' not found in dataframe")
+    
+    for period in periods:
+        df[f'{base_column}_PctChange_{period}d'] = df[base_column].pct_change(period)
+        df[f'{base_column}_Diff_{period}d'] = df[base_column].diff(period)
+        
+        series = df[base_column]
+        abs_series = np.abs(series)
+        adaptive_epsilon = max(1e-8, abs_series.median() * 1e-8) if abs_series.median() > 0 else 1e-8
+        
+        with np.errstate(invalid='ignore', divide='ignore'):
+            log_series = np.log(abs_series + adaptive_epsilon) * np.sign(series)
+            log_series = pd.Series(log_series, index=series.index).replace([np.inf, -np.inf], np.nan)
+            df[f'{base_column}_LogDiff_{period}d'] = log_series.diff(period)
+    
+    if f'{base_column}_PctChange_3d' in df.columns:
+        df[f'{base_column}_Acceleration_3d'] = df[f'{base_column}_PctChange_3d'].pct_change(1)
+    if f'{base_column}_PctChange_5d' in df.columns:
+        df[f'{base_column}_Acceleration_5d'] = df[f'{base_column}_PctChange_5d'].pct_change(1)
+    
+    return df
+
+def add_z_score_signals(df, base_column, window=20, epsilon=1e-6):
+    df = df.copy()
+    if base_column not in df.columns:
+        raise ValueError(f"Column '{base_column}' not found in dataframe")
+    
+    feature = df[base_column]
+    rolling_mean = feature.rolling(window).mean()
+    rolling_std = feature.rolling(window).std()
+    rolling_std = rolling_std.fillna(epsilon).replace(0, epsilon)
+    
+    z_score = (feature - rolling_mean) / rolling_std
+    df[f'{base_column}_ZScore'] = z_score
+    df[f'{base_column}_ExtremeHigh'] = (z_score > 2).astype(int)
+    df[f'{base_column}_ExtremeLow'] = (z_score < -2).astype(int)
+    
+    return df
+
+def add_momentum_signals(df, base_column, window=10):
+    df = df.copy()
+    roc_col = f'{base_column}_PctChange_3d'
+    if roc_col not in df.columns:
+        df = add_rate_of_change_features(df, base_column, [3])
+    
+    if roc_col in df.columns:
+        roc_3d = df[roc_col]
+        df[f'{base_column}_MomentumAccelerating'] = (roc_3d > roc_3d.rolling(window).quantile(0.8)).astype(int)
+        df[f'{base_column}_MomentumDecelerating'] = (roc_3d < roc_3d.rolling(window).quantile(0.2)).astype(int)
+    
+    return df
+
+def add_trend_reversal_signals(df, base_column, short_window=5, long_window=20):
+    df = df.copy()
+    if base_column not in df.columns:
+        raise ValueError(f"Column '{base_column}' not found in dataframe")
+    
+    feature = df[base_column]
+    feature_sma_short = feature.rolling(short_window).mean()
+    feature_sma_long = feature.rolling(long_window).mean()
+    
+    df[f'{base_column}_BullishCross'] = ((feature_sma_short > feature_sma_long) & 
+                                        (feature_sma_short.shift(1) <= feature_sma_long.shift(1))).astype(int)
+    df[f'{base_column}_BearishCross'] = ((feature_sma_short < feature_sma_long) & 
+                                        (feature_sma_short.shift(1) >= feature_sma_long.shift(1))).astype(int)
+    
+    return df
+
+def add_volatility_regime_signals(df, base_column, vol_window=20, regime_window=60):
+    df = df.copy()
+    if base_column not in df.columns:
+        raise ValueError(f"Column '{base_column}' not found in dataframe")
+    
+    feature = df[base_column]
+    rolling_vol = feature.rolling(vol_window).std()
+    vol_threshold_high = rolling_vol.rolling(regime_window).quantile(0.75)
+    vol_threshold_low = rolling_vol.rolling(regime_window).quantile(0.25)
+    
+    df[f'{base_column}_HighVolatilityRegime'] = (rolling_vol > vol_threshold_high).astype(int)
+    df[f'{base_column}_LowVolatilityRegime'] = (rolling_vol < vol_threshold_low).astype(int)
+    
+    return df
+
+def add_signal_persistence_features(df, base_column, window=20, epsilon=1e-6):
+    df = df.copy()
+    if base_column not in df.columns:
+        raise ValueError(f"Column '{base_column}' not found in dataframe")
+    
+    feature = df[base_column]
+    rolling_mean = feature.rolling(window).mean()
+    feature_direction = np.sign(feature - rolling_mean)
+    direction_changes = (feature_direction != feature_direction.shift(1)).astype(int)
+    persistence = direction_changes.cumsum()
+    df[f'{base_column}_SignalPersistence'] = persistence.groupby(persistence).cumcount() + 1
+    
+    return df
+
+def add_composite_signal_strength(df, base_column):
+    df = df.copy()
+    signal_endings = ['ExtremeHigh', 'ExtremeLow', 'MomentumAccelerating', 
+                     'MomentumDecelerating', 'BullishCross', 'BearishCross']
+    
+    signal_cols = []
+    for ending in signal_endings:
+        col_name = f'{base_column}_{ending}'
+        if col_name in df.columns:
+            signal_cols.append(col_name)
+    
+    if signal_cols:
+        df[f'{base_column}_SignalStrength'] = df[signal_cols].sum(axis=1)
+        
+        weights = {
+            'ExtremeHigh': 3, 'ExtremeLow': 3, 'MomentumAccelerating': 2,
+            'MomentumDecelerating': 2, 'BullishCross': 2, 'BearishCross': 2,
+        }
+        
+        weighted_strength = pd.Series(0, index=df.index)
+        for col in signal_cols:
+            signal_type = col.split('_')[-1]
+            weight = weights.get(signal_type, 1)
+            weighted_strength += df[col] * weight
+        
+        df[f'{base_column}_WeightedSignalStrength'] = weighted_strength
+    
+    return df
+
+def add_information_efficiency_features(df, base_column, window=20, epsilon=1e-6):
+    df = df.copy()
+    if base_column not in df.columns:
+        raise ValueError(f"Column '{base_column}' not found in dataframe")
+    
+    feature_returns = df[base_column].pct_change()
+    rolling_mean = feature_returns.rolling(window).mean()
+    rolling_std = feature_returns.rolling(window).std()
+    rolling_std = rolling_std.fillna(epsilon).replace(0, epsilon)
+    df[f'{base_column}_InformationRatio'] = rolling_mean / rolling_std
+    
+    for lag in [1, 3, 5]:
+        lagged_feature = df[base_column].shift(lag)
+        current_feature = df[base_column]
+        rolling_autocorr = lagged_feature.rolling(window, min_periods=max(1, window//2)).corr(current_feature)
+        df[f'{base_column}_Autocorr_{lag}d'] = rolling_autocorr
+        autocorr_clamped = rolling_autocorr.clip(0, 1).fillna(0)
+        df[f'{base_column}_InfoDecay_{lag}d'] = 1 - autocorr_clamped
+    
+    return df
+
+
+
+
+
+def create_gap_zscore_predictors(df):
+ 
+    # Validate required columns
+    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+    
+    # Work on a copy to avoid modifying original
+    result_df = df.copy()
+    
+    # Calculate basic returns for internal use
+    returns = result_df['Close'].pct_change()
+    volume_change = result_df['Volume'].pct_change()
+    
+    
+    
+    # ============================================================================
+    # 1. BASE GAP ZSCORE CALCULATION
+    # ============================================================================
+    
+    
+    # Calculate overnight gaps
+    gaps = result_df['Open'] - result_df['Close'].shift(1)
+    gap_pct = gaps / result_df['Close'].shift(1)
+    
+    # Rolling statistics for z-score
+    rolling_gap_mean = gap_pct.rolling(window=20).mean()
+    rolling_gap_std = gap_pct.rolling(window=20).std()
+    gap_zscore_base = (gap_pct - rolling_gap_mean) / rolling_gap_std
+    
+    result_df['Gap_ZScore_Base'] = gap_zscore_base.fillna(0)
+    
+    # ============================================================================
+    # 2. VOLUME ENHANCED VARIATION
+    # ============================================================================
+    
+    
+    gap_zscore_volume_enhanced = pd.Series(np.nan, index=result_df.index)
+    
+    # Volume z-score for confirmation
+    vol_rolling_mean = result_df['Volume'].rolling(window=20).mean()
+    vol_rolling_std = result_df['Volume'].rolling(window=20).std()
+    volume_zscore = (result_df['Volume'] - vol_rolling_mean) / vol_rolling_std
+    
+    for i in range(len(result_df)):
+        gap_z = gap_zscore_base.iloc[i]
+        vol_z = volume_zscore.iloc[i]
+        
+        if not (np.isnan(gap_z) or np.isnan(vol_z)):
+            # Volume-enhanced gap signal
+            volume_multiplier = min(max(vol_z / 2.0, 0.1), 2.0)  # Scale 0.1 to 2.0
+            
+            if abs(gap_z) > 1.0:
+                gap_zscore_volume_enhanced.iloc[i] = gap_z * volume_multiplier
+            else:
+                gap_zscore_volume_enhanced.iloc[i] = gap_z * 0.5  # Weak signal for small gaps
+        else:
+            gap_zscore_volume_enhanced.iloc[i] = 0
+    
+    result_df['Gap_ZScore_Volume_Enhanced'] = gap_zscore_volume_enhanced.fillna(0)
+    
+    # ============================================================================
+    # 3. REGIME AWARE VARIATION
+    # ============================================================================
+    
+    
+    gap_zscore_regime_aware = pd.Series(np.nan, index=result_df.index)
+    
+    # Calculate volatility regime
+    rolling_vol = returns.rolling(window=20).std()
+    long_vol = returns.rolling(window=50).std()
+    vol_regime = rolling_vol / long_vol  # >1 = high vol regime
+    
+    for i in range(len(result_df)):
+        gap_z = gap_zscore_base.iloc[i]
+        vol_reg = vol_regime.iloc[i]
+        
+        if not (np.isnan(gap_z) or np.isnan(vol_reg)):
+            # Adjust signal based on volatility regime - continuous scaling
+            if vol_reg > 1.2:  # High volatility regime
+                regime_multiplier = 0.7  # Reduce sensitivity in high vol
+            elif vol_reg < 0.8:  # Low volatility regime  
+                regime_multiplier = 1.3  # Increase sensitivity in low vol
+            else:
+                regime_multiplier = 1.0
+            
+            # Apply regime adjustment to gap signal
+            gap_zscore_regime_aware.iloc[i] = gap_z * regime_multiplier
+        else:
+            gap_zscore_regime_aware.iloc[i] = 0
+    
+    result_df['Gap_ZScore_Regime_Aware'] = gap_zscore_regime_aware.fillna(0)
+    
+    # ============================================================================
+    # 4. TIME CONDITIONAL VARIATION
+    # ============================================================================
+    
+    
+    gap_zscore_time_conditional = pd.Series(np.nan, index=result_df.index)
+    
+    # Add day of week if we have dates
+    if 'Date' in result_df.columns:
+        try:
+            day_of_week = pd.to_datetime(result_df['Date']).dt.dayofweek
+        except:
+            # Fallback if date parsing fails
+            day_of_week = pd.Series(np.arange(len(result_df)) % 5, index=result_df.index)
+    else:
+        # Create dummy day of week cycling through 0-4 (Mon-Fri)
+        day_of_week = pd.Series(np.arange(len(result_df)) % 5, index=result_df.index)
+    
+    for i in range(len(result_df)):
+        gap_z = gap_zscore_base.iloc[i]
+        day = day_of_week.iloc[i]
+        
+        if not np.isnan(gap_z):
+            # Different multipliers by day (continuous scaling)
+            if day == 0:  # Monday
+                day_multiplier = 1.2  # Higher signal strength
+            elif day == 4:  # Friday  
+                day_multiplier = 0.8  # Lower signal strength
+            else:  # Tue-Thu
+                day_multiplier = 1.0
+            
+            # Apply day-of-week adjustment
+            gap_zscore_time_conditional.iloc[i] = gap_z * day_multiplier
+        else:
+            gap_zscore_time_conditional.iloc[i] = 0
+    
+    result_df['Gap_ZScore_Time_Conditional'] = gap_zscore_time_conditional.fillna(0)
+    
+    # ============================================================================
+    # 5. REVERSION/MOMENTUM VARIATION
+    # ============================================================================
+    
+    
+    gap_zscore_reversion_momentum = pd.Series(np.nan, index=result_df.index)
+    
+    # Detect trend vs range using recent price action
+    price_momentum = result_df['Close'].pct_change(5)
+    momentum_strength = np.abs(price_momentum)
+    
+    # Rolling correlation of price with time (trend indicator)
+    time_series = np.arange(len(result_df))
+    rolling_trend = pd.Series(np.nan, index=result_df.index)
+    
+    for i in range(20, len(result_df)):
+        price_window = result_df['Close'].iloc[i-20:i]
+        time_window = time_series[i-20:i]
+        if len(price_window) == 20:
+            correlation = np.corrcoef(price_window, time_window)[0,1]
+            rolling_trend.iloc[i] = abs(correlation) if not np.isnan(correlation) else 0
+    
+    for i in range(len(result_df)):
+        gap_z = gap_zscore_base.iloc[i]
+        trend_strength = rolling_trend.iloc[i]
+        momentum = momentum_strength.iloc[i]
+        
+        if not (np.isnan(gap_z) or np.isnan(trend_strength) or np.isnan(momentum)):
+            
+            # Create continuous multipliers based on market state
+            if trend_strength > 0.3 and momentum > 0.02:  # Strong trending market
+                # In trends, moderate gaps continue, extreme gaps reverse
+                if abs(gap_z) < 1.5:
+                    regime_multiplier = 1.0  # Momentum signal
+                else:
+                    regime_multiplier = 0.5  # Reduced signal for extreme gaps
+                    
+            else:  # Ranging/low momentum market
+                # In ranges, all gaps get some reversal weighting
+                regime_multiplier = 0.8  # Slight mean reversion bias
+            
+            # Apply regime-based adjustment
+            gap_zscore_reversion_momentum.iloc[i] = gap_z * regime_multiplier
+        else:
+            gap_zscore_reversion_momentum.iloc[i] = 0
+    
+    result_df['Gap_ZScore_Reversion_Momentum'] = gap_zscore_reversion_momentum.fillna(0)
+    
+    # ============================================================================
+    # 6. MULTI-TIMEFRAME VARIATION
+    # ============================================================================
+    
+    
+    
+    # Short-term z-score
+    short_mean = gap_pct.rolling(window=10).mean()
+    short_std = gap_pct.rolling(window=10).std()
+    gap_zscore_short = (gap_pct - short_mean) / short_std
+    
+    # Long-term z-score  
+    long_mean = gap_pct.rolling(window=50).mean()
+    long_std = gap_pct.rolling(window=50).std()
+    gap_zscore_long = (gap_pct - long_mean) / long_std
+    
+    # Combined signal - weighted average with agreement bonus
+    gap_zscore_multi_timeframe = pd.Series(np.nan, index=result_df.index)
+    
+    for i in range(len(result_df)):
+        short_z = gap_zscore_short.iloc[i]
+        long_z = gap_zscore_long.iloc[i]
+        
+        if not (np.isnan(short_z) or np.isnan(long_z)):
+            # Weight short-term more heavily but add agreement bonus
+            base_signal = 0.7 * short_z + 0.3 * long_z
+            
+            # Agreement bonus when both point same direction
+            if (short_z > 0 and long_z > 0) or (short_z < 0 and long_z < 0):
+                agreement_multiplier = 1.0 + min(abs(short_z * long_z) * 0.1, 0.5)
+                gap_zscore_multi_timeframe.iloc[i] = base_signal * agreement_multiplier
+            else:
+                gap_zscore_multi_timeframe.iloc[i] = base_signal * 0.8  # Penalty for disagreement
+        else:
+            gap_zscore_multi_timeframe.iloc[i] = 0
+    
+    result_df['Gap_ZScore_Multi_Timeframe'] = gap_zscore_multi_timeframe.fillna(0)
+    
+    return result_df
+
+
+
+
+
+def calculate_price_volume_indicators(df):
+    """Fixed version without data leakage"""
+    close = df['Close']
+    high = df['High']
+    low = df['Low']
+    volume = df['Volume']
+    
+    # Create all columns in a dictionary first
+    new_columns = {}
+    
+    # FIX: Use expanding max instead of cummax to avoid future data
+    expanding_max = close.expanding().max()
+    new_columns['percent_from_high'] = ((close - expanding_max) / expanding_max) * 100
+    new_columns['new_high'] = (close == expanding_max)
+    
+    # Days since high calculation - FIXED
+    new_columns['days_since_high'] = (~new_columns['new_high']).cumsum() - \
+                                   (~new_columns['new_high']).cumsum().where(new_columns['new_high']).ffill().fillna(0)
+    
+    new_columns['percent_range'] = (high - low) / close * 100
+    
+    # High-Close Ratio - this is okay as it uses same-day data
+    new_columns['High_Close_Ratio'] = (high - close) / (close + 1e-10)
+    
+    # FIX: Use shifted data for normalization
+    shifted_hc_ratio = new_columns['High_Close_Ratio'].shift(1)
+    new_columns['High_Close_Ratio_norm'] = (
+        new_columns['High_Close_Ratio'] - shifted_hc_ratio.rolling(50).mean()
+    ) / shifted_hc_ratio.rolling(50).std()
+    new_columns['High_Close_Ratio_norm'] = new_columns['High_Close_Ratio_norm'].clip(-3, 3)
+    
+    # FIX: VWAP calculations using shifted data
+    typical_price_shifted = (high.shift(1) + low.shift(1) + close.shift(1)) / 3
+    volume_shifted = volume.shift(1)
+    
+    new_columns['VWAP'] = (
+        (typical_price_shifted * volume_shifted).rolling(window=14).sum() / 
+        volume_shifted.rolling(window=14).sum()
+    )
+    
+    new_columns['VWAP_std14'] = new_columns['VWAP'].rolling(window=14).std()
+    new_columns['VWAP_std200'] = new_columns['VWAP'].rolling(window=20).std()
+    new_columns['VWAP%'] = ((close - new_columns['VWAP']) / new_columns['VWAP']) * 100
+    
+    # FIX: VWAP from high using expanding max
+    new_columns['VWAP%_from_high'] = ((new_columns['VWAP'] - expanding_max) / expanding_max) * 100
+    
+    # OBV calculation - this uses shifted close which is correct
+    close_shift_1 = close.shift(1)
+    obv_condition = close > close_shift_1
+    new_columns['OBV'] = np.where(obv_condition, volume, -volume).cumsum()
+    
+    # Volume metrics - FIX: use shifted volume for rolling calculations
+    new_columns['Volume_rolling_28'] = volume.shift(1).rolling(window=28).mean()
+    new_columns['Volume_rolling_90'] = volume.shift(1).rolling(window=90).mean()
+    new_columns['Volume%'] = ((volume - new_columns['Volume_rolling_28']) / new_columns['Volume_rolling_28']) * 100
+    new_columns['Volume%_rolling_90'] = ((volume - new_columns['Volume_rolling_90']) / new_columns['Volume_rolling_90']) * 100
+    new_columns['Volume_std'] = volume.shift(1).rolling(window=28).std()
+    new_columns['Volume_lag_1'] = volume.shift(1)
+    
+    # Weighted velocity - FIX: use shifted price changes
+    window = 10
+    price_change = close.diff().shift(1).fillna(0)  # Shift the price changes
+    weights = np.linspace(1, 0, window)
+    weights /= np.sum(weights)
+    weighted_velocity = price_change.rolling(window=window).apply(lambda x: np.dot(x, weights), raw=True)
+    new_columns['Weighted_Close_Change_Velocity'] = weighted_velocity
+    
+    return pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
+
+
+
+
+def add_vg_indicators(df: pd.DataFrame, 
+                      price_col: str = 'Close', 
+                      volume_col: str = 'Volume',
+                      lookback: int = 12,
+                      volume_trend_threshold: float = 0.70,
+                      volume_lookback: int = 50) -> pd.DataFrame:
+    """
+    Add visibility graph indicators and volume filter to dataframe.
+    
+    Args:
+        df: Input dataframe with price and volume data
+        price_col: Name of price column (default: 'Close')
+        volume_col: Name of volume column (default: 'Volume') 
+        lookback: Lookback period for VG calculation (default: 12)
+        volume_trend_threshold: Threshold for volume trend filter (default: 0.70)
+        volume_lookback: Lookback for volume trend calculation (default: 50)
+    
+    Returns:
+        Enhanced dataframe with VG indicators and signals
+    """
+    
+    df = df.copy()
+    close_prices = df[price_col].to_numpy()
+    
+    # Detrend the price data for stationarity
+    log_prices = np.log(close_prices)
+    x = np.arange(len(log_prices))
+    coeffs = np.polyfit(x, log_prices, 1)
+    trend = coeffs[0] * x + coeffs[1]
+    detrended_prices = log_prices - trend
+    
+    # Calculate volume trend filter
+    if volume_col in df.columns:
+        volume = df[volume_col].fillna(0)
+        df['volume_trend'] = np.nan
+        df['volume_trend_signal'] = 1
+        
+        for i in range(volume_lookback, len(volume)):
+            volume_window = volume.iloc[i-volume_lookback:i+1]
+            if len(volume_window) > 1 and volume_window.std() > 0:
+                time_index = np.arange(len(volume_window))
+                trend_corr = np.corrcoef(time_index, volume_window)[0, 1]
+                df.loc[i, 'volume_trend'] = trend_corr
+                
+                if trend_corr > volume_trend_threshold:
+                    df.loc[i, 'volume_trend_signal'] = 0
+    else:
+        print(f"Warning: {volume_col} column not found, skipping volume filter")
+        df['volume_trend'] = np.nan
+        df['volume_trend_signal'] = 1
+    
+    # Calculate visibility graph metrics
+    pos_path = np.full(len(close_prices), np.nan)
+    neg_path = np.full(len(close_prices), np.nan)
+    
+    for i in range(lookback, len(close_prices)):
+        window_data = detrended_prices[i - lookback + 1: i + 1]
+        
+        try:
+            pos_vg = NaturalVG()
+            pos_vg.build(window_data)
+            pos_nx = pos_vg.as_networkx()
+            pos_path[i] = nx.average_shortest_path_length(pos_nx)
+            
+            neg_vg = NaturalVG()
+            neg_vg.build(-window_data)
+            neg_nx = neg_vg.as_networkx()
+            neg_path[i] = nx.average_shortest_path_length(neg_nx)
+            
+        except:
+            pos_path[i] = np.nan
+            neg_path[i] = np.nan
+    
+    # Add VG indicators
+    df['vg_pos'] = pos_path
+    df['vg_neg'] = neg_path
+    df['vg_diff'] = df['vg_pos'] - df['vg_neg']
+    df['vg_abs_diff'] = np.abs(df['vg_diff'])
+    
+    # Generate trading signals with volume filter
+    df['vg_long_signal'] = 0
+    df['vg_short_signal'] = 0
+
+    long_condition = (df['vg_pos'] > df['vg_neg']) & (df['volume_trend_signal'] == 1)
+    short_condition = (df['vg_pos'] < df['vg_neg']) & (df['volume_trend_signal'] == 1)
+
+    df.loc[long_condition, 'vg_long_signal'] = 1
+    df.loc[short_condition, 'vg_short_signal'] = -1
+    df['vg_combined_signal'] = df['vg_long_signal'] + df['vg_short_signal']
+    
+    return df
+
+
+
+# Genetic indicators group
+def calculate_genetic_indicators(df):
+    epsilon = 1e-10
+    
+    for i in range(1, 8):
+        df[f'High_Lag{i}'] = df['High'].shift(i) + epsilon
+        df[f'Low_Lag{i}'] = df['Low'].shift(i) + epsilon
+        df[f'Volume_Lag{i}'] = df['Volume'].shift(i) + epsilon
+        df[f'Open_Lag{i}'] = df['Open'].shift(i) + epsilon
+
+    df['G_Price_Gap_Analyzer'] = safe_divide(safe_log(df['Open_Lag2']), df['High_Lag1'])
+    df['G_Triple_High_Trend_Indicator'] = safe_divide(df['High_Lag2'], df['High_Lag1'] * df['High'])
+    df['G_Cyclical_Price_Oscillator'] = safe_divide(
+        safe_divide(np.cos(safe_divide(df['High_Lag2'], df['High'])), df['High_Lag1']),
+        np.sqrt(df['Open_Lag1'] + epsilon)
+    )
+    df['G_Volume_Adjusted_Price_Indicator'] = safe_divide(df['High_Lag2'], safe_divide(df['Volume'], df['Low_Lag1']))
+    df['G_Adjusted_Close_Tracker'] = df['Adj Close']
+    df['G_Volume_Weighted_High_Ratio'] = safe_divide(safe_divide(df['High'], df['High_Lag1']), safe_log(df['Volume'] + 1))
+    df['G_High_Price_Momentum_Indicator'] = safe_divide(df['High'], (df['High_Lag1'] + df['High_Lag2']) / 2)
+    df['G_Advanced_Trend_Synthesizer'] = (
+        safe_log(safe_divide(df['High_Lag1'] + df['High_Lag5'], df['High_Lag1'])) *
+        np.abs(safe_log(safe_divide(df['High_Lag2'], df['High_Lag2'])) - df['High_Lag7']) *
+        safe_divide(df['Open_Lag2'], df['Close'])
+    )
+    df['G_Price_Volatility_Gauge'] = safe_divide(np.abs(df['High_Lag2'] - df['High']), df['Open'])
+    df['G_Multi_Point_Price_Analyzer'] = np.abs(
+        safe_divide(
+            safe_divide(safe_log(safe_divide(df['High'], df['High_Lag2'])), safe_divide(df['Close'], df['High_Lag2'])),
+            safe_divide(df['Close'], df['High_Lag2']) * safe_divide(df['Close'], df['High_Lag1'])
+        )
+    )
+    df['G_Logarithmic_Trend_Detector'] = -safe_log(safe_divide(df['High_Lag2'], df['High_Lag4']))
+    df['G_Complex_Price_Pattern_Indicator'] = safe_log(
+        safe_divide(
+            np.sqrt(np.sqrt(np.sqrt(np.sqrt(df['High_Lag7'] * df['High_Lag4'] + epsilon)))),
+            df['Close']
+        )
+    )
+    df['G_Log_Scaled_Price_Ratio'] = safe_log(safe_divide(df['High'], (df['High_Lag1'] + df['High_Lag2']) / 2))
+    df['G_Volume_Price_Impact_Indicator'] = safe_divide(
+        -df['High_Lag1'] + safe_divide(df['High_Lag3'], df['Close']),
+        df['Volume']
+    )
+    df['G_Volume_Trend_Analyzer'] = safe_log(safe_divide(df['Volume'], df['Volume_Lag1']))
+    df['G_Price_Open_Ratio_Indicator'] = safe_divide(
+        safe_divide(safe_log(safe_divide(df['High_Lag2'], df['High'])), safe_divide(df['High'], df['Open_Lag2'])),
+        safe_divide(df['High'], df['Open_Lag2'])
+    )
+    df['G_Price_Differential_Analyzer'] = (0.1673 / (df['High'] + epsilon) - df['Low']) / (df['High'] + epsilon)
+    df['G_Price_Volatility_Trend_Measure'] = 0.278 - np.abs(safe_divide(df['Low'], df['High']) / safe_divide(df['High_Lag5'], df['Low_Lag5']))
+    df['G_Lagged_Price_Volume_Convergence'] = safe_divide(df['Low_Lag2'], (df['High_Lag2'] + safe_divide(0.791, df['Low'] * df['High'])))
+    df['G_Price_Volume_Disparity_Index'] = np.abs(safe_divide(df['Low_Lag2'], df['High_Lag2'])) / (safe_divide(df['High_Lag5'], df['Low_Lag5']) / -0.2831)
+
+    for i in range(1, 8):
+        df = df.drop(columns=[f'High_Lag{i}', f'Low_Lag{i}', f'Volume_Lag{i}', f'Open_Lag{i}'])
+
+    return df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Kalman filter based indicators
+def calculate_kalman_indicators(df):
+    try:
+        n = len(df)
+        close_prices = df['Close'].values
+        
+        # Pre-allocate arrays
+        kalman_values = np.full(n, np.nan)
+        minima_values = np.full(n, np.nan)
+        maxima_values = np.full(n, np.nan)
+        support_pct = np.full(n, np.nan)
+        resistance_pct = np.full(n, np.nan)
+        
+        # Initialize Kalman filter parameters
+        transition_matrix = np.array([[1]])
+        observation_matrix = np.array([[1]])
+        transition_covariance = np.array([[0.01]])
+        observation_covariance = np.array([[1]])
+        initial_state_mean = close_prices[0]
+        initial_state_covariance = np.array([[1]])
+        
+        # Calculate Kalman filter values
+        current_state_mean = initial_state_mean
+        current_state_covariance = initial_state_covariance
+        
+        for i in range(n):
+            # Prediction step
+            predicted_state_mean = np.dot(transition_matrix, current_state_mean)
+            predicted_state_covariance = np.dot(np.dot(transition_matrix, current_state_covariance), transition_matrix.T) + transition_covariance
+            
+            # Update step with current observation
+            kalman_gain = np.dot(
+                np.dot(predicted_state_covariance, observation_matrix.T),
+                np.linalg.inv(np.dot(np.dot(observation_matrix, predicted_state_covariance), observation_matrix.T) + observation_covariance)
+            )
+            
+            current_state_mean = predicted_state_mean + np.dot(kalman_gain, (close_prices[i] - np.dot(observation_matrix, predicted_state_mean)))
+            current_state_covariance = predicted_state_covariance - np.dot(np.dot(kalman_gain, observation_matrix), predicted_state_covariance)
+            
+            # Store the current filtered value
+            kalman_values[i] = current_state_mean[0]
+        
+        # Compute extrema and percentages
+        window_size = 140
+        min_data_points = 20
+        for i in range(min_data_points, n):
+            # Use only lookback window for extrema detection
+            lookback = min(window_size, i)
+            lookback_start = max(0, i - lookback + 1)
+            historical_window = kalman_values[lookback_start:i+1]
+            
+            # Find local minima/maxima in historical window
+            if len(historical_window) >= 3:
+                min_indices = argrelextrema(historical_window, np.less_equal, order=1)[0]
+                max_indices = argrelextrema(historical_window, np.greater_equal, order=1)[0]
+                
+                # Process minima
+                if len(min_indices) > 0:
+                    most_recent_min_idx = min_indices[-1] + lookback_start
+                    if most_recent_min_idx < i:
+                        minima_values[i] = kalman_values[most_recent_min_idx]
+                    elif i > 0:
+                        minima_values[i] = minima_values[i-1]
+                elif i > 0:
+                    minima_values[i] = minima_values[i-1]
+                
+                # Process maxima
+                if len(max_indices) > 0:
+                    most_recent_max_idx = max_indices[-1] + lookback_start
+                    if most_recent_max_idx < i:
+                        maxima_values[i] = kalman_values[most_recent_max_idx]
+                    elif i > 0:
+                        maxima_values[i] = maxima_values[i-1]
+                elif i > 0:
+                    maxima_values[i] = maxima_values[i-1]
+            elif i > 0:
+                minima_values[i] = minima_values[i-1]
+                maxima_values[i] = maxima_values[i-1]
+            
+            # Calculate percentages
+            if not np.isnan(minima_values[i]) and minima_values[i] > 0:
+                support_pct[i] = (close_prices[i] - minima_values[i]) / minima_values[i] * 100
+                
+            if not np.isnan(maxima_values[i]) and close_prices[i] > 0:
+                resistance_pct[i] = (maxima_values[i] - close_prices[i]) / close_prices[i] * 100
+        
+        # Add to the original DataFrame
+        df['Kalman'] = kalman_values
+        df['minima'] = minima_values
+        df['maxima'] = maxima_values
+        df['Distance to Support (%)'] = support_pct
+        df['Distance to Resistance (%)'] = resistance_pct
+        
+        # Additional Kalman calculations
+        epsilon = 0.001
+        df['Smoothed_Close'] = df['Kalman']
+        df['Perturbed_Kalman'] = df['Kalman'] * (1 + epsilon)
+        df['Divergence'] = np.abs(df['Perturbed_Kalman'] - df['Kalman'])
+        df['Log_Divergence'] = np.log(df['Divergence'] + np.finfo(float).eps)
+        df['Lyapunov_Exponent'] = df['Log_Divergence'].diff() / np.log(1 + epsilon)
+        window_size = 14
+        df['Lyapunov_Exponent_MA'] = df['Lyapunov_Exponent'].rolling(window=window_size).mean()
+        
+        # MA and percentage difference
+        df['MA_200'] = df['Close'].rolling(window=200, min_periods=200).mean()
+        df['Perc_Diff'] = (df['Kalman'] - df['MA_200']) / df['MA_200'] * 100
+        
+    except Exception as e:
+        logging.error(f"Error in calculate_kalman_indicators: {str(e)}")
+    
+    return df
+
+# Specialized volatility indicators
+def calculate_volatility_indicators(df):
+    # Mean reversion z-scores
+    def add_multiple_mean_reversion_z_scores(data, price_column='Smoothed_Close', windows=[28, 90, 151], std_multipliers=[1, 1, 3]):
+        # Create a dictionary to collect all values
+        new_columns = {}
+        
+        for window, std_multiplier in zip(windows, std_multipliers):
+            mean_col = f'Rolling_Mean_{window}'
+            std_col = f'Rolling_Std_{window}'
+            z_score_col = f'Mean_Reversion_Z_Score_{window}_std_{std_multiplier}'
+
+            rolling_window = data[price_column].rolling(window=window)
+            new_columns[mean_col] = rolling_window.mean()
+            new_columns[std_col] = rolling_window.std()
+            new_columns[z_score_col] = (data[price_column] - new_columns[mean_col]) / (new_columns[std_col] * std_multiplier)
+
+        # Add all columns at once
+        return pd.concat([data, pd.DataFrame(new_columns, index=data.index)], axis=1)
+    
+    # Add complexity metrics
+    def add_complexity_metrics(data, window_size=90):
+        # Create a dictionary to collect all values
+        new_columns = {}
+        
+        rolling_variance = data['Close'].rolling(window=window_size).var()
+        new_columns['Complexity_Invariant_Distance'] = rolling_variance.diff().abs()
+        new_columns['CID_Mean'] = new_columns['Complexity_Invariant_Distance'].rolling(window=window_size).mean()
+        new_columns['CID_SD'] = new_columns['Complexity_Invariant_Distance'].rolling(window=window_size).std()
+        
+        # Add all columns at once
+        return pd.concat([data, pd.DataFrame(new_columns, index=data.index)], axis=1)
+    
+    # Calculate rolling indicators
+    pct_change_close = df['Close'].pct_change()
+    rolling_20 = df['Close'].rolling(window=20)
+    rolling_14 = df['Close'].rolling(window=14)
+    
+    df['percent_change_Close'] = pct_change_close
+    df['pct_change_std'] = rolling_20.std()
+    df['percent_change_Close_lag_1'] = pct_change_close.shift(1)
+    df['percent_change_Close_lag_5'] = pct_change_close.shift(5)
+    df['percent_change_Close_lag_10'] = pct_change_close.shift(10)
+    df['pct_change_std_rolling'] = rolling_20.mean()
+    
+    # Direction flipper calculations
+    direction_flipper = (pct_change_close > 0).astype(int)
+    df['direction_flipper_count5'] = direction_flipper.rolling(window=5).sum()
+    df['direction_flipper_count_10'] = direction_flipper.rolling(window=10).sum()
+    
+    # Keltner Channel calculations
+    keltner_central = df['Close'].ewm(span=20).mean()
+    keltner_range = df['ATR'] * 1.5
+    df['KC_UPPER%'] = ((keltner_central + keltner_range) - df['Close']) / df['Close'] * 100
+    df['KC_LOWER%'] = (df['Close'] - (keltner_central - keltner_range)) / df['Close'] * 100
+    
+
+
+
+    ##new target constgruction here 
+    ##vol ajusted open to close move tamped down by a fraction of the atr
+    raw_move = (df['Close'] - df['Open']) / df['ATR']
+    cost = 0.1
+
+    df['percent_change_Open_to_Close_ATR_ajusted'] = np.sign(raw_move) * np.maximum(np.abs(raw_move) - cost, 0)
+
+
+
+    # Apply additional indicator calculations
+    if 'Smoothed_Close' in df.columns:
+        df = add_multiple_mean_reversion_z_scores(df)
+    df = add_complexity_metrics(df)
+    
+    return df
+
+# Composite and significant indicators
+def calculate_significant_indicators(df):
+    df = df.copy()
+    
+    epsilon = 1e-10
+    new_data = {}
+    # Ensure we don't recreate columns that already exist
+    if 'High_Close_Ratio' in df.columns:
+        new_data['HC_Ratio'] = pd.Series((df['High'] - df['Close']) / (df['Close'] + epsilon), index=df.index)
+    else:
+        new_data['High_Close_Ratio'] = pd.Series((df['High'] - df['Close']) / (df['Close'] + epsilon), index=df.index)
+    
+    # Create columns for distances
+    distance_from_peak = np.zeros(len(df))
+    distance_from_trough = np.zeros(len(df))
+    
+    for ticker in df['Ticker'].unique():
+        ticker_mask = df['Ticker'] == ticker
+        ticker_indices = df.index[ticker_mask]
+        
+        min_max_window = 10
+        
+        # Process each point using only past data
+        for i in range(min_max_window, len(ticker_indices)):
+            current_idx = ticker_indices[i]
+            # Get historical window up to and including current point
+            historical_window_indices = ticker_indices[max(0, i-50):i+1]
+            historical_prices = df.loc[historical_window_indices, 'Close'].values
+            
+            # Find peaks and troughs in the historical window only
+            local_max_indices = argrelextrema(historical_prices, np.greater, order=min_max_window)[0]
+            local_min_indices = argrelextrema(historical_prices, np.less, order=min_max_window)[0]
+            
+            # Translate indices within the window to dataframe indices
+            local_max_df_indices = local_max_indices + max(0, i-50)
+            local_min_df_indices = local_min_indices + max(0, i-50)
+            
+            # Make sure we don't consider the current point itself as a peak/trough
+            local_max_df_indices = local_max_df_indices[local_max_df_indices < i]
+            local_min_df_indices = local_min_df_indices[local_min_df_indices < i]
+            
+            current_price = df.loc[current_idx, 'Close']
+            
+            # Calculate distance from nearest peak
+            if len(local_max_df_indices) > 0:
+                nearest_peak_idx = ticker_indices[local_max_df_indices[-1]]
+                peak_price = df.loc[nearest_peak_idx, 'Close']
+                distance_from_peak[current_idx] = (current_price - peak_price) / peak_price
+            
+            # Calculate distance from nearest trough
+            if len(local_min_df_indices) > 0:
+                nearest_trough_idx = ticker_indices[local_min_df_indices[-1]]
+                trough_price = df.loc[nearest_trough_idx, 'Close']
+                distance_from_trough[current_idx] = (current_price - trough_price) / trough_price
+    
+    # Store distances in DataFrame as Series
+    distance_from_peak_series = pd.Series(distance_from_peak, index=df.index)
+    distance_from_trough_series = pd.Series(distance_from_trough, index=df.index)
+    
+    # Check which ratio to use
+    ratio_column = 'High_Close_Ratio' if 'High_Close_Ratio' in new_data else 'HC_Ratio'
+    
+    # Calculate Pattern_Indicator
+    new_data['Pattern_Indicator'] = pd.Series(-1 * distance_from_peak_series * new_data[ratio_column], index=df.index)
+    
+    if 'RSI' not in df.columns:
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0))
+        loss = (-delta.where(delta < 0, 0))
+        avg_gain = gain.rolling(window=14, min_periods=14).mean()
+        avg_loss = loss.rolling(window=14, min_periods=14).mean()
+        rs = avg_gain / avg_loss
+        new_data['RSI'] = pd.Series(100 - (100 / (1 + rs)), index=df.index)
+    else:
+        new_data['RSI'] = df['RSI'].copy()
+
+    # Calculate the composite indicators - ensuring we always have Series
+    new_data['RSI_HC_Composite'] = pd.Series(new_data[ratio_column] * (100 - new_data['RSI']) / 50, index=df.index)
+    
+    # Create a temporary DataFrame to handle Series operations properly
+    temp_df = pd.DataFrame(new_data, index=df.index)
+    
+    temp_df['RSI_HC_Composite_norm'] = (
+        temp_df['RSI_HC_Composite'] - 
+        temp_df['RSI_HC_Composite'].shift(1).rolling(50).mean()
+    ) / temp_df['RSI_HC_Composite'].shift(1).rolling(50).std()
+    
+    temp_df['RSI_HC_Composite_norm'] = temp_df['RSI_HC_Composite_norm'].clip(-3, 3)
+    
+    if 'Lyapunov_Scaled' not in df.columns:
+        lyapunov_data = {}
+        for ticker in df['Ticker'].unique():
+            ticker_mask = df['Ticker'] == ticker
+            indices = df.index[ticker_mask]
+            close_volatility = df.loc[ticker_mask, 'Close'].pct_change().rolling(50, min_periods=10).std()
+            
+            # Calculate Lyapunov with lagged statistics
+            rolling_mean = close_volatility.shift(1).rolling(50, min_periods=10).mean()
+            rolling_std = close_volatility.shift(1).rolling(50, min_periods=10).std()
+            
+            # Apply z-score normalization using only past data
+            lyapunov_scaled = (close_volatility - rolling_mean) / rolling_std.replace(0, 1)
+            
+            # Clip and scale
+            lyapunov_scaled = lyapunov_scaled.clip(-3, 3) / 3
+            
+            for idx, value in zip(indices, lyapunov_scaled):
+                lyapunov_data[idx] = value
+        
+        # Convert to Series
+        temp_df['Lyapunov_Scaled'] = pd.Series(lyapunov_data)
+    else:
+        temp_df['Lyapunov_Scaled'] = df['Lyapunov_Scaled'].copy()
+
+    # Now we're using the DataFrame to ensure we have Series for shift operations
+    temp_df['HC_Predict_Regime'] = np.where(
+        temp_df['Lyapunov_Scaled'].shift(1) < -0.3,
+        temp_df[ratio_column] * 1.5,
+        np.where(
+            temp_df['Lyapunov_Scaled'].shift(1) > 0.3,
+            temp_df[ratio_column] * 0.5,
+            temp_df[ratio_column]
+        )
+    )
+    
+    temp_df['HC_Predict_Regime_norm'] = (
+        temp_df['HC_Predict_Regime'] - 
+        temp_df['HC_Predict_Regime'].shift(1).rolling(50).mean()
+    ) / temp_df['HC_Predict_Regime'].shift(1).rolling(50).std()
+    
+    temp_df['HC_Predict_Regime_norm'] = temp_df['HC_Predict_Regime_norm'].clip(-3, 3)
+    
+    
+    sig_indicators = ['Pattern_Indicator', 'RSI_HC_Composite', ratio_column, 'HC_Predict_Regime']
+    sig_indicators = [i for i in sig_indicators if i in temp_df.columns]
+    
+    # Normalize each indicator before combining
+    for indicator in sig_indicators:
+        norm_name = f"{indicator}_norm"
+        if norm_name not in temp_df.columns:
+            temp_df[norm_name] = (
+                temp_df[indicator] - 
+                temp_df[indicator].shift(1).rolling(50).mean()
+            ) / temp_df[indicator].shift(1).rolling(50).std()
+            
+            temp_df[norm_name] = temp_df[norm_name].clip(-3, 3)
+    
+    norm_columns = [f"{i}_norm" for i in sig_indicators if f"{i}_norm" in temp_df.columns]
+    if len(norm_columns) > 0:
+        temp_df['Significant_Indicators_Ensemble'] = temp_df[norm_columns].mean(axis=1)
+    
+    # Return the combined DataFrame
+    return pd.concat([df, temp_df], axis=1)
+
+
+    
+# Main indicator calculation function
+
+
+
+def add_trading_signal_features(df):
+    """
+    Add trading signal features based on can_buy logic to the indicators pipeline.
+    These features allow the ML model to learn the filtering patterns.
+    All features are numerical and relative rather than hardcoded thresholds.
+    """
+    
+    if len(df) < 50:
+        return df
+    
+    # Initialize new columns dictionary
+    features = {}
+    
+    # === VIX REGIME FEATURES ===
+    if 'VIX_Close' in df.columns:
+        features.update(calculate_vix_regime_features(df))
+    
+    # === LIQUIDITY AND VOLUME FEATURES ===
+    features.update(calculate_liquidity_features(df))
+    
+    # === VOLATILITY AND ATR FEATURES ===
+    features.update(calculate_volatility_atr_features(df))
+    
+    # === PRICE MOMENTUM FEATURES ===
+    features.update(calculate_price_momentum_features(df))
+    
+    # === VOLUME MOMENTUM FEATURES ===
+    features.update(calculate_volume_momentum_features(df))
+    
+    # === MARKET REGIME FEATURES ===
+    features.update(calculate_market_regime_features(df))
+    
+    # === PRICE ACTION AND GAP FEATURES ===
+    features.update(calculate_price_action_features(df))
+    
+    # === COEFFICIENT OF VARIATION FEATURES ===
+    features.update(calculate_volatility_cv_features(df))
+    
+    # Convert to DataFrame and add to original
+    features_df = pd.DataFrame(features, index=df.index)
+    return pd.concat([df, features_df], axis=1)
+
+
+def calculate_vix_regime_features(df):
+    """Extract VIX-based regime features"""
+    features = {}
+    
+    current_vix = df['VIX_Close']
+    
+    # Rolling VIX statistics (using only past data)
+    vix_ma_20 = current_vix.shift(1).rolling(20, min_periods=10).mean()
+    vix_ma_50 = current_vix.shift(1).rolling(50, min_periods=20).mean()
+    vix_std_20 = current_vix.shift(1).rolling(20, min_periods=10).std()
+    
+    # VIX percentile rank (relative measure)
+    vix_window_252 = current_vix.shift(1).rolling(252, min_periods=50)
+    features['vix_percentile_rank'] = vix_window_252.apply(
+        lambda x: (x <= x.iloc[-1]).mean() * 100 if len(x) > 0 else 50, raw=False
+    )
+    
+    # VIX regime scaling factor (continuous)
+    features['vix_regime_scale'] = np.where(
+        features['vix_percentile_rank'] >= 80, 1.20,
+        np.where(features['vix_percentile_rank'] >= 60, 1.10,
+                np.where(features['vix_percentile_rank'] <= 20, 0.95, 1.0))
+    )
+    
+    # VIX momentum and acceleration
+    features['vix_momentum_5d'] = current_vix.pct_change(5)
+    features['vix_acceleration'] = features['vix_momentum_5d'].diff()
+    
+    # VIX z-score
+    features['vix_zscore'] = (current_vix - vix_ma_20) / (vix_std_20 + 1e-8)
+    
+    # VIX regime transitions
+    features['vix_regime_low'] = (features['vix_percentile_rank'] <= 25).astype(float)
+    features['vix_regime_high'] = (features['vix_percentile_rank'] >= 75).astype(float)
+    
+    return features
+
+
+
+
+
+
+def calculate_liquidity_features(df):
+    """Extract liquidity and volume-related features"""
+    features = {}
+    
+    current_close = df['Close']
+    current_volume = df['Volume']
+    
+    # Dollar volume calculations
+    current_dollar_volume = current_volume * current_close
+    
+    # Historical dollar volume statistics (using shifted data)
+    dollar_vol_shifted = current_dollar_volume.shift(1)
+    features['dollar_volume_ma_10'] = dollar_vol_shifted.rolling(10, min_periods=5).mean()
+    features['dollar_volume_ma_252'] = dollar_vol_shifted.rolling(252, min_periods=50).mean()
+    features['dollar_volume_std_252'] = dollar_vol_shifted.rolling(252, min_periods=50).std()
+    
+    # Current dollar volume relative measures
+    features['dollar_volume_ratio_10d'] = current_dollar_volume / (features['dollar_volume_ma_10'] + 1e-8)
+    features['dollar_volume_ratio_252d'] = current_dollar_volume / (features['dollar_volume_ma_252'] + 1e-8)
+    features['dollar_volume_zscore'] = (
+        current_dollar_volume - features['dollar_volume_ma_252']
+    ) / (features['dollar_volume_std_252'] + 1e-8)
+    
+    # Volume percentile rank
+    vol_window_252 = dollar_vol_shifted.rolling(252, min_periods=50)
+    features['dollar_volume_percentile'] = vol_window_252.apply(
+        lambda x: (x <= current_dollar_volume.iloc[x.index[-1]]).mean() * 100 if len(x) > 0 else 50, 
+        raw=False
+    )
+    
+    # Volume trend analysis (5d vs 20d)
+    features['volume_trend_5d_20d'] = (
+        dollar_vol_shifted.rolling(5, min_periods=3).mean() / 
+        (dollar_vol_shifted.rolling(20, min_periods=10).mean() + 1e-8)
+    )
+    
+    # Short-term liquidity stress (3d vs median)
+    features['liquidity_stress_3d'] = (
+        dollar_vol_shifted.rolling(3, min_periods=2).mean() / 
+        (dollar_vol_shifted.rolling(252, min_periods=50).median() + 1e-8)
+    )
+    
+    # Volume spike detection (relative to recent average)
+    vol_10d_avg = current_volume.shift(1).rolling(10, min_periods=5).mean()
+    features['volume_spike_ratio'] = current_volume / (vol_10d_avg + 1e-8)
+    
+    # Sustained volume burst (count of high volume days in last 5)
+    volume_burst_threshold = vol_10d_avg * 3
+    recent_volumes = current_volume.rolling(5, min_periods=3)
+    features['sustained_volume_burst_count'] = recent_volumes.apply(
+        lambda x: (x > volume_burst_threshold.iloc[x.index[-1]]).sum() if len(x) > 0 else 0, 
+        raw=False
+    )
+    
+    return features
+
+
+def calculate_volatility_atr_features(df):
+    """Extract ATR and volatility-related features"""
+    features = {}
+    
+    # True Range calculation (using shifted close)
+    high = df['High']
+    low = df['Low']
+    close_prev = df['Close'].shift(1)
+    
+    tr1 = high - low
+    tr2 = np.abs(high - close_prev)
+    tr3 = np.abs(low - close_prev)
+    true_range = np.maximum(tr1, np.maximum(tr2, tr3))
+    
+    # ATR calculation
+    features['atr_14'] = true_range.rolling(14, min_periods=10).mean()
+    features['atr_percentage'] = features['atr_14'] / df['Close']
+    
+    # ATR percentile rank
+    atr_pct_shifted = features['atr_percentage'].shift(1)
+    atr_window_252 = atr_pct_shifted.rolling(252, min_periods=50)
+    features['atr_percentile_rank'] = atr_window_252.apply(
+        lambda x: (x <= features['atr_percentage'].iloc[x.index[-1]]).mean() * 100 if len(x) > 0 else 50,
+        raw=False
+    )
+    
+    # Gap analysis
+    current_open = df['Open']
+    prev_close = df['Close'].shift(1)
+    gap_pct = (current_open - prev_close) / (prev_close + 1e-8)
+    features['gap_percentage'] = gap_pct
+    features['gap_absolute'] = np.abs(gap_pct)
+    
+    # Gap in ATR terms
+    prev_atr_pct = features['atr_percentage'].shift(1)
+    features['gap_in_atr_terms'] = gap_pct / (prev_atr_pct + 1e-8)
+    
+    # ATR regime classification
+    features['atr_regime_low'] = (features['atr_percentile_rank'] <= 25).astype(float)
+    features['atr_regime_high'] = (features['atr_percentile_rank'] >= 75).astype(float)
+    
+    return features
+
+
+def calculate_price_momentum_features(df):
+    """Extract price momentum features"""
+    features = {}
+    
+    close = df['Close']
+    
+    # Multi-timeframe returns
+    for period in [3, 5, 10, 20]:
+        features[f'return_{period}d'] = close.pct_change(period)
+        features[f'return_{period}d_abs'] = np.abs(features[f'return_{period}d'])
+    
+    # Momentum strength indicators
+    features['momentum_strength_5d'] = np.where(features['return_5d'] > 0.005, 1.0, 0.0)
+    features['momentum_strength_continuous'] = np.tanh(features['return_5d'] * 100)  # Continuous version
+    
+    # Rapid price movement detection
+    features['rapid_price_change_5d'] = close / close.shift(5) - 1
+    features['rapid_price_change_zscore'] = (
+        features['rapid_price_change_5d'] - 
+        features['rapid_price_change_5d'].shift(1).rolling(50, min_periods=20).mean()
+    ) / (features['rapid_price_change_5d'].shift(1).rolling(50, min_periods=20).std() + 1e-8)
+    
+    # Price acceleration
+    features['price_acceleration'] = features['return_5d'] - features['return_5d'].shift(5)
+    
+    # Trend consistency (what % of last N days were positive)
+    for window in [5, 10, 20]:
+        daily_returns = close.pct_change()
+        features[f'trend_consistency_{window}d'] = (
+            daily_returns.rolling(window, min_periods=window//2).apply(
+                lambda x: (x > 0).mean(), raw=True
+            )
+        )
+    
+    return features
+
+
+def calculate_volume_momentum_features(df):
+    """Extract volume momentum features"""
+    features = {}
+    
+    volume = df['Volume']
+    close = df['Close']
+    dollar_volume = volume * close
+    
+    # Dollar volume momentum (5d vs 20d comparison)
+    dv_5d = dollar_volume.shift(1).rolling(5, min_periods=3).mean()
+    dv_20d = dollar_volume.shift(1).rolling(20, min_periods=10).mean()
+    features['volume_momentum_ratio'] = dv_5d / (dv_20d + 1e-8)
+    
+    # Volume trend strength
+    features['volume_trend_strength'] = np.where(
+        features['volume_momentum_ratio'] > 1.0, 
+        np.log(features['volume_momentum_ratio']), 
+        -np.log(1.0 / (features['volume_momentum_ratio'] + 1e-8))
+    )
+    
+    # Volume persistence (how many days has volume been above/below average)
+    vol_ma_20 = volume.shift(1).rolling(20, min_periods=10).mean()
+    vol_above_avg = volume > vol_ma_20
+    features['volume_persistence'] = vol_above_avg.rolling(10, min_periods=5).sum()
+    
+    # Volume volatility
+    vol_returns = volume.pct_change()
+    features['volume_volatility'] = vol_returns.rolling(20, min_periods=10).std()
+    
+    return features
+
+
+def calculate_market_regime_features(df):
+    """Extract market regime features"""
+    features = {}
+    
+    close = df['Close']
+    
+    # Price position in recent ranges
+    for window in [20, 50, 100]:
+        high_window = df['High'].rolling(window, min_periods=window//2).max()
+        low_window = df['Low'].rolling(window, min_periods=window//2).min()
+        price_range = high_window - low_window
+        features[f'price_position_{window}d'] = (
+            (close - low_window) / (price_range + 1e-8)
+        )
+    
+    # Trend direction using multiple timeframes
+    for window in [10, 20, 50]:
+        sma = close.rolling(window, min_periods=window//2).mean()
+        features[f'trend_direction_{window}d'] = np.where(close > sma, 1.0, -1.0)
+        features[f'distance_from_sma_{window}d'] = (close - sma) / (sma + 1e-8)
+    
+    # Market regime composite (trend + volatility)
+    vol_regime = df.get('vix_regime_scale', pd.Series(1.0, index=df.index))
+    trend_regime = features.get('trend_direction_20d', pd.Series(0.0, index=df.index))
+    features['market_regime_composite'] = vol_regime * trend_regime
+    
+    return features
+
+
+
+
+
+
+def calculate_price_action_features(df):
+    """Extract price action features"""
+    features = {}
+    
+    close = df['Close']
+    open_price = df['Open']
+    high = df['High']
+    low = df['Low']
+    
+    # Price floor relative measure (distance from minimum viable price)
+    features['price_quality_score'] = np.log(close / 1.10) if (close > 1.10).all() else np.log(close / close.min())
+    
+    # Intraday range characteristics
+    features['intraday_range_pct'] = (high - low) / close
+    features['open_close_ratio'] = (close - open_price) / (open_price + 1e-8)
+    features['high_close_ratio'] = (high - close) / (close + 1e-8)
+    features['low_close_ratio'] = (close - low) / (close + 1e-8)
+    
+    # Price action patterns
+    features['doji_pattern'] = np.where(
+        np.abs(features['open_close_ratio']) < 0.001, 1.0, 0.0
+    )
+    features['hammer_pattern'] = np.where(
+        (features['low_close_ratio'] > features['high_close_ratio'] * 2) & 
+        (features['open_close_ratio'] > 0), 1.0, 0.0
+    )
+    
+    return features
+
+
+def calculate_volatility_cv_features(df):
+    """Extract coefficient of variation features"""
+    features = {}
+    
+    close = df['Close']
+    
+    # Coefficient of variation for different windows
+    for window in [10, 20, 50]:
+        close_window = close.rolling(window, min_periods=window//2)
+        mean_price = close_window.mean()
+        std_price = close_window.std()
+        features[f'cv_{window}d'] = std_price / (mean_price + 1e-8)
+        
+        # Historical CV comparison
+        cv_shifted = features[f'cv_{window}d'].shift(1)
+        cv_window_252 = cv_shifted.rolling(252, min_periods=50)
+        features[f'cv_{window}d_percentile'] = cv_window_252.apply(
+            lambda x: (x <= features[f'cv_{window}d'].iloc[x.index[-1]]).mean() * 100 if len(x) > 0 else 50,
+            raw=False
+        )
+        
+        # CV regime classification
+        features[f'cv_{window}d_regime_high'] = (features[f'cv_{window}d_percentile'] >= 80).astype(float)
+        features[f'cv_{window}d_regime_low'] = (features[f'cv_{window}d_percentile'] <= 20).astype(float)
+    
+    return features
+
+
+def create_trading_signal_composite_scores(df):
+    """
+    Create composite scores that summarize the trading signal strength.
+    These can be used as high-level features for the ML model.
+    """
+    
+    features = {}
+    
+    # Liquidity score (0-1, higher is better liquidity)
+    liquidity_components = [
+        df.get('dollar_volume_percentile', 50) / 100,
+        np.clip(df.get('volume_trend_5d_20d', 1.0), 0, 2) / 2,
+        1 - np.clip(df.get('liquidity_stress_3d', 1.0), 0, 2) / 2
+    ]
+    features['liquidity_score'] = np.mean(liquidity_components, axis=0)
+    
+    # Volatility score (0-1, higher indicates better trading conditions)
+    vol_components = [
+        df.get('vix_percentile_rank', 50) / 100,
+        np.clip(df.get('atr_percentile_rank', 50), 20, 80) / 100,
+        1 - np.clip(df.get('cv_20d_percentile', 50), 0, 90) / 100
+    ]
+    features['volatility_score'] = np.mean(vol_components, axis=0)
+    
+    # Momentum score (0-1, higher indicates strong momentum)
+    momentum_components = [
+        np.clip(df.get('momentum_strength_continuous', 0), -1, 1) / 2 + 0.5,
+        np.clip(df.get('volume_momentum_ratio', 1.0), 0.5, 1.5) / 2,
+        np.clip(df.get('trend_consistency_10d', 0.5), 0, 1)
+    ]
+    features['momentum_score'] = np.mean(momentum_components, axis=0)
+    
+    # Overall trading signal score
+    features['trading_signal_composite'] = (
+        features['liquidity_score'] * 0.3 +
+        features['volatility_score'] * 0.4 +
+        features['momentum_score'] * 0.3
+    )
+    
+    return features
+
+
+# Integration function to add to your indicators pipeline
+def add_can_buy_features_to_indicators(df):
+    """
+    Main function to add all trading signal features to your indicators pipeline.
+    Call this at the end of your indicators() function.
+    """
+    
+    # Add the basic trading signal features
+    df = add_trading_signal_features(df)
+    
+    # Add composite scores
+    composite_features = create_trading_signal_composite_scores(df)
+    composite_df = pd.DataFrame(composite_features, index=df.index)
+    df = pd.concat([df, composite_df], axis=1)
+    
+    # Fill any NaN values with sensible defaults
+    trading_feature_columns = [col for col in df.columns if any(
+        keyword in col.lower() for keyword in [
+            'vix_', 'dollar_volume_', 'atr_', 'gap_', 'return_', 'momentum_', 
+            'volume_', 'trend_', 'price_', 'cv_', 'liquidity_', 'trading_signal_'
+        ]
+    )]
+    
+    for col in trading_feature_columns:
+        if col in df.columns:
+            # Fill with forward fill first, then with column median
+            df[col] = df[col].ffill().fillna(df[col].median())
+    
+    return df
+
+
+
+def gap_indicators(df, vol_percentile=75, extreme_pct=10, lookback=20, expanding_window=None):
+    
+    df = df.copy()
+    
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date')
+        else:
+            raise ValueError("DataFrame must have DatetimeIndex or 'Date' column")
+    
+    required_cols = ['Open', 'High', 'Low', 'Close']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+    
+    df = df.sort_index()
+    
+    prev_close = df['Close'].shift(1)
+    gap_pct = (df['Open'] - prev_close) / prev_close * 100
+    
+    daily_range = df['High'] - df['Low']
+    close_to_low = df['Close'] - df['Low']
+    close_position_raw = close_to_low / daily_range.replace(0, np.nan)
+    df['close_position'] = close_position_raw.fillna(0.5).clip(0, 1)
+    
+    df['gap_volatility'] = gap_pct.rolling(lookback, min_periods=2).std()
+    
+    if expanding_window is not None:
+        df['vol_threshold'] = df['gap_volatility'].shift(1).rolling(
+            window=expanding_window, min_periods=expanding_window
+        ).quantile(vol_percentile / 100)
+        
+        df['close_low_threshold'] = df['close_position'].shift(1).rolling(
+            window=expanding_window, min_periods=expanding_window
+        ).quantile(extreme_pct / 100)
+        
+        df['close_high_threshold'] = df['close_position'].shift(1).rolling(
+            window=expanding_window, min_periods=expanding_window
+        ).quantile(1 - extreme_pct / 100)
+    else:
+        df['vol_threshold'] = df['gap_volatility'].shift(1).expanding(
+            min_periods=252
+        ).quantile(vol_percentile / 100)
+        
+        df['close_low_threshold'] = df['close_position'].shift(1).expanding(
+            min_periods=252
+        ).quantile(extreme_pct / 100)
+        
+        df['close_high_threshold'] = df['close_position'].shift(1).expanding(
+            min_periods=252
+        ).quantile(1 - extreme_pct / 100)
+    
+    df['high_vol'] = (df['gap_volatility'] > df['vol_threshold']).astype(int)
+    
+    df['long_signal'] = (
+        (df['close_position'] < df['close_low_threshold']) & 
+        (df['high_vol'] == 1)
+    ).astype(int)
+    
+    df['short_signal'] = (
+        (df['close_position'] > df['close_high_threshold']) & 
+        (df['high_vol'] == 1)
+    ).astype(int)
+    
+    return df
+
+
+
+
+
+##data clean up and preciscion control
+def final_cleanup(df):
+    # Remove duplicate columns before final cleanup
+    if len(df.columns) != len(df.columns.unique()):
+        df = df.loc[:, ~df.columns.duplicated(keep='last')]
+        
+    # Final cleanup
+    columns_to_drop = ['Adj Close', 'ATZ_Upper', 'ATZ_Lower', 'VWAP', '200DAY_ATR-', '200DAY_ATR', 'ATR', 'OBV', '200ma', '14ma']
+    columns_to_drop = [col for col in columns_to_drop if col in df.columns]
+    df = interpolate_columns(df, max_gap_fill=50)
+    df = df.iloc[200:]
+    df = df.drop(columns=columns_to_drop, axis=1)
+    df = df.round(4)
+
+    return df
+
+
+def forward_fill(df):
+    df = df.copy()
+    
+    # Forward-fill and convert data types
+    df['Close'] = df['Close'].ffill()
+    df['High'] = df['High'].ffill()
+    df['Low'] = df['Low'].ffill()
+    df['Volume'] = df['Volume'].ffill()
+
+    df['Close'] = df['Close'].astype(np.float32)
+    df['High'] = df['High'].astype(np.float32)
+    df['Low'] = df['Low'].astype(np.float32)
+    df['Open'] = df['Open'].astype(np.float32)
+    df['Volume'] = df['Volume'].astype(np.float32)
+
+    return df
+
+
+
+
+
+def indicators(df):
+    
+    # Make a copy to avoid in-place modifications causing fragmentation
+    df = forward_fill(df)
+
+    df = add_genetic_info_decay_3d(df)
+    df = add_genetic_autocorr_3d(df)
+    df = add_volume_spectral_splatter(df)
+    df = add_genetic_log_zscore_20d(df)
+    df = add_genetic_signal_strength(df)
+
+    # Calculate all indicator groups
+    df = calculate_genetic_indicators(df)
+    df = calculate_parabolic_SAR(df)
+    df = calculate_moving_average_indicators(df)
+    df = calculate_price_volume_indicators(df)
+    df = calculate_kalman_indicators(df)
+    df = calculate_volatility_indicators(df)
+    df = calculate_significant_indicators(df)
+        
+    df = add_price_differential_ratio(df, epsilon = 1e-10)
+    df = add_top_stress_indicators(df)
+    base_column = 'Price_Differential_Ratio'
+    
+    df = add_rolling_log_scaled_features(df, base_column)
+    df = add_rate_of_change_features(df, base_column)
+    df = add_z_score_signals(df, base_column)
+    df = add_momentum_signals(df, base_column)
+    df = add_trend_reversal_signals(df, base_column)
+    df = add_volatility_regime_signals(df, base_column)
+    df = add_signal_persistence_features(df, base_column)
+    df = add_composite_signal_strength(df, base_column)
+    df = add_information_efficiency_features(df, base_column)
+
+    df = calculate_vix_features(df)
+    df = calculate_dvamr_probability(df)
+
+    df = calculate_beta(df, window=60, min_periods=30)
+
+    df = add_can_buy_features_to_indicators(df)
+
+    df = final_cleanup(df)
+    
+    return df
+
+
+
+
+
+
+# Additional indicator calculation functions
+def calculate_parabolic_SAR(df):
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+
+    # Initialize SAR
+    sar = low[0]
+    ep = high[0]
+    af = 0.02
+    sar_values = [sar]
+
+    for i in range(1, len(df)):
+        sar = sar + af * (ep - sar)
+        if close[i] > close[i - 1]:
+            af = min(af + 0.02, 0.2)
+        else:
+            af = 0.02
+
+        if close[i] > close[i - 1]:
+            ep = max(high[i], ep)
+        else:
+            ep = min(low[i], ep)
+
+        sar = min(sar, low[i], low[i - 1]) if close[i] > close[i - 1] else max(sar, high[i], high[i - 1])
+        sar_values.append(sar)
+
+    df['Parabolic_SAR'] = sar_values
+    return df
+
+# File processing functions
+def validate_columns(df, required_columns):
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        logging.error(f"Missing columns: {missing_columns}")
+        return False
+    return True
+
+def DataQualityCheck(df, all_dfs=None):
+    quality_issues = []
+    
+    if df is None or df.empty:
+        logging.error("DataFrame is empty.")
+        return None
+    
+    if len(df) < 201:
+        quality_issues.append(f"Insufficient data points: {len(df)}/201 minimum required.")
+    
+    price_variance = df[['Open', 'High', 'Low', 'Close']].std().sum()
+    if price_variance < 0.01:
+        quality_issues.append(f"Data appears flat. Price variance: {price_variance:.6f}")
+    
+    if df['Date'].dtype != 'datetime64[ns]':
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        if df['Date'].isna().any():
+            quality_issues.append("Date column contains invalid date formats.")
+    
+    if 'Adj Close' not in df.columns:
+        df['Adj Close'] = df['Close']
+    
+    missing_pct = df[['Open', 'High', 'Low', 'Close', 'Volume']].isna().mean().mean() * 100
+    if missing_pct > 20:
+        quality_issues.append(f"Excessive missing data: {missing_pct:.1f}% of price/volume data is missing.")
+    
+    data_span_years = (df['Date'].max() - df['Date'].min()).days / 365.25
+    if data_span_years < 1:
+        quality_issues.append(f"Limited historical data: only spans {data_span_years:.1f} years.")
+    
+    price_jumps = df['Close'].pct_change().abs()
+    extreme_moves = (price_jumps > 1.0).sum()
+    if extreme_moves > 10:
+        quality_issues.append(f"Detected {extreme_moves} extreme price movements (>50% daily).")
+    
+    if quality_issues:
+        ticker = df.get('Ticker', ['Unknown'])[0] if 'Ticker' in df.columns else 'Unknown'
+
+        #annoying error that clutters the terminal
+        #logging.warning(f"Data quality issues for {ticker}: {'; '.join(quality_issues)}")
+        
+        if any("flat" in issue or "Insufficient" in issue or "missing" in issue for issue in quality_issues):
+            return None
+    
+    return df
+
+def SaveData(df, file_path, output_dir):
+    file_name = os.path.basename(file_path)
+    output_file = os.path.join(output_dir, file_name)
+    
+    # Fix for duplicate columns - keep the last occurrence of each column
+    if len(df.columns) != len(df.columns.unique()):
+        # Identify duplicate columns
+        duplicates = df.columns[df.columns.duplicated(keep=False)]
+        if duplicates.any():
+            logging.warning(f"Found duplicate columns: {list(duplicates.unique())}")
+        
+        # Keep only the last occurrence of each duplicate column
+        df = df.loc[:, ~df.columns.duplicated(keep='last')]
+        logging.info(f"Removed duplicate columns. DataFrame now has {len(df.columns)} columns.")
+    
+    df.to_parquet(output_file, index=False)
+    del df
+
+def clear_output_directory(output_dir):
+    for file in os.listdir(output_dir):
+        if file.endswith('.parquet'):
+            os.remove(os.path.join(output_dir, file))
+
+def process_file(file_path, output_dir):
+    try:
+        df = pd.read_parquet(file_path)
+        if 'Date' not in df.columns:
+            if df.index.name == 'Date':
+                df = df.reset_index()
+            else:
+                logging.error("The 'Date' column is missing from the DataFrame.")
+                return False
+
+        if df['Date'].dtype != 'datetime64[ns]':
+            logging.info("Converting 'Date' column to datetime.")
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    
+        if not validate_columns(df, ['Close', 'High', 'Low', 'Volume']):
+            logging.error(f"File {file_path} does not contain all required columns.")
+            return False
+
+        df = DataQualityCheck(df)
+        if df is None:
+            logging.error(f"Data quality check failed for {file_path}.")
+            return False
+
+        df = indicators(df)
+        df = clean_and_interpolate_data(df)
+        SaveData(df, file_path, output_dir)
+        return True
+
+    except Exception as e:
+        logging.error(f"Error processing {file_path}: {str(e)}")
+        traceback_info = traceback.format_exc()
+        logging.error(traceback_info)
+        return False
+
+def process_file_wrapper(file_path):
+    return process_file(file_path, CONFIG['output_directory'])
+
+
+
+
+
+
+
+
+
+
+
+
+
+def process_files(file_path, output_dir, index_temp_files=None):
+    global GLOBAL_INDEX_DATA
+    
+    # Load indexes in this worker if not already loaded
+    load_indexes_for_worker()
+    
+    try:
+        df = pd.read_parquet(file_path)
+        
+        if 'Date' not in df.columns:
+            if df.index.name == 'Date':
+                df = df.reset_index()
+            else:
+                logging.error(f"'Date' column missing from {file_path}")
+                return False
+
+        if df['Date'].dtype != 'datetime64[ns]':
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    
+        if not validate_columns(df, ['Close', 'High', 'Low', 'Volume']):
+            logging.error(f"File {file_path} missing required columns")
+            return False
+
+        df = DataQualityCheck(df)
+        if df is None:
+            logging.error(f"Data quality check failed for {file_path}")
+            return False
+
+        df = indicators(df)
+        df = clean_and_interpolate_data(df)
+        SaveData(df, file_path, output_dir)
+        
+        return True
+
+    except Exception as e:
+        logging.error(f"Error processing {file_path}: {str(e)}")
+        traceback_info = traceback.format_exc()
+        logging.error(traceback_info)
+        return False
+
+
+
+
+
+def process_data_files(run_percent, port=7496):
+    """Main processing function with all market indexes."""
+
+    print(f"Processing {run_percent}% of files from {CONFIG['input_directory']}")
+    StartTimer = time.time()
+
+    os.makedirs(CONFIG['output_directory'], exist_ok=True)
+    clear_output_directory(CONFIG['output_directory'])
+
+    # Update/download all indexes - this saves them to Data/Indexes
+    update_all_indexes(port=port)
+
+    # Get files to process
+    file_paths = [
+        os.path.join(CONFIG['input_directory'], f) 
+        for f in os.listdir(CONFIG['input_directory']) 
+        if f.endswith('.parquet')
+    ]
+    
+    files_to_process = file_paths[:int(len(file_paths) * (run_percent / 100))]
+    num_workers = min(32, len(files_to_process))
+    
+    completed = 0
+    failed = 0
+    
+    # Process files in parallel - each worker will load indexes independently
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for file_path in files_to_process:
+            future = executor.submit(
+                process_files, 
+                file_path, 
+                CONFIG['output_directory'],
+                None  # No longer need to pass temp files
+            )
+            futures.append(future)
+        
+        with tqdm(total=len(futures), desc="Processing files") as pbar:
+            for future in as_completed(futures):
+                try:
+                    if future.result():
+                        completed += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    print(f"Exception in worker process: {str(e)}")
+                    failed += 1
+                finally:
+                    pbar.update(1)
+                    pbar.set_description(
+                        f"Processing files (Success: {completed}, Failed: {failed})"
+                    )
+
+    total_time = time.time() - StartTimer
+    files_per_second = len(files_to_process) / total_time if total_time > 0 else 0
+    
+    print(f"\nProcessed {len(files_to_process)} files in {total_time:.2f} seconds")
+    print(f"Files per second: {files_per_second:.2f}")
+    print(f'Average time per file: {round(total_time / len(files_to_process), 2) if len(files_to_process) > 0 else 0} seconds')
+    print(f'Successfully processed: {completed}')
+    print(f'Failed to process: {failed}')
+
+
+
+
+if __name__ == "__main__":
+    logger.info("Starting the process...")
+    parser = argparse.ArgumentParser(description="Process financial market data files.")
+    parser.add_argument('--runpercent', type=int, default=100, help="Percentage of files to process from the input directory.")
+    parser.add_argument('--port', type=int, default=None, help='TWS/Gateway port (7497 for paper, 7496 for real)')
+    parser.add_argument('--ibgateway', action='store_true', help='Use IB Gateway ports (4001 live / 4002 paper) instead of TWS (7496 live / 7497 paper)')
+    args = parser.parse_args()
+
+    # Determine port based on --ibgateway flag
+    if args.port is not None:
+        port = args.port
+    elif args.ibgateway:
+        port = 4001  # IB Gateway default for live (4002 for paper)
+    else:
+        port = 7496  # TWS default for live (7497 for paper)
+
+    print(f"Connection: {'IB Gateway' if args.ibgateway else 'TWS'}")
+    print(f"Port: {port}")
+
+    process_data_files(args.runpercent, port=port)

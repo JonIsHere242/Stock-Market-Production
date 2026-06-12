@@ -1,0 +1,64 @@
+============================================================================
+  ENTRY / EXIT TIMING STUDY  (minute-accurate, exit @ close unless noted)
+============================================================================
+  Covered trades: 1065   |   gap available on 1065
+  Internally-consistent: every rule is scored on the SAME trades.
+
+  [A] ENTRY-TIME SWEEP  (exit @ close, same-dollar sizing, fees both sides)
+      Entry     EV/trade $    Win %     Total $   Median $
+      --------------------------------------------------
+      open            8.90    52.03        9426       3.01
+      09:35           6.94    50.24        7348       0.56
+      09:45           7.38    50.71        7811       1.37
+      10:00           6.80    51.56        7205       2.09
+      10:15           7.68    51.37        8138       2.71
+      10:30           7.60    50.99        8045       2.14
+      11:00           7.99    50.85        8452       1.12
+      12:00           9.91    52.97       10497       5.09
+      14:00          12.40    52.79       13128       5.59
+      -> best EV: entry @ 14:00  ($12.40/trade, total $13,128)
+
+  [B] GAP-CONDITIONAL ENTRY  (overnight gap = open vs prior close)
+      EV $/trade by gap bucket; does waiting beat the open?
+      Bucket            n      open     09:45     10:00     10:30     best
+      --------------------------------------------------------------------
+      gap<=-2%        114     29.67     26.32     26.90     23.20     open
+      -2..-0.5%       228      3.90      0.84      0.81      2.59     open
+      flat +-0.5%     341      7.83      5.55      4.54      4.64     open
+      0.5..2%         271     13.81     12.29     10.55     10.78     open
+      gap>=+2%        111    -10.56     -4.76     -3.47      3.33    10:30
+      (read across each row: which entry time has the highest EV for that gap)
+
+  [E] COMBINED GAP RULE  (skip dud cohorts, pick entry time per gap)
+      Rule: gap<=-2% -> open ;  -2..-0.5% -> SKIP ;  flat -> open ;
+            +0.5..2% -> open ;  gap>=+2% -> 10:30
+      Strategy                Trades  EV/trade $     Total $    Win %
+      ---------------------------------------------------------------
+      All @ open                1059        8.90        9426    52.03
+      All @ 10:00               1059        6.80        7205    51.56
+      Smart gap rule             831       12.13       10078    53.31
+      (smart rule skipped 228 dud-cohort trades; deploys capital on the rest)
+
+  [C] PROTECTIVE STOP  (entry @ 10:00, exit @ close unless intraday low hits -X%)
+      Full-path trades available: 918 of 1065  (multi-day-complete subset)
+      Stop        EV/trade $    Win %     Total $  Stopped %
+      ----------------------------------------------------
+      none              3.21    50.54        2951       0.00
+      0.5%              2.01     9.37        1844      91.07
+      1.0%              1.37    16.88        1254      83.22
+      2.0%              0.73    28.87         666      68.95
+      3.0%             -0.57    37.69        -526      56.64
+      5.0%              0.93    46.62         852      32.03
+
+  [D] PROFIT TARGET  (entry @ 10:00, take profit if intraday high tags +Y%)
+      Target      EV/trade $    Win %     Total $      Hit %
+      ----------------------------------------------------
+      none              3.21    50.54        2951       0.00
+      1.0%             -5.96    79.30       -5472      78.32
+      2.0%             -5.01    68.30       -4603      64.92
+      3.0%             -3.31    61.11       -3038      53.81
+      5.0%             -2.79    53.16       -2559      34.64
+
+  NOTE: stop/target assume a fill exactly at the level (optimistic on gaps through it).
+  Treat C/D as directional signal, not a promise. Favour patterns that are monotone.
+============================================================================

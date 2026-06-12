@@ -108,7 +108,13 @@ if ($currentHour -eq 17) {
     $scriptsToRun = $allScripts
 } elseif ($currentHour -eq 7) {
     Write-Log "=== MORNING BROKER MODE ===" "Cyan"
-    $scriptsToRun = @(@{ Name = "Daily Broker"; File = "8__DailyBroker.py"; Args = "" })
+    # Funnel first (narrows the 0__signals pool -> _Buy_Signals book of <=4). It is
+    # idempotent: if the book is already narrowed for the next session (e.g. you ran
+    # the trade-signals skill by hand), it exits in <1s spending $0. Then the broker.
+    $scriptsToRun = @(
+        @{ Name = "Signal Funnel"; File = "7__MacroFilter.py"; Args = "" },
+        @{ Name = "Daily Broker";  File = "9_SuperFastBroker.py"; Args = "" }
+    )
 } else {
     Write-Log "=== FULL PIPELINE TEST MODE ===" "Cyan"
     Write-Log "Running all scripts in test mode..." "Yellow"

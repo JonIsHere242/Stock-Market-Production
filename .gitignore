@@ -1,0 +1,14 @@
+﻿
+# --- added by setup.ps1: never commit secrets, venv, data, or caches ---
+stock_env/
+Data/
+__pycache__/
+*.pyc
+.fred_api_key
+Claud-API-KEY.txt
+.alpaca_keys
+.env
+*.log
+
+# large analysis artifact — exceeds GitHub's 100MB hard limit (kept on disk, just not pushed)
+analysis_output/interaction_search/interactions_all.csv

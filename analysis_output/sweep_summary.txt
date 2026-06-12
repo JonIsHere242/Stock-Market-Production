@@ -1,0 +1,5 @@
+trail=1.5%  return=187.67  sharpe=3.14  trades=38  maxDD=13.00  win=53.16
+trail=2.0%  return=187.67  sharpe=3.14  trades=38  maxDD=13.00  win=53.16
+trail=2.5%  return=187.67  sharpe=3.14  trades=38  maxDD=13.00  win=53.16
+trail=4.0%  return=187.67  sharpe=3.14  trades=38  maxDD=13.00  win=53.16
+trail=6.0%  return=187.67  sharpe=3.14  trades=38  maxDD=13.00  win=53.16

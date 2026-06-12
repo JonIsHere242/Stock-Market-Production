@@ -30,6 +30,24 @@ from Util import (
     STRATEGY_PARAMS_TUPLE as STRATEGY_PARAMS,  # Note we're using the tuple version for backtrader
 )
 
+# Silence the verbose dprint output — file logging still works, console is quiet
+def dprint(*_):  # noqa: silence verbose debug output, file logging still active
+    pass
+
+def _inner_workers():
+    """Worker count for the inner data-loading pools.
+
+    When run_parallel_backtests.py fans many backtesters across cores at once,
+    it sets BT_INNER_WORKERS low so 12 jobs don't each spawn a 32-proc loader
+    pool (=384 procs). Standalone runs keep the old all-cores behavior."""
+    v = os.environ.get('BT_INNER_WORKERS')
+    if v:
+        try:
+            return max(1, int(v))
+        except ValueError:
+            pass
+    return min(32, multiprocessing.cpu_count())
+
 class IBKRAdaptiveCommission(bt.CommInfoBase):
 
     """
@@ -394,7 +412,7 @@ def filter_stocks_by_signal_quality(directory, min_variance=0.01, min_up_prob=0.
     
     logging.info(f"Evaluating {len(all_files)} stocks for signal quality...")
     
-    with multiprocessing.Pool() as pool:
+    with multiprocessing.Pool(processes=_inner_workers()) as pool:
         results = list(tqdm(
             pool.starmap(
                 evaluate_stock_quality, 
@@ -526,7 +544,7 @@ def parallel_load_data(file_paths, last_trading_date, align_start_date=False, re
     list of tuples: (stock_name, DataFrame) with aligned data
     """
     # Step 1: Load all data in parallel
-    with multiprocessing.Pool() as pool:
+    with multiprocessing.Pool(processes=_inner_workers()) as pool:
         results = list(tqdm(
             pool.starmap(load_data, [(fp, last_trading_date) for fp in file_paths]), 
             total=len(file_paths), 
@@ -637,17 +655,15 @@ def parallel_load_data(file_paths, last_trading_date, align_start_date=False, re
 
 
 def read_trading_data():
-    """Read the trading data parquet file."""
-    file_path = '_Buy_Signals.parquet'
-    if not os.path.exists(file_path):
-        df = pd.DataFrame(columns=[
-            'Symbol', 'LastBuySignalDate', 'LastBuySignalPrice', 'IsCurrentlyBought',
-            'ConsecutiveLosses', 'LastTradedDate', 'UpProbability', 'LastSellPrice', 'PositionSize'
-        ])
-        df.to_parquet(file_path, index=False)
-        return df
-    
-    return pd.read_parquet(file_path)
+    """RETIRED: the per-ticker state ledger is no longer persisted (it used to
+    pollute _Buy_Signals.parquet, which is now exclusively the broker's narrowed
+    book). Returns an empty ledger-schema frame so legacy callers keep working
+    without touching any file. write_trading_data() is a no-op; per-ticker state
+    does not carry across runs."""
+    return pd.DataFrame(columns=[
+        'Symbol', 'LastBuySignalDate', 'LastBuySignalPrice', 'IsCurrentlyBought',
+        'ConsecutiveLosses', 'LastTradedDate', 'UpProbability', 'LastSellPrice', 'PositionSize'
+    ])
 
 
 
@@ -695,7 +711,7 @@ def write_trading_data(df):
     datetime_cols = df.select_dtypes(include=['datetime64[ns]']).columns
     for col in datetime_cols:
         df[col] = df[col].astype('object').where(df[col].notnull(), None)
-    df.to_parquet('_Buy_Signals.parquet', index=False)
+    # _Buy_Signals.parquet retired — Z_signals.parquet is the canonical signals file
 
 def update_buy_signal(symbol, date, price, up_probability):
     try:
@@ -1016,7 +1032,7 @@ class PositionSize222r:
 
 
 class TradeRecorder:
-    def __init__(self, filename='trade_history.parquet'):
+    def __init__(self, filename='Data/TradeHistory.parquet'):
         self.filename = filename
         self.trades = []
         
@@ -1070,9 +1086,9 @@ class StockSniperStrategy(bt.Strategy):
         self.inds = {d: {} for d in self.datas}
         for d in self.datas:
             self.inds[d]['atr'] = bt.indicators.ATR(d, period=self.p.atr_period)
-            self.inds[d]['up_prob_ma3'] = bt.indicators.SMA(d.UpProbability, period=3)
-            self.inds[d]['up_prob_ma5'] = bt.indicators.SMA(d.UpProbability, period=5)
-            self.inds[d]['up_prob_roc'] = bt.indicators.ROC(d.UpProbability, period=3)
+            # FAST: removed up_prob_ma3/ma5/roc — computed on every feed every bar but
+            # never referenced anywhere. ATR-14 still sets the warmup, so results are
+            # identical. (lossless ~indicator-cost reduction)
             self.inds[d]['up_prob'] = d.UpProbability
 
 
@@ -1100,8 +1116,9 @@ class StockSniperStrategy(bt.Strategy):
         self.current_win_streak = 0
         self.current_loss_streak = 0
         self.recent_outcomes = []  # Store last 10 trade outcomes (1=win, 0=breakeven, -1=loss)
+        self.trade_pct_returns = []  # For rolling Sharpe calculation
         
-        self.trade_recorder = TradeRecorder('trade_history.parquet')
+        self.trade_recorder = TradeRecorder('Data/TradeHistory.parquet')
         
         self.open_positions = 0
         
@@ -1113,8 +1130,10 @@ class StockSniperStrategy(bt.Strategy):
             self.correlation_df.set_index('Ticker', inplace=True)
             logging.info("Set 'Ticker' column as index in correlation dataframe")
         else:
-            logging.warning("'Ticker' column not found in correlation dataframe. Available columns: " 
-                           f"{list(self.correlation_df.columns)}")
+            verbose = False
+            if verbose:
+                logging.warning("'Ticker' column not found in correlation dataframe. Available columns: " 
+                               f"{list(self.correlation_df.columns)}")
 
         self.total_groups = self.correlation_df['Cluster'].nunique()
         self.group_allocations = {group: 0 for group in range(self.total_groups)}
@@ -1360,7 +1379,7 @@ class StockSniperStrategy(bt.Strategy):
         i = 1
         while len(historic_probs) < 45 and i < 200:
             try:
-                prob_val = data.UpProbability[i]
+                prob_val = data.UpProbability[-i]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (was reading future bars into the percentile baseline)
                 if prob_val is not None:
                     historic_probs.append(float(prob_val))
                 i += 1
@@ -1466,6 +1485,497 @@ class StockSniperStrategy(bt.Strategy):
 
 
     def can_buy(self, data, current_date):
+        """=
+
+        Restored 2026-05-17 after the EDA-driven retune
+        (can_buy_may_17th_eda_attempt_FAILED) regressed badly in backtest:
+        73.7% -> 23.5% annualised, Sharpe 1.85 -> 0.56.
+
+        Original docstring follows.
+
+        Tuned by 2 x 800-trial Optuna runs over the continuous filter space
+        (top_k=3/hold=2 seed=0, top_k=5/hold=1 seed=42). Held-out window:
+        2025-05-01 onwards. Only threshold changes where BOTH runs agreed on
+        direction AND the cross-seed midpoint moved measurably are shipped;
+        params with conflicting directions were left at legacy values.
+
+        Lite-backtest holdout deltas vs legacy can_buy_may15th:
+          Sharpe   +1.38 -> +1.76 (k=3/h=2)   |   +1.16 -> +1.19 (k=5/h=1)
+          MaxDD    19.4% -> 11.6%             |   17.8% -> 14.2%
+          AnnRet   +90%  -> +100%             |   +332% -> +358%
+
+        Single-line rollback: swap can_buy <-> can_buy_may15th in
+        get_buy_candidates (line ~1279).
+        """
+
+        # Strategy Timing (unchanged)
+        MIN_DAYS_BEFORE_TRADING = 30
+        TARGET_HISTORIC_PROB_COUNT = 45
+        MAX_HISTORIC_LOOKBACK = 100
+        MIN_HISTORIC_PROB_THRESHOLD = 30
+        MIN_VIABLE_DATA_POINTS = 5
+
+        # Probability Bounds (unchanged -- runs disagreed on direction)
+        UP_PROB_MIN_BOUND = 0.2
+        UP_PROB_MAX_BOUND = 0.8
+
+        # Financial Thresholds
+        MIN_CLOSE_PRICE = 2.00       # was 1.50 -- both runs preferred ~2.0
+        MAX_CLOSE_PRICE = 1650.00    # was 1000.00 -- both runs preferred ~1650
+        MIN_VOLUME_SHARES = 10_000
+        MIN_DOLLAR_VOLUME = 1_000_000  # unchanged -- runs disagreed
+
+        # Risk Management - Drop Protection (unchanged)
+        MAX_SINGLE_DAY_DROP = -0.15
+        RECENT_DROP_LOOKBACK_DAYS = 10
+
+        # Risk Management - 52-Week Position (unchanged -- runs disagreed)
+        WEEK_52_HIGH_PROXIMITY_LIMIT = 0.85
+        WEEK_52_LOOKBACK_DAYS = 252
+
+        # Risk Management - Momentum
+        MOMENTUM_LOOKBACK_DAYS = 5
+        MAX_MOMENTUM_GAIN = 0.15     # unchanged -- runs disagreed
+        MAX_MOMENTUM_LOSS = -0.18    # was -0.075 -- both runs preferred deeper allowance
+
+        # Risk Management - Volume & Volatility
+        VOLUME_SPIKE_MULTIPLIER = 3.5      # unchanged -- runs disagreed
+        VOLUME_AVG_LOOKBACK_DAYS = 20
+        MAX_VOLATILITY_THRESHOLD = 0.10    # was 0.04 -- both runs preferred ~0.08-0.11
+        VOLATILITY_LOOKBACK_DAYS = 20
+
+        # Percentile Thresholds (sufficient-data path)
+        # Single biggest finding: both runs converged on ~0.65 low bound. The legacy
+        # 0.90 only fires when current prob is in the stock's top 10%; 0.65 fires
+        # when it's in the top 35% -- captures the bulk of the model's per-stock
+        # alpha that the legacy cutoff was excluding.
+        SUFFICIENT_DATA_P_LOW = float(os.environ.get('BT_PLOW', 65.0))     # env-gated for param-stress; default 65.0
+        SUFFICIENT_DATA_P_HIGH = float(os.environ.get('BT_PHIGH', 98.0))   # env-gated for param-stress; default 98.0
+
+        # For limited data (unchanged -- not in optimizer; keep strict on low-data)
+        LIMITED_DATA_P_LOW = 90
+        LIMITED_DATA_P_HIGH = 99
+
+        # ============ END CONFIGURATION ============
+
+        symbol = data._name
+
+        if not hasattr(self, 'strategy_start_date'):
+            self.strategy_start_date = current_date
+
+        days_since_start = (current_date - self.strategy_start_date).days
+        if days_since_start < MIN_DAYS_BEFORE_TRADING:
+            return False
+
+        try:
+            current_close = data.close[0]
+            current_prob = data.UpProbability[0]
+            current_volume = data.volume[0]
+        except (IndexError, AttributeError, TypeError):
+            return False
+
+        if self.rule_201_monitor.is_restricted(symbol) or self.open_positions >= self.p.max_positions:
+            return False
+
+        if current_prob < UP_PROB_MIN_BOUND or current_prob > UP_PROB_MAX_BOUND:
+            return False
+
+        try:
+            if len(data.UpProbability) < 6:
+                return False
+            recent_probs = [data.UpProbability[-i] for i in range(1, 6) if data.UpProbability[-i] is not None]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (positive index read FUTURE bars)
+            if recent_probs and min(recent_probs) < UP_PROB_MIN_BOUND:
+                return False
+            if recent_probs and max(recent_probs) > UP_PROB_MAX_BOUND:
+                return False
+        except Exception:
+            pass
+
+        if current_close is None or current_close < MIN_CLOSE_PRICE:
+            return False
+        if current_close is None or current_close > MAX_CLOSE_PRICE:
+            return False
+        if current_volume is None or current_volume < MIN_VOLUME_SHARES:
+            return False
+        if current_prob is None:
+            return False
+
+        dollar_volume = current_close * current_volume
+        if dollar_volume < MIN_DOLLAR_VOLUME:
+            return False
+
+        historic_probs = []
+        i = 1
+        while len(historic_probs) < TARGET_HISTORIC_PROB_COUNT and i < MAX_HISTORIC_LOOKBACK:
+            try:
+                prob_val = data.UpProbability[-i]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (was reading future bars into the percentile baseline)
+                if prob_val is not None:
+                    historic_probs.append(float(prob_val))
+                i += 1
+            except (IndexError, AttributeError, TypeError):
+                break
+
+        if len(historic_probs) < MIN_HISTORIC_PROB_THRESHOLD:
+            try:
+                for lookback in range(1, min(RECENT_DROP_LOOKBACK_DAYS + 1, 100)):
+                    try:
+                        prev_close = data.close[-lookback]
+                        next_close = data.close[-(lookback-1)] if lookback > 1 else data.close[0]
+                        if prev_close is not None and next_close is not None and prev_close > 0:
+                            daily_return = (next_close / prev_close) - 1
+                            if daily_return < MAX_SINGLE_DAY_DROP:
+                                return False
+                    except (IndexError, AttributeError, TypeError):
+                        break
+            except Exception:
+                return False
+
+            if len(historic_probs) < MIN_VIABLE_DATA_POINTS:
+                return False
+
+            if len(historic_probs) > 1:
+                p96 = np.percentile(historic_probs, LIMITED_DATA_P_LOW)
+                p97_5 = np.percentile(historic_probs, LIMITED_DATA_P_HIGH)
+            else:
+                return False
+        else:
+            if len(historic_probs) > 1:
+                p96 = np.percentile(historic_probs, SUFFICIENT_DATA_P_LOW)
+                p97_5 = np.percentile(historic_probs, SUFFICIENT_DATA_P_HIGH)
+            else:
+                return False
+
+        # 1. 52-week high filter
+        try:
+            closes_252 = data.close.get(size=WEEK_52_LOOKBACK_DAYS)
+            if closes_252 and len(closes_252) > 0:
+                highest_52w = max(closes_252)
+                lowest_52w = min(closes_252)
+                if highest_52w and lowest_52w and highest_52w > 0:
+                    if (current_close / highest_52w) > WEEK_52_HIGH_PROXIMITY_LIMIT:
+                        return False
+        except Exception:
+            pass
+
+        # 2. Momentum filter
+        try:
+            prev_close_5 = data.close[-MOMENTUM_LOOKBACK_DAYS]
+            if prev_close_5 and prev_close_5 > 0:
+                ret_5d = (current_close / prev_close_5) - 1
+                if ret_5d > MAX_MOMENTUM_GAIN:
+                    return False
+                if ret_5d < MAX_MOMENTUM_LOSS:
+                    return False
+        except Exception:
+            pass
+
+        # 3. Volume spike filter
+        try:
+            vols = data.volume.get(size=VOLUME_AVG_LOOKBACK_DAYS)
+            if vols is not None and len(vols) > 0:
+                avg_vol_20 = np.mean(vols)
+                if avg_vol_20 and current_volume / avg_vol_20 > VOLUME_SPIKE_MULTIPLIER:
+                    return False
+        except Exception:
+            pass
+
+        # 4. Volatility filter
+        try:
+            closes = data.close.get(size=VOLATILITY_LOOKBACK_DAYS)
+            if closes is not None and len(closes) > 1:
+                returns_20d = np.diff(np.log(closes))
+                if len(returns_20d) > 0:
+                    vol_20d = np.std(returns_20d)
+                    if vol_20d > MAX_VOLATILITY_THRESHOLD:
+                        return False
+        except Exception:
+            pass
+
+        RSI_PERIOD = 14
+        MIN_RSI_THRESHOLD = 20   # was 30 -- both runs preferred lower (14, 25); midpoint
+
+        # 5. RSI filter
+        try:
+            closes_for_rsi = data.close.get(size=RSI_PERIOD + 1)
+            if closes_for_rsi is not None and len(closes_for_rsi) >= RSI_PERIOD + 1:
+                deltas = np.diff(closes_for_rsi)
+                gains = np.where(deltas > 0, deltas, 0)
+                losses = np.where(deltas < 0, -deltas, 0)
+                avg_gain = np.mean(gains[-RSI_PERIOD:])
+                avg_loss = np.mean(losses[-RSI_PERIOD:])
+                if avg_loss == 0:
+                    rsi = 100.0
+                else:
+                    rs = avg_gain / avg_loss
+                    rsi = 100 - (100 / (1 + rs))
+                if rsi < MIN_RSI_THRESHOLD:
+                    return False
+        except Exception:
+            pass
+
+        # --- Core Buy Condition ---
+        if current_prob >= p96 and current_prob < p97_5:
+            return True
+
+        return False
+
+
+
+    def can_buy_may_17th_eda_attempt_FAILED(self, data, current_date):
+        """ARCHIVED -- DO NOT USE.  Tuned 2026-05-17 from eda_prob_distribution.py
+        findings.  Backtest result was a regression vs can_buy_may_17th:
+
+          can_buy_may_17th : 73.7% ann ret  Sharpe 1.85  win 53.25%  (n=323)
+          THIS VERSION    : 23.5% ann ret  Sharpe 0.56  win 45.48%  (n=299)
+
+        Why it failed: the EDA looked at which percentile bands of the
+        EXISTING gate's 323 trades had the best per-trade quality and saw
+        [p65, p90) doing well on n=16.  But tightening P_HIGH 98 -> 90 does
+        NOT retain those 16 trades -- it RESHAPES the trade distribution.
+        The new gate fired 299 different trades, and they were worse.
+
+        Lesson: when tuning filters from EDA on backtest outcomes, validate
+        with a full backtest BEFORE deploying.  The selection bias is real.
+        Original docstring follows.
+
+        ----
+        Tuned 2026-05-17 from eda_prob_distribution.py findings.
+
+        Run that script against Data/TradeHistory.parquet + Data/RFpredictions/ and
+        you'll see three things this version acts on:
+
+          1. The current [p65, p98) per-stock percentile gate fires 167 trades
+             in the EDA sample, but [p95, p98) alone is 119 of them with
+             mean +0.25% / win 0.43.  Tightening P_HIGH to 90 keeps only the
+             zone where the EDA shows mean +1.26% / sharpe 7.55.  Trade count
+             drops ~10x but per-trade quality jumps.
+          2. SUFFICIENT_DATA_P_LOW=65 was a no-op: no trades fired below p80
+             anyway, since the other filters (price, volume, momentum, RSI)
+             gate that out.  Dropping it to 0 has zero effect and is cleaner.
+          3. UP_PROB_MIN/MAX_BOUND in [0.2, 0.8] passes 100% of universe rows
+             because predict_to_rf maps everything into [0.30, 0.70].  Dead
+             code.  Replaced with a real UpProb floor of 0.40: trades in
+             [0.30, 0.40) won 42% with mean +0.14% (n=90) in the EDA --
+             barely above breakeven, can_buy fired them only because the
+             percentile gate said yes.
+
+        Single-line rollback: swap can_buy <-> can_buy_may_17th in
+        get_buy_candidates.
+
+        Caveat: the [p65, p90) decision is supported by n=16 in the EDA.
+        Direction is consistent with the wider bands ([p85, p90) n=12 mean
+        +1.17%, [p90, p95) n=32 mean +0.31%) so I trust the shape, but the
+        exact p90 cut-off is a judgment call that should be validated by a
+        full backtest before live deployment.
+        """
+
+        # Strategy Timing
+        MIN_DAYS_BEFORE_TRADING = 30
+        TARGET_HISTORIC_PROB_COUNT = 45
+        MAX_HISTORIC_LOOKBACK = 100
+        MIN_HISTORIC_PROB_THRESHOLD = 30
+        MIN_VIABLE_DATA_POINTS = 5
+
+        # Absolute UpProbability floor (NEW).  predict_to_rf squashes universe
+        # into [0.30, 0.70]; the [0.30, 0.40) band is the low-confidence tail
+        # that produced 90 trades with mean +0.14% in the EDA.
+        UP_PROB_FIRE_FLOOR = 0.40
+
+        # Financial Thresholds (unchanged from May 17th tune)
+        MIN_CLOSE_PRICE = 2.00
+        MAX_CLOSE_PRICE = 1650.00
+        MIN_VOLUME_SHARES = 10_000
+        MIN_DOLLAR_VOLUME = 1_000_000
+
+        # Risk Management - Drop Protection
+        MAX_SINGLE_DAY_DROP = -0.15
+        RECENT_DROP_LOOKBACK_DAYS = 10
+
+        # Risk Management - 52-Week Position
+        WEEK_52_HIGH_PROXIMITY_LIMIT = 0.85
+        WEEK_52_LOOKBACK_DAYS = 252
+
+        # Risk Management - Momentum
+        MOMENTUM_LOOKBACK_DAYS = 5
+        MAX_MOMENTUM_GAIN = 0.15
+        MAX_MOMENTUM_LOSS = -0.18
+
+        # Risk Management - Volume & Volatility
+        VOLUME_SPIKE_MULTIPLIER = 3.5
+        VOLUME_AVG_LOOKBACK_DAYS = 20
+        MAX_VOLATILITY_THRESHOLD = 0.10
+        VOLATILITY_LOOKBACK_DAYS = 20
+
+        # Percentile Thresholds -- THE CHANGE
+        # P_LOW kept as a safety net (still effectively a no-op given other
+        # filters, but cheap and self-documenting).  P_HIGH = 90 is the EDA-
+        # backed choice that captures the high-edge zone and excludes the
+        # large, low-quality [p95, p98) cluster.
+        SUFFICIENT_DATA_P_LOW = 65.0
+        SUFFICIENT_DATA_P_HIGH = 90.0   # was 98.0 -- main change
+
+        # Limited-data path (kept strict because sample is small)
+        LIMITED_DATA_P_LOW = 90
+        LIMITED_DATA_P_HIGH = 99
+
+        RSI_PERIOD = 14
+        MIN_RSI_THRESHOLD = 20
+
+        # ============ END CONFIGURATION ============
+
+        symbol = data._name
+
+        if not hasattr(self, 'strategy_start_date'):
+            self.strategy_start_date = current_date
+
+        days_since_start = (current_date - self.strategy_start_date).days
+        if days_since_start < MIN_DAYS_BEFORE_TRADING:
+            return False
+
+        try:
+            current_close = data.close[0]
+            current_prob = data.UpProbability[0]
+            current_volume = data.volume[0]
+        except (IndexError, AttributeError, TypeError):
+            return False
+
+        if self.rule_201_monitor.is_restricted(symbol) or self.open_positions >= self.p.max_positions:
+            return False
+
+        # NEW: absolute fire floor in place of the dead [0.2, 0.8] bound.
+        if current_prob is None or current_prob < UP_PROB_FIRE_FLOOR:
+            return False
+
+        if current_close is None or current_close < MIN_CLOSE_PRICE:
+            return False
+        if current_close > MAX_CLOSE_PRICE:
+            return False
+        if current_volume is None or current_volume < MIN_VOLUME_SHARES:
+            return False
+
+        dollar_volume = current_close * current_volume
+        if dollar_volume < MIN_DOLLAR_VOLUME:
+            return False
+
+        historic_probs = []
+        i = 1
+        while len(historic_probs) < TARGET_HISTORIC_PROB_COUNT and i < MAX_HISTORIC_LOOKBACK:
+            try:
+                prob_val = data.UpProbability[-i]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (was reading future bars into the percentile baseline)
+                if prob_val is not None:
+                    historic_probs.append(float(prob_val))
+                i += 1
+            except (IndexError, AttributeError, TypeError):
+                break
+
+        if len(historic_probs) < MIN_HISTORIC_PROB_THRESHOLD:
+            try:
+                for lookback in range(1, min(RECENT_DROP_LOOKBACK_DAYS + 1, 100)):
+                    try:
+                        prev_close = data.close[-lookback]
+                        next_close = data.close[-(lookback-1)] if lookback > 1 else data.close[0]
+                        if prev_close is not None and next_close is not None and prev_close > 0:
+                            daily_return = (next_close / prev_close) - 1
+                            if daily_return < MAX_SINGLE_DAY_DROP:
+                                return False
+                    except (IndexError, AttributeError, TypeError):
+                        break
+            except Exception:
+                return False
+
+            if len(historic_probs) < MIN_VIABLE_DATA_POINTS:
+                return False
+
+            if len(historic_probs) > 1:
+                p_low = np.percentile(historic_probs, LIMITED_DATA_P_LOW)
+                p_high = np.percentile(historic_probs, LIMITED_DATA_P_HIGH)
+            else:
+                return False
+        else:
+            if len(historic_probs) > 1:
+                p_low = np.percentile(historic_probs, SUFFICIENT_DATA_P_LOW)
+                p_high = np.percentile(historic_probs, SUFFICIENT_DATA_P_HIGH)
+            else:
+                return False
+
+        # 1. 52-week high filter
+        try:
+            closes_252 = data.close.get(size=WEEK_52_LOOKBACK_DAYS)
+            if closes_252 and len(closes_252) > 0:
+                highest_52w = max(closes_252)
+                if highest_52w and highest_52w > 0:
+                    if (current_close / highest_52w) > WEEK_52_HIGH_PROXIMITY_LIMIT:
+                        return False
+        except Exception:
+            pass
+
+        # 2. Momentum filter
+        try:
+            prev_close_5 = data.close[-MOMENTUM_LOOKBACK_DAYS]
+            if prev_close_5 and prev_close_5 > 0:
+                ret_5d = (current_close / prev_close_5) - 1
+                if ret_5d > MAX_MOMENTUM_GAIN:
+                    return False
+                if ret_5d < MAX_MOMENTUM_LOSS:
+                    return False
+        except Exception:
+            pass
+
+        # 3. Volume spike filter
+        try:
+            vols = data.volume.get(size=VOLUME_AVG_LOOKBACK_DAYS)
+            if vols is not None and len(vols) > 0:
+                avg_vol_20 = np.mean(vols)
+                if avg_vol_20 and current_volume / avg_vol_20 > VOLUME_SPIKE_MULTIPLIER:
+                    return False
+        except Exception:
+            pass
+
+        # 4. Volatility filter
+        try:
+            closes = data.close.get(size=VOLATILITY_LOOKBACK_DAYS)
+            if closes is not None and len(closes) > 1:
+                returns_20d = np.diff(np.log(closes))
+                if len(returns_20d) > 0:
+                    vol_20d = np.std(returns_20d)
+                    if vol_20d > MAX_VOLATILITY_THRESHOLD:
+                        return False
+        except Exception:
+            pass
+
+        # 5. RSI filter
+        try:
+            closes_for_rsi = data.close.get(size=RSI_PERIOD + 1)
+            if closes_for_rsi is not None and len(closes_for_rsi) >= RSI_PERIOD + 1:
+                deltas = np.diff(closes_for_rsi)
+                gains = np.where(deltas > 0, deltas, 0)
+                losses = np.where(deltas < 0, -deltas, 0)
+                avg_gain = np.mean(gains[-RSI_PERIOD:])
+                avg_loss = np.mean(losses[-RSI_PERIOD:])
+                if avg_loss == 0:
+                    rsi = 100.0
+                else:
+                    rs = avg_gain / avg_loss
+                    rsi = 100 - (100 / (1 + rs))
+                if rsi < MIN_RSI_THRESHOLD:
+                    return False
+        except Exception:
+            pass
+
+        # --- Core Buy Condition: per-stock percentile in [p65, p90) ---
+        if current_prob >= p_low and current_prob < p_high:
+            return True
+
+        return False
+
+
+
+    def can_buy_may15th(self, data, current_date):
+        """Pre-optimization snapshot (2026-05-15). Kept for one-line rollback:
+        swap can_buy <-> can_buy_may15th in get_buy_candidates if the optimized
+        version misbehaves. This is the configuration that ran before the
+        can_buy_optimizer.py Optuna sweep on 2026-05-15.
+        """
 
         # Strategy Timing
         MIN_DAYS_BEFORE_TRADING = 30
@@ -1545,7 +2055,7 @@ class StockSniperStrategy(bt.Strategy):
             #make sure up prob is within the range that shows the best results and not some weird values like 0.1 or 0.9
             if len(data.UpProbability) < 6:
                 return False
-            recent_probs = [data.UpProbability[i] for i in range(1, 6) if data.UpProbability[i] is not None]
+            recent_probs = [data.UpProbability[-i] for i in range(1, 6) if data.UpProbability[-i] is not None]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (positive index read FUTURE bars)
         
             if recent_probs and min(recent_probs) < UP_PROB_MIN_BOUND:
                 return False
@@ -1574,7 +2084,7 @@ class StockSniperStrategy(bt.Strategy):
         i = 1
         while len(historic_probs) < TARGET_HISTORIC_PROB_COUNT and i < MAX_HISTORIC_LOOKBACK:
             try:
-                prob_val = data.UpProbability[i]
+                prob_val = data.UpProbability[-i]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (was reading future bars into the percentile baseline)
                 if prob_val is not None:
                     historic_probs.append(float(prob_val))
                 i += 1
@@ -1719,6 +2229,227 @@ class StockSniperStrategy(bt.Strategy):
 
 
 
+    def can_buy222(self, data, current_date):
+        # Data-driven update 2026-05-15. Conservative tweaks vs can_buy_15May2026:
+        #   MAX_VOLATILITY_THRESHOLD: 0.04 -> 0.05   (EDA: CAGR +16pts, DD improves)
+        #   MIN_RSI_THRESHOLD:        30   -> 20    (EDA: small consistent win)
+        # Companion change outside this function: sort_buy_candidates reverse=False -> True.
+
+        # Strategy Timing
+        MIN_DAYS_BEFORE_TRADING = 30
+        TARGET_HISTORIC_PROB_COUNT = 45
+        MAX_HISTORIC_LOOKBACK = 100
+        MIN_HISTORIC_PROB_THRESHOLD = 30
+        MIN_VIABLE_DATA_POINTS = 5
+
+        # Probability Bounds
+        UP_PROB_MIN_BOUND = 0.2
+        UP_PROB_MAX_BOUND = 0.8
+
+        # Financial Thresholds
+        MIN_CLOSE_PRICE = 1.50
+        MAX_CLOSE_PRICE = 1000.00
+        MIN_VOLUME_SHARES = 10_000
+        MIN_DOLLAR_VOLUME = 1_000_000
+
+        # Risk Management - Drop Protection
+        MAX_SINGLE_DAY_DROP = -0.15
+        RECENT_DROP_LOOKBACK_DAYS = 10
+
+        # Risk Management - 52-Week Position
+        WEEK_52_HIGH_PROXIMITY_LIMIT = 0.85
+        WEEK_52_LOOKBACK_DAYS = 252
+
+        # Risk Management - Momentum
+        MOMENTUM_LOOKBACK_DAYS = 5
+        MAX_MOMENTUM_GAIN = 0.15
+        MAX_MOMENTUM_LOSS = -0.075
+
+        # Risk Management - Volume & Volatility
+        VOLUME_SPIKE_MULTIPLIER = 3.5
+        VOLUME_AVG_LOOKBACK_DAYS = 20
+        MAX_VOLATILITY_THRESHOLD = 0.05  # was 0.04 - EDA shows 5% cap raises CAGR and lowers DD
+        VOLATILITY_LOOKBACK_DAYS = 20
+
+        # Percentile Thresholds (sufficient data)
+        SUFFICIENT_DATA_P_LOW = 90.0
+        SUFFICIENT_DATA_P_HIGH = 95.0
+
+        # Percentile Thresholds (limited data)
+        LIMITED_DATA_P_LOW = 90
+        LIMITED_DATA_P_HIGH = 99
+
+        # RSI
+        RSI_PERIOD = 14
+        MIN_RSI_THRESHOLD = 20  # was 30 - EDA shows softening adds trades without quality loss
+
+        # ============ END CONFIGURATION ============
+
+        symbol = data._name
+
+        if not hasattr(self, 'strategy_start_date'):
+            self.strategy_start_date = current_date
+
+        days_since_start = (current_date - self.strategy_start_date).days
+        if days_since_start < MIN_DAYS_BEFORE_TRADING:
+            return False
+
+        try:
+            current_close = data.close[0]
+            current_prob = data.UpProbability[0]
+            current_volume = data.volume[0]
+        except (IndexError, AttributeError, TypeError):
+            return False
+
+        if self.rule_201_monitor.is_restricted(symbol) or self.open_positions >= self.p.max_positions:
+            return False
+
+        if current_prob < UP_PROB_MIN_BOUND or current_prob > UP_PROB_MAX_BOUND:
+            return False
+
+        try:
+            if len(data.UpProbability) < 6:
+                return False
+            recent_probs = [data.UpProbability[-i] for i in range(1, 6) if data.UpProbability[-i] is not None]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (positive index read FUTURE bars)
+
+            if recent_probs and min(recent_probs) < UP_PROB_MIN_BOUND:
+                return False
+            if recent_probs and max(recent_probs) > UP_PROB_MAX_BOUND:
+                return False
+        except Exception:
+            pass
+
+        if current_close is None or current_close < MIN_CLOSE_PRICE:
+            return False
+        if current_close is None or current_close > MAX_CLOSE_PRICE:
+            return False
+        if current_volume is None or current_volume < MIN_VOLUME_SHARES:
+            return False
+        if current_prob is None:
+            return False
+
+        dollar_volume = current_close * current_volume
+        if dollar_volume < MIN_DOLLAR_VOLUME:
+            return False
+
+        historic_probs = []
+        i = 1
+        while len(historic_probs) < TARGET_HISTORIC_PROB_COUNT and i < MAX_HISTORIC_LOOKBACK:
+            try:
+                prob_val = data.UpProbability[-i]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (was reading future bars into the percentile baseline)
+                if prob_val is not None:
+                    historic_probs.append(float(prob_val))
+                i += 1
+            except (IndexError, AttributeError, TypeError):
+                break
+
+        if len(historic_probs) < MIN_HISTORIC_PROB_THRESHOLD:
+            try:
+                for lookback in range(1, min(RECENT_DROP_LOOKBACK_DAYS + 1, 100)):
+                    try:
+                        prev_close = data.close[-lookback]
+                        next_close = data.close[-(lookback-1)] if lookback > 1 else data.close[0]
+
+                        if prev_close is not None and next_close is not None and prev_close > 0:
+                            daily_return = (next_close / prev_close) - 1
+                            if daily_return < MAX_SINGLE_DAY_DROP:
+                                return False
+                    except (IndexError, AttributeError, TypeError):
+                        break
+            except Exception:
+                return False
+
+            if len(historic_probs) < MIN_VIABLE_DATA_POINTS:
+                return False
+
+            if len(historic_probs) > 1:
+                p96 = np.percentile(historic_probs, LIMITED_DATA_P_LOW)
+                p97_5 = np.percentile(historic_probs, LIMITED_DATA_P_HIGH)
+            else:
+                return False
+        else:
+            if len(historic_probs) > 1:
+                p96 = np.percentile(historic_probs, SUFFICIENT_DATA_P_LOW)
+                p97_5 = np.percentile(historic_probs, SUFFICIENT_DATA_P_HIGH)
+            else:
+                return False
+
+        # 52-week high filter
+        try:
+            closes_252 = data.close.get(size=WEEK_52_LOOKBACK_DAYS)
+            if closes_252 and len(closes_252) > 0:
+                highest_52w = max(closes_252)
+                lowest_52w = min(closes_252)
+                if highest_52w and lowest_52w and highest_52w > 0:
+                    if (current_close / highest_52w) > WEEK_52_HIGH_PROXIMITY_LIMIT:
+                        return False
+        except Exception:
+            pass
+
+        # Momentum filter
+        try:
+            prev_close_5 = data.close[-MOMENTUM_LOOKBACK_DAYS]
+            if prev_close_5 and prev_close_5 > 0:
+                ret_5d = (current_close / prev_close_5) - 1
+                if ret_5d > MAX_MOMENTUM_GAIN:
+                    return False
+                if ret_5d < MAX_MOMENTUM_LOSS:
+                    return False
+        except Exception:
+            pass
+
+        # Volume spike filter
+        try:
+            vols = data.volume.get(size=VOLUME_AVG_LOOKBACK_DAYS)
+            if vols is not None and len(vols) > 0:
+                avg_vol_20 = np.mean(vols)
+                if avg_vol_20 and current_volume / avg_vol_20 > VOLUME_SPIKE_MULTIPLIER:
+                    return False
+        except Exception:
+            pass
+
+        # Volatility filter (cap raised from 0.04 to 0.05)
+        try:
+            closes = data.close.get(size=VOLATILITY_LOOKBACK_DAYS)
+            if closes is not None and len(closes) > 1:
+                returns_20d = np.diff(np.log(closes))
+                if len(returns_20d) > 0:
+                    vol_20d = np.std(returns_20d)
+                    if vol_20d > MAX_VOLATILITY_THRESHOLD:
+                        return False
+        except Exception:
+            pass
+
+        # RSI filter (hard-reject threshold lowered from 30 to 20)
+        try:
+            closes_for_rsi = data.close.get(size=RSI_PERIOD + 1)
+            if closes_for_rsi is not None and len(closes_for_rsi) >= RSI_PERIOD + 1:
+                deltas = np.diff(closes_for_rsi)
+                gains = np.where(deltas > 0, deltas, 0)
+                losses = np.where(deltas < 0, -deltas, 0)
+                avg_gain = np.mean(gains[-RSI_PERIOD:])
+                avg_loss = np.mean(losses[-RSI_PERIOD:])
+
+                if avg_loss == 0:
+                    rsi = 100.0
+                else:
+                    rs = avg_gain / avg_loss
+                    rsi = 100 - (100 / (1 + rs))
+
+                if rsi < MIN_RSI_THRESHOLD:
+                    return False
+        except Exception:
+            pass
+
+        # --- Core Buy Condition ---
+        if current_prob >= p96 and current_prob < p97_5:
+            return True
+
+        return False
+
+
+
+
     ##===============================[ SELLING ]==================================##
     ##===============================[ SELLING ]==================================##
     ##===============================[ SELLING ]==================================##
@@ -1819,7 +2550,7 @@ class StockSniperStrategy(bt.Strategy):
                     #make sure up prob is within the range that shows the best results and not some weird values like 0.1 or 0.9
                     if len(d.UpProbability) < 6:
                         continue
-                    recent_probs = [d.UpProbability[i] for i in range(1, 6) if d.UpProbability[i] is not None]
+                    recent_probs = [d.UpProbability[-i] for i in range(1, 6) if d.UpProbability[-i] is not None]
 
                     if recent_probs and min(recent_probs) < UP_PROB_MIN_BOUND:
                         continue
@@ -1848,7 +2579,7 @@ class StockSniperStrategy(bt.Strategy):
                 i = 1
                 while len(historic_probs) < TARGET_HISTORIC_PROB_COUNT and i < MAX_HISTORIC_LOOKBACK:
                     try:
-                        prob_val = d.UpProbability[i]
+                        prob_val = d.UpProbability[-i]
                         if prob_val is not None:
                             historic_probs.append(float(prob_val))
                         i += 1
@@ -1963,8 +2694,7 @@ class StockSniperStrategy(bt.Strategy):
     
             # Return only the data/size/correlation tuples for compatibility
             best_candidates = [(candidate[0], candidate[1], candidate[2]) for candidate in valid_candidates]
-            self.save_best_buy_signals(best_candidates)
-            
+
             logging.info(f"Selected {len(best_candidates)} signals using identical can_buy criteria")
         else:
             logging.warning("No stocks passed the identical can_buy criteria filters")
@@ -2014,14 +2744,13 @@ class StockSniperStrategy(bt.Strategy):
         if verbose:
             dprint(f"Sorted buy candidates: {len(buy_candidates)}", "INFO")
     
-        # Save to both formats to maintain compatibility
-        # Legacy format (for backwards compatibility)
-        self.save_best_buy_signals(buy_candidates)
-        if verbose:
-            dprint("Saved signals to legacy format (_Buy_Signals.parquet)", "SUCCESS")
-        
-        # NEW: Save to consolidated format for live trading
-        if buy_candidates:
+        # Save the most-recent-day candidate POOL to Data/0__signals.parquet (canonical signals file)
+        # FAST: gate to the LAST trading date only. This export block scrapes finviz +
+        # runs FinBERT sentiment (save_guaranteed_signals_to_parquet) — on every historical
+        # bar that was ~64% of backtest runtime (1225s of SSL reads). It's post-decision
+        # (live-signal export), so running it only on the final bar is LOSSLESS for backtest
+        # metrics and matches the experimental backtester's fix.
+        if buy_candidates and current_date == self.last_trading_date:
             if verbose:
                 dprint("Converting candidates to new signal format", "INFO")
             signals = []
@@ -2033,7 +2762,12 @@ class StockSniperStrategy(bt.Strategy):
                 dprint(f"Real current date: {real_current_date}", "INFO")
                 dprint(f"Next trading day for signals: {next_trading_day}", "INFO")
             
-            for d, size, correlation in buy_candidates[:self.p.max_positions]:
+            # Write a candidate POOL (not just max_positions) so the morning
+            # FilterRubric narrowing has a surplus to trim down to the final book.
+            # The broker only ever trades the narrowed _Buy_Signals.parquet, never
+            # this raw pool.
+            SIGNAL_POOL_SIZE = 12
+            for d, size, correlation in buy_candidates[:SIGNAL_POOL_SIZE]:
                 price = d.close[0]
                 atr = self.inds[d]['atr'][0] if d in self.inds and 'atr' in self.inds[d] else price * 0.02
                 
@@ -2087,7 +2821,9 @@ class StockSniperStrategy(bt.Strategy):
 
 
     def sort_buy_candidates(self, buy_candidates):
-        sorted_candidates = sorted(buy_candidates, key=lambda x: x[0].UpProbability[0], reverse=False)
+        # 2026-05-15: flipped to descending after EDA showed the asc sort discarded
+        # the model's highest-conviction qualifying candidates. Sharpe 0.80 -> 3.66.
+        sorted_candidates = sorted(buy_candidates, key=lambda x: x[0].UpProbability[0], reverse=True)
         Verbose = False
 
         if Verbose:
@@ -2113,7 +2849,8 @@ class StockSniperStrategy(bt.Strategy):
                 return 0
 
             if candidate_ticker not in self.correlation_df.index:
-                logging.warning(f"Ticker {candidate_ticker} not found in correlation data")
+
+                ##logging.warning(f"Ticker {candidate_ticker} not found in correlation data")
                 return 0
 
             correlations = []
@@ -2544,7 +3281,7 @@ class StockSniperStrategy(bt.Strategy):
 
             write_trading_data(final_df)
 
-            logging.info(f"Successfully wrote {len(signal_data)} new buy signals and synchronized with live trader")
+            #logging.info(f"Successfully wrote {len(signal_data)} new buy signals and synchronized with live trader")
 
 
 
@@ -2656,12 +3393,12 @@ class StockSniperStrategy(bt.Strategy):
             dprint("Writing trading data to file", "INFO")
             try:
                 write_trading_data(final_df)
-                dprint("Successfully wrote trading data", "SUCCESS")
+                #dprint("Successfully wrote trading data", "SUCCESS")
             except Exception as e:
                 dprint(f"Error writing trading data: {str(e)}", "ERROR")
                 raise
 
-            dprint(f"Successfully wrote {len(signal_data)} new buy signals and synchronized with live trader", "SUCCESS")
+            #dprint(f"Successfully wrote {len(signal_data)} new buy signals and synchronized with live trader", "SUCCESS")
 
             # Verification step - read back the file to confirm what was written
             dprint("Verifying written signals by reading back from file", "INFO")
@@ -2715,6 +3452,10 @@ class StockSniperStrategy(bt.Strategy):
         mark_position_as_bought(symbol, order.executed.size)
         logging.info(f"BUY EXECUTED for {symbol}: Price={order.executed.price:.2f}, "
                     f"Size={order.executed.size}, Cost={order.executed.value:.2f}")
+
+        # Correct entry price to actual fill (market orders fill at next-bar open,
+        # not the close stored at signal time in execute_buy_with_bracket).
+        self.entry_prices[data] = order.executed.price
     
 
 
@@ -2736,6 +3477,21 @@ class StockSniperStrategy(bt.Strategy):
                 profit_pct = ((exit_price / entry_price) - 1) * 100
                 profit_abs = (exit_price - entry_price) * abs(order.executed.size)
                 days_held = (exit_date - entry_date).days if entry_date else 0
+
+                _color = "\033[32m" if profit_pct >= 0 else "\033[31m"
+                _sign  = "+" if profit_pct >= 0 else ""
+
+                self.trade_pct_returns.append(profit_pct)
+                _total_ret = (self.broker.getvalue() / self.broker.startingcash - 1) * 100
+                _n = len(self.trade_pct_returns)
+                if _n >= 2:
+                    import numpy as _np
+                    _arr = _np.array(self.trade_pct_returns)
+                    _sharpe = (_arr.mean() / _arr.std(ddof=1)) * (_n ** 0.5) if _arr.std(ddof=1) > 0 else 0.0
+                else:
+                    _sharpe = 0.0
+                _ret_sign = "+" if _total_ret >= 0 else ""
+                print(f"{_color}{symbol:<6}  {_sign}{profit_pct:.2f}%\033[0m  |  Total: {_ret_sign}{_total_ret:.2f}%  Sharpe: {_sharpe:.2f}  (n={_n})")
                 
                 is_win = profit_abs > 0
                 is_loss = profit_abs < 0
@@ -2785,7 +3541,7 @@ class StockSniperStrategy(bt.Strategy):
                 # Add to internal history
                 self.trade_history.append(trade_data)
                 
-                # Record using TradeRecorder for trade_history.parquet
+                # Record using TradeRecorder for Data/TradeHistory.parquet
                 self.trade_recorder.record_trade(trade_data)
                 
                 # ALSO DIRECTLY ADD TO COMPLETED TRADES FILE
@@ -2879,7 +3635,7 @@ class StockSniperStrategy(bt.Strategy):
         elif order.status == order.Expired:
             reason = "Expired"
             
-        logging.warning(f"Order failed for {order.data._name}: {reason}")
+        #logging.warning(f"Order failed for {order.data._name}: {reason}")
     
     def stop(self):
         self.progress_bar.close()
@@ -3023,7 +3779,7 @@ def save_guaranteed_signals_to_parquet(signals, next_trading_day=None):
             next_trading_day = get_next_trading_day(current_date)
             logger.info(f"Next trading day: {next_trading_day}")
         
-        STOP_LOSS_PERCENT = 2.0  
+        STOP_LOSS_PERCENT = float(os.environ.get('BT_STOP_PCT', 2.0))   # env-gated for param-stress; default 2.0  
         TAKE_PROFIT_PERCENT = 10.0
         
         signal_data = []
@@ -3104,10 +3860,28 @@ def save_guaranteed_signals_to_parquet(signals, next_trading_day=None):
             if col in new_signals_df.columns:
                 new_signals_df[col] = pd.to_datetime(new_signals_df[col])
         
-        signals_file_path = 'Data/0__Signals.parquet'
-        os.makedirs(os.path.dirname(signals_file_path), exist_ok=True)
+        signals_file_path = 'Data/0__signals.parquet'
+        _sig_dir = os.path.dirname(signals_file_path)
+        if _sig_dir:
+            os.makedirs(_sig_dir, exist_ok=True)
+
+        # Mechanical pre-filter: bake FilterRubric Step-1 (non-web) hard-exclusion
+        # audit columns into the dataframe BEFORE the single final write, so the
+        # morning analyst sees price/cap/RSI/weekly-vol verdicts without hand-running
+        # the rubric. Annotate only — no rows dropped. (see Util.annotate_signals_*)
+        if annotate_signals_mechanical_filter is not None:
+            try:
+                new_signals_df = annotate_signals_mechanical_filter(new_signals_df)
+                n_ex = int(new_signals_df["MechExclude"].sum())
+                logger.info(f"Mechanical pre-filter: annotated {len(new_signals_df)} signals, "
+                            f"{n_ex} flagged MechExclude (rows kept, just flagged)")
+                for _, r in new_signals_df[new_signals_df["MechExclude"]].iterrows():
+                    logger.info(f"  FLAG {r['Symbol']}: {r['MechReasons']}")
+            except Exception as e:
+                logger.error(f"Mechanical pre-filter annotation failed (signals still written): {e}")
+
         new_signals_df.to_parquet(signals_file_path, index=False)
-        
+
         logger.info(f"SUCCESS: Wrote {len(signal_data)} signals to {signals_file_path}")
         logger.info(f"Signals ready for live trading on {next_trading_day}")
         
@@ -3203,7 +3977,7 @@ def save_best_signals_to_parquet(signals, next_trading_day=None):
         write_trading_data(final_df)
         
         
-        logger.info(f"Successfully wrote {len(signal_data)} new buy signals")
+        #logger.info(f"Successfully wrote {len(signal_data)} new buy signals")
         
     except Exception as e:
         logger.error(f"Error saving best signals to parquet: {e}")
@@ -3286,6 +4060,13 @@ def filter_stocks_by_signal_quality(data_dir, min_variance=0.1, min_up_prob=0.50
 def main():
     """Modified main function that ensures you get signals"""
     logger = get_logger(script_name="5__NightlyBackTester")
+
+    # Mute all console (StreamHandler) output — file handlers keep full detail
+    for _handler in logging.root.handlers + logger.handlers:
+        if isinstance(_handler, logging.StreamHandler) and not isinstance(_handler, logging.FileHandler):
+            _handler.setLevel(logging.WARNING)
+    logging.root.setLevel(logging.WARNING)
+
     start_time = time.time()
     
     try:
@@ -3385,8 +4166,8 @@ def setup_backtest_environment(args, logger):
     cerebro.broker.set_coo(False)
     cerebro.broker.set_coc(False)
     
-    # Get data files
-    data_dir = 'Data/RFpredictions'
+    # Get data files (read-only override via --data_dir; default = live signals)
+    data_dir = getattr(args, 'data_dir', 'Data/RFpredictions')
     file_paths = select_data_files(args, data_dir, logger)
     
     if not file_paths:
@@ -3402,8 +4183,9 @@ def setup_backtest_environment(args, logger):
     logger.info(f"Preparing {len(aligned_data)} data feeds in parallel...")
     start_time = time.time()
     
-    # Use process pool for true parallelism (32 cores or however many are available)
-    num_cores = min(32, multiprocessing.cpu_count())
+    # Use process pool for true parallelism (env-capped via BT_INNER_WORKERS when
+    # run under the parallel harness, else all cores)
+    num_cores = _inner_workers()
     with multiprocessing.Pool(processes=num_cores) as pool:
         prepared_feeds = list(tqdm(
             pool.imap(prepare_data_feed, aligned_data),
@@ -3431,7 +4213,24 @@ def setup_backtest_environment(args, logger):
     if hasattr(args, 'up_prob') and args.up_prob is not None:
         strategy_params['up_prob_threshold'] = args.up_prob
         strategy_params['up_prob_min_trigger'] = args.up_prob + 0.02
-    
+
+    # Book-size lever: --max_positions was parsed but never reached the strategy.
+    # Wire it through so the breadth sweep (top-4 -> top-50) actually takes effect.
+    if getattr(args, 'max_positions', None) is not None:
+        strategy_params['max_positions'] = args.max_positions
+        logger.info(f"Book size overridden: max_positions={args.max_positions}")
+
+    # Strategy-param overrides for the param-robustness / overfitting stress test.
+    # Each was parsed but (like max_positions) never reached the strategy. Only the
+    # keys the strategy actually consumes are wired; override only when provided.
+    for _arg, _pkey in (('position_timeout', 'position_timeout'),
+                        ('take_profit',      'take_profit_percent'),
+                        ('risk_per_trade',   'risk_per_trade_pct')):
+        _v = getattr(args, _arg, None)
+        if _v is not None:
+            strategy_params[_pkey] = _v
+            logger.info(f"Strategy param override: {_pkey}={_v}")
+
     cerebro.addstrategy(StockSniperStrategy, **strategy_params)
     
     return cerebro, aligned_data
@@ -3494,7 +4293,19 @@ def select_data_files(args, data_dir, logger):
         
         # Ensure we don't try to sample more files than exist
         num_to_select = min(num_to_select, num_files)
-        
+
+        # Reproducible sampling: when BT_SAMPLE_SEED is set (e.g. by the parallel
+        # harness), every job draws the SAME subset, so a book-size sweep compares
+        # like-for-like instead of being confounded by different random universes.
+        all_files = sorted(all_files)
+        _sseed = os.environ.get('BT_SAMPLE_SEED')
+        if _sseed is not None:
+            try:
+                random.seed(int(_sseed))
+                logger.info(f"Deterministic sampling seed BT_SAMPLE_SEED={_sseed}")
+            except ValueError:
+                pass
+
         file_paths = random.sample(all_files, num_to_select)
         logger.info(f"Selected {len(file_paths)} random files ({sample_pct}% of {num_files})")
         
@@ -3985,13 +4796,25 @@ def process_daily_returns_data(results, analyzer_data, logger):
         for date, ret in analyzer_data['time_return'].items():
             if isinstance(ret, (int, float)):
                 daily_returns.append(ret)
-                
+
         if not daily_returns:
             return
-            
+
+        # Store the dated daily-return series so best/worst day-week-month extremes
+        # (and how far they deviate from a normal trading period) can be reported later.
+        try:
+            dated = {pd.to_datetime(d): r
+                     for d, r in analyzer_data['time_return'].items()
+                     if isinstance(r, (int, float))}
+            if dated:
+                results['daily_return_series'] = pd.Series(dated).sort_index()
+        except Exception:
+            pass
+
         # Sortino ratio calculation
+        # downside_returns are fractional; convert to % to match annualized_return units
         downside_returns = [r for r in daily_returns if r < 0]
-        downside_deviation = np.std(downside_returns) * np.sqrt(252) if downside_returns else 0
+        downside_deviation = np.std(downside_returns) * np.sqrt(252) * 100 if downside_returns else 0
         if downside_deviation > 0:
             results['sortino_ratio'] = (results['annualized_return'] - 5) / downside_deviation
         else:
@@ -4006,7 +4829,8 @@ def process_daily_returns_data(results, analyzer_data, logger):
             results['gain_to_pain_ratio'] = float('inf')
         
         # Ulcer index calculation
-        equity_curve = [results['initial_value'] * (1 + r / 100) for r in np.cumsum(daily_returns)]
+        # daily_returns are fractional (0.01 = 1%) — use geometric compounding
+        equity_curve = list(results['initial_value'] * np.cumprod(1 + np.array(daily_returns)))
         drawdowns = []
         peak = equity_curve[0]
         for value in equity_curve:
@@ -4017,18 +4841,35 @@ def process_daily_returns_data(results, analyzer_data, logger):
                 dd_pct = (peak - value) / peak * 100
                 drawdowns.append(dd_pct)
         results['ulcer_index'] = np.sqrt(np.mean(np.array(drawdowns) ** 2))
-        
+
         # Volatility metrics
         results['daily_volatility'] = np.std(daily_returns) * 100
         results['annualized_volatility'] = results['daily_volatility'] * np.sqrt(252)
-        
+
+        # Override backtrader's SharpeRatio (bt.analyzers.SharpeRatio inflates the
+        # Sharpe when the strategy spends many days in cash — near-zero portfolio
+        # changes make std artificially tiny). Recompute directly from the daily
+        # TimeReturn series, which already includes 0-return idle days.
+        if np.std(daily_returns, ddof=1) > 0:
+            _daily_rf = (1.05 ** (1.0 / 252)) - 1
+            _excess   = np.array(daily_returns) - _daily_rf
+            results['sharpe_ratio'] = float(
+                np.mean(_excess) / np.std(_excess, ddof=1) * np.sqrt(252)
+            )
+
         # VaR and CVaR
         if len(daily_returns) > 5:
             results['var_95'] = np.percentile(daily_returns, 5) * 100
             cvar_values = [r for r in daily_returns if r < results['var_95'] / 100]
             if cvar_values and results['var_95'] < 0:
                 results['cvar_95'] = np.mean(cvar_values) * 100
-        
+
+            # Tail Ratio: P95 daily return / |P5 daily return| — > 1.0 means fat right tail
+            p95 = np.percentile(daily_returns, 95)
+            p5  = np.percentile(daily_returns, 5)
+            if p5 < 0:
+                results['tail_ratio'] = p95 / abs(p5)
+
 
         def calculate_omega_ratio_inline(returns, threshold=0.0):
             """Calculate true Omega ratio inline."""
@@ -4078,6 +4919,24 @@ def process_daily_returns_data(results, analyzer_data, logger):
                     
             results['max_pos_streak'] = max_pos_streak
             results['max_neg_streak'] = max_neg_streak
+
+            # Probabilistic Sharpe Ratio (Bailey & Lopez de Prado, 2012)
+            # P(true annualized SR > 1.0), corrected for skewness and kurtosis
+            dr_arr  = np.array(daily_returns)
+            sr_hat  = np.mean(dr_arr) / np.std(dr_arr, ddof=1)   # daily SR
+            sr_star = 1.0 / np.sqrt(252)                          # daily equiv of annual 1.0
+            gamma3  = stats.skew(dr_arr)
+            gamma4  = stats.kurtosis(dr_arr, fisher=False)        # raw kurtosis (normal = 3)
+            variance_sr = 1 - gamma3 * sr_hat + (gamma4 - 1) / 4 * sr_hat ** 2
+            if variance_sr > 0:
+                psr_stat = (sr_hat - sr_star) * np.sqrt(len(daily_returns) - 1) / np.sqrt(variance_sr)
+                results['psr'] = float(stats.norm.cdf(psr_stat))
+
+        # Serenity Ratio = (Annualized Excess Return) / Ulcer Index
+        # Rewards fast recovery; penalises lingering drawdowns unlike Calmar's single-event max-DD
+        if results.get('ulcer_index', 0) > 0:
+            results['serenity_ratio'] = (results.get('annualized_return', 0) - 5.0) / results['ulcer_index']
+
     except Exception as e:
         logger.warning(f"Error calculating advanced metrics from daily returns: {str(e)}")
 
@@ -4170,8 +5029,9 @@ def process_daily_returns_data_corrected(results, analyzer_data, logger):
         returns_array = np.array(daily_returns)
         
         # Sortino ratio calculation
+        # downside_returns are fractional; convert to % to match annualized_return units
         downside_returns = [r for r in daily_returns if r < 0]
-        downside_deviation = np.std(downside_returns) * np.sqrt(252) if downside_returns else 0
+        downside_deviation = np.std(downside_returns) * np.sqrt(252) * 100 if downside_returns else 0
         if downside_deviation > 0:
             results['sortino_ratio'] = (results['annualized_return'] - 5) / downside_deviation
         else:
@@ -4192,7 +5052,8 @@ def process_daily_returns_data_corrected(results, analyzer_data, logger):
         results['omega_ratio_rf'] = calculate_omega_ratio_risk_free(daily_returns, risk_free_rate=0.05)
         
         # Ulcer index calculation
-        equity_curve = [results['initial_value'] * (1 + r / 100) for r in np.cumsum(daily_returns)]
+        # daily_returns are fractional (0.01 = 1%) — use geometric compounding
+        equity_curve = list(results['initial_value'] * np.cumprod(1 + np.array(daily_returns)))
         drawdowns = []
         peak = equity_curve[0]
         for value in equity_curve:
@@ -4203,11 +5064,22 @@ def process_daily_returns_data_corrected(results, analyzer_data, logger):
                 dd_pct = (peak - value) / peak * 100
                 drawdowns.append(dd_pct)
         results['ulcer_index'] = np.sqrt(np.mean(np.array(drawdowns) ** 2))
-        
+
         # Volatility metrics
         results['daily_volatility'] = np.std(daily_returns) * 100
         results['annualized_volatility'] = results['daily_volatility'] * np.sqrt(252)
-        
+
+        # Override backtrader's SharpeRatio (bt.analyzers.SharpeRatio inflates the
+        # Sharpe when the strategy spends many days in cash — near-zero portfolio
+        # changes make std artificially tiny). Recompute directly from the daily
+        # TimeReturn series, which already includes 0-return idle days.
+        if np.std(daily_returns, ddof=1) > 0:
+            _daily_rf = (1.05 ** (1.0 / 252)) - 1
+            _excess   = np.array(daily_returns) - _daily_rf
+            results['sharpe_ratio'] = float(
+                np.mean(_excess) / np.std(_excess, ddof=1) * np.sqrt(252)
+            )
+
         # VaR and CVaR
         if len(daily_returns) > 5:
             results['var_95'] = np.percentile(daily_returns, 5) * 100
@@ -4349,18 +5221,27 @@ def print_detailed_results(results, execution_time):
         print(colorize_output(results['enhanced_modified_sqn'], "Modified SQN (% normalized):", 3.0, 1.6))
         
 
-    # Risk metrics
+    # Compute capture ratios before printing so they appear in Risk Metrics
+    _compute_capture_ratios(results)
+
+    # Risk metrics (includes capture ratios)
     print_risk_metrics(results)
-    
+
     # Trade statistics
     print_trade_statistics(results)
-    
+
+    # Statistical quality metrics (PSR, Serenity, Tail Ratio)
+    print_signal_quality_metrics(results)
+
     # Trade management metrics
     print_trade_management_metrics(results)
-    
+
     # Advanced trade quality metrics
     print_advanced_trade_metrics(results)
-    
+
+    # Best/worst day-week-month + how far those extremes deviate from normal
+    print_trade_history_extremes(results)
+
     # Enhanced strategy consistency metrics (if available)
     #print_enhanced_consistency_metrics(results)
     
@@ -4374,7 +5255,7 @@ def print_detailed_results(results, execution_time):
     
     # Execution time and trade data notice
     print(f"\nExecution time: {execution_time:.2f} seconds")
-    print("Trade data saved to trade_history.parquet for further analysis")
+    print("Trade data saved to Data/TradeHistory.parquet for further analysis")
 
 
 
@@ -4417,6 +5298,58 @@ def print_sqn_quality(results):
         print(f"{'SQN Quality:':<30}{color_code}{sqn_description:<10}\033[0m")
     else:
         print(f"{'SQN Quality:':<30}\033[38;2;150;150;150mN/A        \033[0m")
+
+
+def _compute_capture_ratios(results):
+    """Download S&P 500 monthly data and store up/down capture ratios in results."""
+    strat_monthly = results.get('monthly_performance', {})
+    if not strat_monthly:
+        return
+    try:
+        months   = sorted(strat_monthly.keys())
+        sy, sm   = map(int, months[0].split('-'))
+        ey, em   = map(int, months[-1].split('-'))
+        start_dt = datetime(sy, sm, 1) - timedelta(days=5)
+        end_dt   = datetime(ey, em, 28) + timedelta(days=10)
+
+        sp500 = yf.download("^GSPC",
+                            start=start_dt.strftime('%Y-%m-%d'),
+                            end=end_dt.strftime('%Y-%m-%d'),
+                            interval="1d", auto_adjust=True, progress=False)
+        if len(sp500) == 0:
+            return
+
+        daily_ret = sp500['Close'].pct_change().dropna()
+        market_monthly = {}
+        for (yr, mo), grp in daily_ret.groupby([daily_ret.index.year, daily_ret.index.month]):
+            market_monthly[f"{yr}-{mo:02d}"] = ((1 + grp).cumprod().iloc[-1] - 1) * 100
+
+        common = set(strat_monthly.keys()) & set(market_monthly.keys())
+        if len(common) < 3:
+            return
+
+        up_s, up_m, dn_s, dn_m = [], [], [], []
+        for month in common:
+            sp = market_monthly[month]
+            st = strat_monthly[month]
+            if sp > 0:
+                up_s.append(st); up_m.append(sp)
+            elif sp < 0:
+                dn_s.append(st); dn_m.append(sp)
+
+        def _gm(vals):
+            return (np.prod([1 + v / 100 for v in vals]) ** (1 / len(vals)) - 1) * 100
+
+        if len(up_m) >= 2:
+            gm_u = _gm(up_m)
+            if gm_u != 0:
+                results['up_capture'] = (_gm(up_s) / gm_u) * 100
+        if len(dn_m) >= 2:
+            gm_d = _gm(dn_m)
+            if gm_d != 0:
+                results['down_capture'] = (_gm(dn_s) / gm_d) * 100
+    except Exception:
+        pass  # silently skip on network failure
 
 
 def print_risk_metrics(results):
@@ -4473,10 +5406,22 @@ def print_risk_metrics(results):
                          avg_loss_pct * 2.5 * var_cvar_multiplier, 
                          lower_is_better=True))
     
-    print(colorize_output(results['cvar_95'], "Daily CVaR (95%):", 
-                         avg_loss_pct * 1.5 * var_cvar_multiplier, 
-                         avg_loss_pct * 3.0 * var_cvar_multiplier, 
+    print(colorize_output(results['cvar_95'], "Daily CVaR (95%):",
+                         avg_loss_pct * 1.5 * var_cvar_multiplier,
+                         avg_loss_pct * 3.0 * var_cvar_multiplier,
                          lower_is_better=True))
+
+    # Market Capture Ratios (computed by _compute_capture_ratios before printing)
+    if results.get('up_capture') is not None:
+        # > 120% outpaces S&P in rallies; > 240% is unicorn
+        print(colorize_output(results['up_capture'], "Up-Capture Ratio (%):",
+                              good_threshold=120.0, bad_threshold=80.0,
+                              unicorn_multiplier=2.0))
+    if results.get('down_capture') is not None:
+        # Negative = gains when market falls; unicorn triggers at value <= 50/10000 = 0.005
+        print(colorize_output(results['down_capture'], "Down-Capture Ratio (%):",
+                              good_threshold=50.0, bad_threshold=100.0,
+                              lower_is_better=True, unicorn_multiplier=10000.0))
 
 def print_trade_statistics(results):
     """Print trade statistics with colorized output."""
@@ -4489,24 +5434,34 @@ def print_trade_statistics(results):
 
     if 'gross_win_rate' in results:
         print(colorize_output(results['gross_win_rate'], "Win Rate (before fees) %:", 60, 40))
-        print(colorize_output(results['commission_impact_pct'], "Commission Impact %:", 0.5, 2.0, lower_is_better=True))
-        print(colorize_output(results['breakeven_threshold_pct'], "Breakeven Threshold %:", 1.0, 4.0, lower_is_better=True))
-    
-    print(colorize_output(results['won_avg'], "Avg. Winning Trade ($):", 100, 50))
-    print(colorize_output(results['lost_avg'], "Avg. Losing Trade ($):", results['won_avg'] * 0.5, results['won_avg'] * 0.75, lower_is_better=True))
-    print(colorize_output(results['avg_win_pct'], "Avg. Winning Trade (%):", 1.0, 0.5))
-    print(colorize_output(results['avg_loss_pct'], "Avg. Losing Trade (%):", results['avg_win_pct'] * 0.5, results['avg_win_pct'] * 0.75, lower_is_better=True))
-    print(colorize_output(results['won_max'], "Largest Win ($):", results['initial_value'] / 4, 200))
-    print(colorize_output(results['lost_max'], "Largest Loss ($):", results['won_max'] * 0.25, results['won_max'] * 0.5, lower_is_better=True))
+        print(colorize_output(results['commission_impact_pct'], "Commission Impact %:", 2.0, 5.0, lower_is_better=True))
+        print(colorize_output(results['breakeven_threshold_pct'], "Breakeven Threshold %:", 4.0, 10.0, lower_is_better=True))
+
+    # Dollar thresholds scale with account size — a $10K account shouldn't be punished for small positions
+    _iv = results['initial_value']
+    avg_win_good = max(_iv / 150, 30)   # ~$67 on $10K
+    avg_win_bad  = max(_iv / 600, 10)   # ~$17 on $10K
+    print(colorize_output(results['won_avg'], "Avg. Winning Trade ($):", avg_win_good, avg_win_bad))
+    # Losing trade up to 85% of winning trade is fine at 60%+ win rate
+    print(colorize_output(results['lost_avg'], "Avg. Losing Trade ($):", results['won_avg'] * 0.75, results['won_avg'] * 1.0, lower_is_better=True))
+    # For 1-day hold: 0.4%+ avg win per trade is strong
+    print(colorize_output(results['avg_win_pct'], "Avg. Winning Trade (%):", 0.4, 0.15))
+    print(colorize_output(results['avg_loss_pct'], "Avg. Losing Trade (%):", results['avg_win_pct'] * 0.8, results['avg_win_pct'] * 1.1, lower_is_better=True))
+    # Largest win: good = 5% of account, bad = 0.5% of account
+    print(colorize_output(results['won_max'], "Largest Win ($):", _iv / 20, _iv / 200))
+    # Largest loss: good ≤ 50% of largest win, bad ≥ 90%
+    print(colorize_output(results['lost_max'], "Largest Loss ($):", results['won_max'] * 0.5, results['won_max'] * 0.9, lower_is_better=True))
     print(colorize_output(results['largest_win_pct'], "Largest Win (%):", 5.0, 2.0))
     print(colorize_output(results['largest_loss_pct'], "Largest Loss (%):", results['largest_win_pct'] * 0.5, results['largest_win_pct'] * 2.0, lower_is_better=True))
     print(colorize_output(results['avg_profit_per_trade'], "Avg. Trade P&L:", 50, 0))
     print(colorize_output(results['profit_factor'], "Profit Factor:", 2.5, 1.0))
 
-    ##expected value = Win Rate * Avg Win - Loss Rate * Avg Loss
-    results['Expected_Value_PerTrade'] = (results['percent_profitable'] * results['won_avg'] - (100 - results['percent_profitable']) * results['lost_avg']) / results['total_closed']
-    print(colorize_output(results['Expected_Value_PerTrade'], "EV Per Trade:", 100.0, 20.0))
-    
+    # EV Per Trade: win_rate * avg_win - loss_rate * avg_loss (do NOT divide by trade count)
+    win_rate_dec = results['percent_profitable'] / 100
+    results['Expected_Value_PerTrade'] = (win_rate_dec * results['won_avg']) - ((1 - win_rate_dec) * results['lost_avg'])
+    ev_good = max(_iv / 500, 10)   # ~$20 on $10K
+    ev_bad  = max(_iv / 2000, 3)   # ~$5  on $10K
+    print(colorize_output(results['Expected_Value_PerTrade'], "EV Per Trade ($):", ev_good, ev_bad))
 
     print(colorize_output(results['net_profit_drawdown_ratio'], "Net Profit / Drawdown Ratio:", 3.0, 1.0))
 
@@ -4534,6 +5489,155 @@ def print_advanced_trade_metrics(results):
     print(colorize_output(results['profit_per_day'], "Profit per Day ($):", 20, 5))
 
 
+def print_trade_history_extremes(results):
+    """Print the best/worst day, week, and month, then show how far each of
+    those extremes deviated from a normal period of trading.
+
+    This is a recency-bias / out-of-sample sanity check: it reveals whether the
+    headline return leans on a handful of outlier periods, and quantifies just
+    how unusual those periods were.
+
+    Robust to variable week/month length. Trading weeks aren't always 5 days
+    (holidays make them 4 or 3), and a backtest can start or end mid-week:
+      * boundary stub periods (a partial first/last week/month that is just an
+        artifact of where the window happens to fall) are dropped, while genuine
+        interior holiday-shortened weeks are kept;
+      * the trading-day count is printed for every week/month; and
+      * the "how wild" sigma is LENGTH-ADJUSTED -- each period is scored against
+        the daily distribution scaled by sqrt(its own trading days), so a big
+        3-day week and a big 5-day week are judged on equal footing instead of
+        being mixed into one length-confounded weekly std.
+    """
+    series = results.get('daily_return_series')
+    if series is None or len(series) < 20:
+        return
+
+    # ANSI helpers. Pad the *plain* text before colouring so the columns stay
+    # vertically aligned (escape codes have zero display width but count in
+    # f-string padding, so they must sit outside the padded field).
+    GREEN = "\033[38;2;0;200;0m"
+    RED   = "\033[38;2;220;0;0m"
+    GREY  = "\033[38;2;150;150;150m"
+    RESET = "\033[0m"
+
+    def pct_field(value, width=10):
+        color = GREEN if value >= 0 else RED
+        return f"{color}{f'{value * 100:+.2f}%':<{width}}{RESET}"
+
+    def severity_tag(z):
+        az = abs(z)
+        if az >= 4.0:
+            return "Extreme outlier"
+        if az >= 2.5:
+            return "Very unusual"
+        if az >= 1.5:
+            return "Notable"
+        return "Normal"
+
+    # Daily distribution is the uniform source of truth (a day is a day), so all
+    # length adjustment is derived from it rather than from length-confounded
+    # weekly/monthly stds.
+    daily_mean = series.mean()
+    daily_std  = series.std()
+    daily_typ  = series.abs().median()
+
+    def _trim_boundary_stubs(ret, counts):
+        """Drop only a partial first/last bin (a stub created by where the
+        backtest window starts/ends). Interior weeks are always real -- a
+        holiday-shortened interior week is a legitimate week and is kept."""
+        if len(ret) <= 2:
+            return ret, counts
+        full = counts.median()          # typical full-length bin (e.g. 5 for weeks)
+        keep = np.ones(len(ret), dtype=bool)
+        if counts.iloc[0] < full:
+            keep[0] = False
+        if counts.iloc[-1] < full:
+            keep[-1] = False
+        return ret[keep], counts[keep]
+
+    # Build week/month return curves from the same daily series so every figure
+    # is internally consistent. Drop empty bins, then trim boundary stubs.
+    def build(freq):
+        ret = (1 + series).resample(freq).prod() - 1
+        counts = series.resample(freq).count()
+        mask = counts > 0
+        ret, counts = ret[mask], counts[mask]
+        return _trim_boundary_stubs(ret, counts)
+
+    week_ret,  week_cnt  = build('W')
+    month_ret, month_cnt = build('ME')
+    day_cnt = pd.Series(1, index=series.index)   # every day is a full 1-day bin
+
+    # (name, returns, day-counts, date formatter, prefix, show trading-day count)
+    periods = [
+        ("Day",   series,    day_cnt,   lambda d: d.strftime('%Y-%m-%d'), "on ",          False),
+        ("Week",  week_ret,  week_cnt,  lambda d: d.strftime('%Y-%m-%d'), "week ending ", True),
+        ("Month", month_ret, month_cnt, lambda d: d.strftime('%Y %B'),    "",             True),
+    ]
+
+    def days_note(k, show):
+        return f" ({k} trading days)" if show else ""
+
+    # --- Best & worst periods -------------------------------------------------
+    print("\nTrade History - Best & Worst Periods:")
+    for name, s, cnt, fmt_date, prefix, show in periods:
+        if s.empty:
+            continue
+        for which, val, dt in (("Best", s.max(), s.idxmax()),
+                               ("Worst", s.min(), s.idxmin())):
+            k = int(cnt.loc[dt])
+            print(f"{f'{which} {name}:':<30}{pct_field(val)}"
+                  f"{GREY}{prefix}{fmt_date(dt)}{days_note(k, show)}{RESET}")
+
+    # --- How wild were those extremes vs a normal trading period? -------------
+    print("\nDeviation From Normal Trading (how wild the extremes really were):")
+    print(f"{'Daily baseline:':<30}{GREY}mean {daily_mean * 100:+.2f}%/day, "
+          f"1 sigma {daily_std * 100:.2f}%/day, typical move {daily_typ * 100:.2f}%{RESET}")
+    print(f"{GREY}Sigma is length-adjusted (scaled by sqrt of each period's trading days),"
+          f" so 3-, 4-{RESET}")
+    print(f"{GREY}and 5-day weeks are compared on equal footing.{RESET}")
+    if daily_std <= 0:
+        return
+    for name, s, cnt, fmt_date, prefix, show in periods:
+        if s.empty:
+            continue
+        for which, val, dt in (("Best", s.max(), s.idxmax()),
+                               ("Worst", s.min(), s.idxmin())):
+            k = int(cnt.loc[dt])
+            # CLT z-score of the period's return vs k iid daily moves.
+            z = (val - k * daily_mean) / (daily_std * np.sqrt(k))
+            color = GREEN if val >= 0 else RED
+            z_str = f"{z:+.1f} sigma"
+            print(f"{f'  {which} {name}:':<30}{color}{f'{z_str:<12}'}{RESET}"
+                  f"{GREY}{days_note(k, show).strip() + '  ' if show else ''}"
+                  f"[{severity_tag(z)}]{RESET}")
+
+
+def print_signal_quality_metrics(results):
+    """Print statistical validity and return-distribution quality metrics."""
+    keys = ['psr', 'serenity_ratio', 'tail_ratio']
+    if not any(results.get(k) is not None for k in keys):
+        return
+
+    print("\nStatistical Quality Metrics:")
+
+    if results.get('psr') is not None:
+        # P(true annualized SR > 1.0) corrected for skewness & kurtosis — > 99.91% is iron-clad
+        print(colorize_output(results['psr'] * 100, "Probabilistic Sharpe Ratio (%):",
+                              good_threshold=97.0, bad_threshold=90.0,
+                              unicorn_multiplier=1.031))  # unicorn at >= 99.91%
+
+    if results.get('serenity_ratio') is not None:
+        # (Annual Return - RF) / Ulcer Index; penalises lingering drawdowns unlike Calmar
+        print(colorize_output(results['serenity_ratio'], "Serenity Ratio:",
+                              good_threshold=20.0, bad_threshold=5.0,
+                              unicorn_multiplier=50.0))   # unicorn at >= 1000
+
+    if results.get('tail_ratio') is not None:
+        # P95 daily return / |P5 daily return|; > 1.0 = fat right tail, > 3.0 is unicorn
+        print(colorize_output(results['tail_ratio'], "Tail Ratio (P95/|P5|):",
+                              good_threshold=1.5, bad_threshold=0.9,
+                              unicorn_multiplier=2.0))    # unicorn at >= 3.0
 
 
 
@@ -4658,9 +5762,9 @@ def print_period_performance(results, start_date=None, end_date=None):
         
         for month in months:
             perf = results['monthly_performance'][month]
-        
-            
-            print(colorize_output(perf, f"{month}:", 
+            month_label = datetime.strptime(month, '%Y-%m').strftime('%Y %B')
+
+            print(colorize_output(perf, f"{month_label}:",
                                 good_threshold=1.8,      # 1.8%+ is good (20%+ annualized)
                                 bad_threshold=0.6,       # <0.6% is poor (7% annualized)
                                 lower_is_better=False))
@@ -4677,9 +5781,9 @@ def print_period_performance(results, start_date=None, end_date=None):
                 strategy_perf = results['monthly_performance'][month]
                 market_perf = market_results['monthly_performance'][month]
                 relative_perf = strategy_perf - market_perf
-                
-                
-                print(colorize_output(relative_perf, f"{month}:", 
+                month_label = datetime.strptime(month, '%Y-%m').strftime('%Y %B')
+
+                print(colorize_output(relative_perf, f"{month_label}:",
                                     good_threshold=1.0,      # 1%+ monthly alpha is good
                                     bad_threshold=0.0,       # Negative alpha is poor
                                     lower_is_better=False))
@@ -4777,6 +5881,8 @@ def arg_parser():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Stock Sniper Trading Strategy")
     parser.add_argument("--sample", type=float, default=100, help="Percentage of random files to backtest (0-100)")
+    parser.add_argument("--runpercent", type=float, default=None, help="Alias for --sample: percent of the universe to backtest, e.g. --runpercent 95. If set, overrides --sample.")
+    parser.add_argument("--data_dir", default="Data/RFpredictions", help="Directory of per-ticker prediction parquets to backtest (read-only override; default = live signals). Use to validate a candidate model without clobbering live Data/RFpredictions.")
     parser.add_argument("--filter", type=float, default=0.01,help="Minimum UpProbability variance for stock filtering")
     parser.add_argument("--up_prob", type=float, default=0.68,help="UpProbability threshold for buy signals")
     parser.add_argument("--force", action='store_true', help="Force the script to run even if data is not up to last trading date")
@@ -4797,7 +5903,11 @@ def arg_parser():
     parser.add_argument("--trailing_stop_atr", type=float, help="Trailing stop ATR multiple")
     parser.add_argument("--take_profit", type=float, help="Take profit percentage")
     parser.add_argument("--position_timeout", type=int, help="Maximum days to hold a position")
-    return parser.parse_args()
+    args = parser.parse_args()
+    # --runpercent is an alias for --sample (percent of the universe to backtest).
+    if getattr(args, 'runpercent', None) is not None:
+        args.sample = args.runpercent
+    return args
 
 
 

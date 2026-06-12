@@ -1,0 +1,63 @@
+================================================================================
+  INTRADAY FILL REALITY-CHECK  -  trade_history.parquet vs real 1-min fills
+================================================================================
+
+  [1] BACKTEST HEADLINE  (from the AccountValue equity curve - the number you pasted)
+      Total Return        :    232.08%   (final $33,208 on $10,000)
+      Annualized          :    247.17%
+      Sharpe / Sortino    :      4.52 / 8.19
+      Max Drawdown        :    -11.22%      Ann Vol: 29.06%
+
+  [2] LEDGER RECONCILIATION  (heads up - the ledger does NOT match the headline)
+      Account growth (AccountValue) : $   23,207.52
+      Realized P&L of logged trades : $   11,603.76  (sum of PnL - Commission)
+      Unexplained gap               : $   11,603.76
+      => The 232% headline comes from the portfolio equity curve, not the logged
+         per-trade prices, which only account for the realized figure above. So this
+         reality-check compares fills at the TRADE level (where the minute data bites).
+
+  [3] TRADE-LEVEL FILL COMPARISON  (shared covered universe)
+      Coverage: 1059/1112 trades priced (95.2%) across 469 symbols  | entry-time 10:00 ET
+
+      Metric                            Recorded  Real 10:00/clz   Real open/clz
+      --------------------------------------------------------------------------
+      Total Trades                          1059            1059            1059
+      Realized P&L ($)                   9859.28         7204.90         9425.69
+      Win Rate (after fees) %              49.86           51.56           52.03
+      Win Rate (before fees)%              50.24           51.65           52.31
+      Profit Factor                         1.43            1.19            1.24
+      Avg Win ($)                          62.47           81.47           88.20
+      Avg Loss ($)                        -43.55          -72.66          -77.12
+      Avg Win (%)                           3.83            5.08            5.50
+      Avg Loss (%)                         -2.28           -3.95           -4.19
+      EV per Trade ($)                      9.31            6.80            8.90
+      Total Commission ($)                940.52          936.77          938.44
+      --- single $10,000-stream compounding (NOT the portfolio engine) ---
+      Compounded Return %                  98.59           72.05           94.26
+      Sharpe (realized) *                   3.78            2.29            2.83
+      Max Drawdown %                       -7.60          -19.99          -16.30
+
+  [4] REAL-FILL SLIPPAGE vs recorded prices  (mean / median %)
+      Entry @ 10:00 vs recorded : +1.288% / +0.360%
+      Entry @ open  vs recorded : +1.186% / +0.276%
+      Exit  @ close vs recorded : +1.044% / +0.026%
+
+  * Realized Sharpe books P&L on the exit date (no daily mark-to-market), so it is a
+    consistent cross-column comparison only; it is NOT the AccountValue Sharpe in [1].
+
+  --- Monthly Realized Return % (single-stream) ---
+      Month             Recorded  Real 10:00/clz   Real open/clz
+      2025-07              15.16           15.05           14.37
+      2025-08              28.49           43.93           47.31
+      2025-09               7.61            8.50           11.22
+      2025-10               7.15            0.86            3.83
+      2025-11               0.34           -6.47           -0.92
+      2025-12               1.09           -7.37           -5.08
+      2026-01               0.65            5.62            4.14
+      2026-02              10.00            6.13            6.81
+      2026-03              -2.46           -5.89           -4.66
+      2026-04               4.93           -7.80           -6.32
+      2026-05               0.81            7.32            0.70
+
+  Symbols with NO usable intraday data (46): ACLX, APP, BELFB, BHC, BMA, BZ, CLS, CNC, CRGY, CRTO, CSTM, DOW, EQX, FIGS, FOLD, GFI, GO, HMY, IAG, INSP, KALV, LYFT, MAMA, MEG, NEO, NET, NOW, OMER, ONON, PCVX, PENG, RIVN, ROOT, SATS, SKE, SKYT, STM, TAL, TVTX, UA ...
+================================================================================

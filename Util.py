@@ -20,7 +20,7 @@ from pathlib import Path
 import threading
 import atexit
 from zoneinfo import ZoneInfo
-from backtrader_ib_insync import IBStore
+#from backtrader_ib_insync import IBStore
 import ib_insync as ibi
 import platform
 import subprocess
@@ -38,10 +38,34 @@ if hasattr(pd, 'errors') and hasattr(pd.errors, 'PerformanceWarning'):
 
 nyse = ec.get_calendar('XNYS')
 
+try:
+    from backtrader_ib_insync import IBStore
+except ImportError:
+    IBStore = None
+
+
 # File paths for consolidated data files
-SIGNALS_FILE = 'Data/0__Signals.parquet'
-COMPLETED_TRADES_FILE = 'Data/0__CompletedTrades.parquet'
+SIGNALS_FILE = 'Data/0__signals.parquet'  # canonical signals file (recent-day candidate pool)
+COMPLETED_TRADES_FILE = 'Data/TradeHistory.parquet'
 BACKTEST_METRICS_FILE = 'Data/0__BacktestMetrics.parquet'
+
+# Mechanical signal pre-filter (FilterRubric Step-1 non-web hard exclusions:
+# price, market cap, weekly volatility, RSI death-zone). Impl lives in
+# signal_filter.py; re-exported here so the rest of the pipeline has one home.
+# Adds audit columns to the signals file (MechRSI14, MechWeeklyVolPct,
+# MechExclude, MechReasons); does NOT drop rows.
+try:
+    from signal_filter import (
+        annotate_signals_mechanical_filter,
+        prefilter_signals_file,
+        compute_rsi14,
+        compute_weekly_vol_pct,
+    )
+except Exception:  # keep Util.py importable even if signal_filter is missing
+    annotate_signals_mechanical_filter = None
+    prefilter_signals_file = None
+    compute_rsi14 = None
+    compute_weekly_vol_pct = None
 
 # Schemas for data files
 SIGNALS_SCHEMA = {
@@ -94,7 +118,7 @@ STRATEGY_PARAMS = {
     'up_prob_min_trigger': 0.70,        # Minimum probability to trigger buy
     
     # Position management parameters 
-    'max_positions': 4,                 # Maximum concurrent positions
+    'max_positions': 10,                # Maximum concurrent positions (4->8->10 2026-06-08; joint seed x config x book grid: k10 most robust marginally). NOTE: 9_SuperFastBroker sizes from its OWN hardcoded PositionSizer(max_positions=...) ~line 73 — kept in sync at 10.
     'reserve_percent': 0.10,            # Cash reserve percentage
     'max_group_allocation': 0.45,       # Maximum allocation to a group
     
@@ -823,7 +847,7 @@ def write_signals(df):
         
         # Write to file
         df.to_parquet(SIGNALS_FILE, index=False)
-        logger.info(f"Successfully wrote {len(df)} signals to {SIGNALS_FILE}")
+        #logger.info(f"Successfully wrote {len(df)} signals to {SIGNALS_FILE}")
         
     except Exception as e:
         logger.error(f"Error writing signals: {str(e)}")
@@ -1161,7 +1185,7 @@ def write_completed_trades(df):
         
         # Write to file
         df.to_parquet(COMPLETED_TRADES_FILE, index=False)
-        logger.info(f"Successfully wrote {len(df)} completed trades to {COMPLETED_TRADES_FILE}")
+        #logger.info(f"Successfully wrote {len(df)} completed trades to {COMPLETED_TRADES_FILE}")
         
     except Exception as e:
         logger.error(f"Error writing completed trades: {str(e)}")
@@ -1182,7 +1206,9 @@ def add_completed_trade(trade_data):
         
         # Write updated DataFrame
         write_completed_trades(df)
-        logger.info(f"Added completed trade for {trade_data.get('Symbol', 'Unknown')}")
+        verbose = False
+        if verbose:
+            logger.info(f"Added completed trade for {trade_data.get('Symbol', 'Unknown')}")
         
         return True
         
@@ -1263,7 +1289,7 @@ def write_backtest_metrics(df):
         
         # Write to file
         df.to_parquet(BACKTEST_METRICS_FILE, index=False)
-        logger.info(f"Successfully wrote backtest metrics to {BACKTEST_METRICS_FILE}")
+        #logger.info(f"Successfully wrote backtest metrics to {BACKTEST_METRICS_FILE}")
         
     except Exception as e:
         logger.error(f"Error writing backtest metrics: {str(e)}")
@@ -2649,7 +2675,9 @@ def read_trading_data(is_live=False):
     logger = get_logger()
     try:
         # Determine file path based on mode
-        file_path = 'Data/Production/LiveTradingData/pending_signals.parquet' if is_live else '_Buy_Signals.parquet'
+        # Non-live per-ticker state ledger RETIRED: routed to a retired file so it
+        # never overwrites _Buy_Signals.parquet (now the broker's narrowed book).
+        file_path = 'Data/Production/LiveTradingData/pending_signals.parquet' if is_live else 'Data/_retired_trading_ledger.parquet'
         
         if os.path.exists(file_path):
             df = pd.read_parquet(file_path)
@@ -2682,7 +2710,9 @@ def write_trading_data(df, is_live=False):
     logger = get_logger()
     try:
         # Determine file path based on mode
-        file_path = 'Data/Production/LiveTradingData/pending_signals.parquet' if is_live else '_Buy_Signals.parquet'
+        # Non-live per-ticker state ledger RETIRED: routed to a retired file so it
+        # never overwrites _Buy_Signals.parquet (now the broker's narrowed book).
+        file_path = 'Data/Production/LiveTradingData/pending_signals.parquet' if is_live else 'Data/_retired_trading_ledger.parquet'
         
         # Ensure required columns exist
         required_cols = ['Symbol', 'LastBuySignalDate', 'LastBuySignalPrice', 
@@ -2707,7 +2737,7 @@ def write_trading_data(df, is_live=False):
         
         # Write to file
         df.to_parquet(file_path, index=False)
-        logger.info(f"Successfully wrote {len(df)} trading data records to {file_path}")
+        #logger.info(f"Successfully wrote {len(df)} trading data records to {file_path}")
         
     except Exception as e:
         logger.error(f"Error writing trading data: {str(e)}")

@@ -1,0 +1,6 @@
+# Rename this file to ".alpaca_keys" (no .example) and paste your free Alpaca keys.
+# Get them at https://alpaca.markets  ->  sign up (free) -> Home -> "Generate API Keys".
+# The FREE plan gives IEX historical minute bars back to 2016 — exactly what we want.
+# This file is gitignored; it will never be committed.
+ALPACA_API_KEY_ID=PKxxxxxxxxxxxxxxxxxx
+ALPACA_API_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

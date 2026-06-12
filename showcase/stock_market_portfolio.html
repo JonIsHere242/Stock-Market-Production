@@ -1,0 +1,1665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Autonomous Trading System | Jonathan Bellmont</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  --bg:      #07090d;
+  --bg2:     #0c1018;
+  --bg3:     #111820;
+  --amber:   #d4890a;
+  --amber-hi:#f0a010;
+  --amber-lo: rgba(212,137,10,0.10);
+  --amber-border: rgba(212,137,10,0.22);
+  --amber-border-hi: rgba(212,137,10,0.50);
+  --cyan:    #00b8cc;
+  --cyan-lo: rgba(0,184,204,0.10);
+  --green:   #00a844;
+  --red:     #cc2828;
+  --text:    #c0b8b0;
+  --text-hi: #e4dcd4;
+  --muted:   #524e48;
+  --mono: 'JetBrains Mono', 'Courier New', monospace;
+  --unicorn: #6495ed;
+  --unicorn-lo: rgba(100,149,237,0.10);
+  --unicorn-border: rgba(100,149,237,0.30);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: 'Inter', sans-serif;
+  background-color: var(--bg);
+  background-image: radial-gradient(rgba(212,137,10,0.09) 1px, transparent 1px);
+  background-size: 28px 28px;
+  color: var(--text);
+  line-height: 1.68;
+  font-size: 14px;
+}
+
+body::before {
+  content: '';
+  position: fixed; inset: 0;
+  background: repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(0,0,0,0.06) 3px, rgba(0,0,0,0.06) 4px);
+  pointer-events: none;
+  z-index: 999;
+}
+
+@media print {
+  @page { size: 1280px 18000px; margin: 0; }
+  html, body { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  body::before { display: none; }
+  .section, .panel, .pipe-card, .pipe-grid, .algo-card, .book-card, .grid, .module-grid {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+  .hero { page-break-after: avoid; }
+}
+
+.container { max-width: 980px; margin: 0 auto; padding: 0 36px; }
+
+.term-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--amber);
+  margin-bottom: 10px;
+}
+
+/* HERO */
+.hero {
+  padding: 72px 0 60px;
+  border-bottom: 1px solid var(--amber-border);
+  position: relative;
+  overflow: hidden;
+}
+.hero::after {
+  content: '';
+  position: absolute;
+  right: -80px; top: -80px;
+  width: 520px; height: 520px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(212,137,10,0.07) 0%, transparent 70%);
+  pointer-events: none;
+}
+.hero h1 {
+  font-family: var(--mono);
+  font-size: 48px;
+  font-weight: 600;
+  line-height: 1.08;
+  color: var(--amber-hi);
+  letter-spacing: -0.02em;
+  margin-bottom: 14px;
+  text-shadow: 0 0 40px rgba(212,137,10,0.25);
+}
+.h1-sub {
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 300;
+  color: var(--text);
+  letter-spacing: 0.01em;
+  display: block;
+}
+.hero-desc {
+  font-size: 15px;
+  color: var(--text);
+  max-width: 660px;
+  margin-bottom: 40px;
+  line-height: 1.72;
+}
+.hero-meta {
+  display: flex; gap: 36px; flex-wrap: wrap;
+  border-top: 1px solid var(--amber-border);
+  padding-top: 28px;
+  margin-bottom: 28px;
+}
+.meta-val {
+  font-family: var(--mono);
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--amber-hi);
+  display: block;
+  line-height: 1.2;
+}
+.meta-label {
+  font-size: 10px;
+  font-family: var(--mono);
+  color: var(--muted);
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+}
+.hero-links { display: flex; gap: 16px; flex-wrap: wrap; }
+.link-btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-decoration: none;
+  padding: 8px 20px;
+  border: 1px solid var(--amber-border-hi);
+  color: var(--amber-hi);
+  background: var(--amber-lo);
+  transition: background 0.15s, border-color 0.15s;
+}
+.link-btn:hover { background: rgba(212,137,10,0.18); border-color: var(--amber-hi); }
+.link-btn.secondary { border-color: var(--amber-border); color: var(--muted); background: transparent; }
+.link-btn.secondary:hover { color: var(--text); border-color: var(--amber-border-hi); }
+.link-wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.click-hint { font-family: var(--mono); font-size: 9px; color: var(--muted); letter-spacing: 0.06em; padding-left: 2px; }
+
+/* SECTION */
+.section { padding: 56px 0; border-bottom: 1px solid var(--amber-border); }
+.section:last-child { border-bottom: none; }
+.section-head { margin-bottom: 32px; }
+.section-title { font-size: 24px; font-weight: 600; color: var(--text-hi); line-height: 1.25; margin-bottom: 12px; }
+.section-body { color: var(--text); max-width: 720px; font-size: 14px; line-height: 1.72; }
+
+/* GRID */
+.grid { display: grid; gap: 14px; }
+.grid-2 { grid-template-columns: 1fr 1fr; }
+.grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+
+/* PANEL */
+.panel {
+  background: var(--amber-lo);
+  border: 1px solid var(--amber-border);
+  padding: 0;
+  position: relative;
+}
+.panel-titlebar {
+  background: rgba(212,137,10,0.12);
+  border-bottom: 1px solid var(--amber-border);
+  padding: 6px 16px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.10em;
+  color: var(--amber);
+  text-transform: uppercase;
+  display: flex; align-items: center; gap: 8px;
+}
+.panel-titlebar::before {
+  content: '';
+  width: 6px; height: 6px;
+  border: 1px solid var(--amber);
+  display: inline-block;
+  flex-shrink: 0;
+}
+.panel-body { padding: 20px 22px; }
+.panel h3 { font-size: 13px; font-weight: 600; color: var(--text-hi); margin-bottom: 7px; }
+.panel p { font-size: 13px; color: var(--text); line-height: 1.65; }
+
+.panel.cyan-panel { border-color: rgba(0,184,204,0.22); background: var(--cyan-lo); }
+.panel.cyan-panel .panel-titlebar { background: rgba(0,184,204,0.10); border-bottom-color: rgba(0,184,204,0.22); color: var(--cyan); }
+.panel.cyan-panel .panel-titlebar::before { border-color: var(--cyan); }
+
+.panel.unicorn-panel { border-color: var(--unicorn-border); background: var(--unicorn-lo); }
+.panel.unicorn-panel .panel-titlebar { background: rgba(100,149,237,0.10); border-bottom-color: var(--unicorn-border); color: var(--unicorn); }
+.panel.unicorn-panel .panel-titlebar::before { border-color: var(--unicorn); }
+
+/* TAGS */
+.tag {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border: 1px solid;
+}
+.tag-amber { color: var(--amber-hi); border-color: rgba(212,137,10,0.40); background: var(--amber-lo); }
+.tag-cyan  { color: var(--cyan);     border-color: rgba(0,184,204,0.30);  background: var(--cyan-lo); }
+.tag-green { color: #86c882;         border-color: rgba(0,168,68,0.30);   background: rgba(0,168,68,0.08); }
+.tag-red   { color: #e87878;         border-color: rgba(204,40,40,0.35);  background: rgba(204,40,40,0.08); }
+.tag-dim   { color: var(--muted);    border-color: rgba(82,78,72,0.4);    background: transparent; }
+.tag-unicorn { color: var(--unicorn); border-color: var(--unicorn-border); background: var(--unicorn-lo); }
+
+/* INLINE CODE */
+.ic {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: rgba(212,137,10,0.10);
+  border: 1px solid var(--amber-border);
+  padding: 1px 6px;
+  color: var(--amber-hi);
+}
+
+/* CODE BOX */
+.code-box {
+  background: #030508;
+  border: 1px solid rgba(212,137,10,0.15);
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.85;
+  overflow-x: auto;
+}
+.code-box-bar {
+  background: rgba(212,137,10,0.08);
+  border-bottom: 1px solid rgba(212,137,10,0.15);
+  padding: 5px 16px;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--amber);
+  font-family: var(--mono);
+}
+.code-box pre { padding: 18px 22px; overflow-x: auto; }
+.kw  { color: #d4a0e8; }
+.fn  { color: #7ab4f0; }
+.str { color: #98cc6e; }
+.cm  { color: #5e8a96; font-style: italic; }
+.num { color: #e8925a; }
+.cls { color: var(--amber-hi); }
+
+/* FORMULA BOX */
+.formula-box {
+  background: #040608;
+  border: 1px solid rgba(0,184,204,0.25);
+  padding: 22px 28px;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 2;
+  color: var(--cyan);
+}
+.formula-header { font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; font-family: var(--mono); }
+.formula-main { font-size: 14px; color: #7dd8e8; font-weight: 500; }
+
+/* PIPELINE CARDS — interactive */
+.pipe-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 8px;
+}
+.pipe-card {
+  background: var(--amber-lo);
+  border: 1px solid var(--amber-border);
+  border-left: 3px solid var(--amber);
+  padding: 16px 20px;
+  text-decoration: none;
+  display: block;
+  transition: background 0.15s, border-color 0.15s, border-left-color 0.15s;
+  cursor: pointer;
+  position: relative;
+}
+.pipe-card:hover {
+  background: rgba(212,137,10,0.16);
+  border-color: rgba(212,137,10,0.50);
+  border-left-color: var(--amber-hi);
+}
+.pipe-card:hover .pipe-arrow { opacity: 1; }
+.pipe-arrow {
+  position: absolute;
+  top: 14px; right: 16px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--amber);
+  opacity: 0.4;
+  transition: opacity 0.15s;
+  letter-spacing: 0.05em;
+}
+.pipe-card-num {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--amber);
+  letter-spacing: 0.12em;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+}
+.pipe-card h4 {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--amber-hi);
+  margin-bottom: 5px;
+  letter-spacing: 0.04em;
+}
+.pipe-card p { font-size: 12px; color: var(--text); line-height: 1.58; }
+.pipe-card-file {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--muted);
+  margin-top: 8px;
+  letter-spacing: 0.05em;
+}
+
+/* LINEAR PIPELINE */
+.pipeline { display: flex; flex-direction: column; gap: 0; }
+.pipe-row {
+  display: flex; align-items: stretch;
+  border-left: 2px solid var(--amber-border);
+  margin-left: 18px;
+  position: relative;
+}
+.pipe-row:last-child { border-left-color: transparent; }
+.pipe-num {
+  position: absolute;
+  left: -13px; top: 18px;
+  width: 24px; height: 24px;
+  background: var(--amber);
+  color: var(--bg);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.pipe-content { margin-left: 28px; padding: 16px 0 26px; flex: 1; }
+.pipe-content h4 { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--amber-hi); margin-bottom: 4px; letter-spacing: 0.05em; text-transform: uppercase; }
+.pipe-content p { font-size: 13px; color: var(--text); }
+
+/* METRIC TABLE */
+.metric-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.metric-table th {
+  background: rgba(212,137,10,0.10);
+  padding: 8px 16px;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  color: var(--amber);
+  text-align: left;
+  border-bottom: 1px solid var(--amber-border-hi);
+}
+.metric-table td { padding: 8px 16px; border-bottom: 1px solid rgba(212,137,10,0.06); color: var(--text); vertical-align: top; }
+.metric-table tr:last-child td { border-bottom: none; }
+.metric-table .col-val { font-family: var(--mono); color: var(--amber-hi); font-weight: 500; }
+
+/* SQN SCALE */
+.sqn-scale { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.sqn-row { display: flex; align-items: center; gap: 14px; }
+.sqn-dot {
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.sqn-label { font-family: var(--mono); font-size: 11px; font-weight: 600; min-width: 120px; }
+.sqn-range { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+
+/* COMPARISON TABLE */
+.cmp-table { width: 100%; border-collapse: collapse; border: 1px solid var(--amber-border); font-size: 13px; }
+.cmp-table th { background: rgba(212,137,10,0.10); padding: 10px 18px; font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: 0.10em; text-transform: uppercase; color: var(--amber); text-align: left; border-bottom: 1px solid var(--amber-border-hi); }
+.cmp-table td { padding: 10px 18px; border-bottom: 1px solid rgba(212,137,10,0.07); color: var(--text); vertical-align: top; }
+.cmp-table tr:last-child td { border-bottom: none; }
+.ok  { color: var(--green); font-weight: 600; margin-right: 6px; }
+.no  { color: var(--red);   font-weight: 600; margin-right: 6px; }
+
+/* DIVIDER */
+.divider { border: none; border-top: 1px solid var(--amber-border); margin: 28px 0; }
+
+/* ALGO CARD */
+.algo-card {
+  background: var(--amber-lo);
+  border: 1px solid var(--amber-border);
+  border-left: 3px solid var(--amber);
+  padding: 20px 24px;
+  margin-bottom: 12px;
+}
+.algo-card h4 { font-size: 14px; font-weight: 600; color: var(--text-hi); margin-bottom: 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.algo-card p { font-size: 13px; color: var(--text); line-height: 1.68; }
+
+/* BOOK CARD */
+.book-card {
+  background: var(--amber-lo);
+  border: 1px solid var(--amber-border);
+  padding: 16px 20px;
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+.book-num {
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--amber);
+  opacity: 0.4;
+  flex-shrink: 0;
+  line-height: 1;
+  margin-top: 2px;
+}
+.book-title { font-size: 13px; font-weight: 600; color: var(--text-hi); margin-bottom: 3px; }
+.book-author { font-family: var(--mono); font-size: 10px; color: var(--amber); letter-spacing: 0.05em; margin-bottom: 6px; }
+.book-desc { font-size: 12px; color: var(--text); line-height: 1.60; }
+
+/* STACK PILLS */
+.stack-pill {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 3px 10px;
+  border: 1px solid var(--amber-border);
+  color: var(--amber);
+  margin: 2px;
+}
+
+/* FOOTER */
+.footer { padding: 36px 0; border-top: 1px solid var(--amber-border); }
+.footer-inner { display: flex; flex-direction: column; gap: 20px; }
+.footer-name { font-family: var(--mono); font-size: 16px; font-weight: 600; color: var(--amber-hi); margin-bottom: 6px; }
+.footer-contact { font-family: var(--mono); font-size: 11px; color: var(--text); letter-spacing: 0.05em; margin-bottom: 3px; }
+.footer-contact a { color: var(--amber-hi); text-decoration: none; }
+.footer-detail { font-family: var(--mono); font-size: 10px; color: var(--muted); letter-spacing: 0.08em; }
+.footer-stack-label { font-family: var(--mono); font-size: 9px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 6px; }
+
+@media (max-width: 720px) {
+  .grid-2, .grid-3, .pipe-grid { grid-template-columns: 1fr; }
+  .hero h1 { font-size: 32px; }
+}
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════ HERO -->
+<div class="hero">
+<div class="container">
+  <h1>Stock-Market<br><span class="h1-sub">End-to-End Autonomous Trading System</span></h1>
+
+  <p class="hero-desc">
+    A fully autonomous quantitative trading system running on a personal computer against Interactive Brokers.
+    The pipeline covers SEC data ingestion, high-speed IBKR price collection, alpha factor engineering,
+    XGBoost prediction, multi-metric backtesting, LLM-assisted macro filtering, and live bracket-order
+    execution. A single PowerShell scheduler fires twice daily. No human intervention required.
+  </p>
+
+  <div class="hero-meta">
+    <div class="meta-item">
+      <span class="meta-val">~4,200</span>
+      <span class="meta-label">Equities Tracked</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-val">9</span>
+      <span class="meta-label">Pipeline Stages</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-val">20+</span>
+      <span class="meta-label">Risk &amp; Perf Metrics</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-val">Live</span>
+      <span class="meta-label">IBKR Production</span>
+    </div>
+  </div>
+
+  <div class="hero-links">
+    <div class="link-wrap">
+      <a class="link-btn" href="https://github.com/JonIsHere242/Stock-Market-Production" target="_blank">View Source on GitHub</a>
+      <span class="click-hint">(click to open repo)</span>
+    </div>
+    <div class="link-wrap">
+      <a class="link-btn secondary" href="https://github.com/JonIsHere242" target="_blank">github.com/JonIsHere242</a>
+      <span class="click-hint">(click me)</span>
+    </div>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ 01. OVERVIEW -->
+<div class="section">
+<div class="container">
+  <div class="section-head">
+    <div class="term-label">// 01. Overview</div>
+    <div class="section-title">What This System Does and Why</div>
+    <p class="section-body">
+      Most retail quantitative systems stop at backtesting. This one didn't. Every component from
+      data ingestion to live order submission is written, owned, and running in production. Each stage
+      does one thing and passes its output forward. Complexity is at the system level, not buried inside
+      any individual module. That makes each piece independently testable and replaceable, which matters
+      a lot when something breaks at 9:45am on a trading day.(or IBKR resets my password 5 minutes before market open)
+    </p>
+  </div>
+
+  <div class="grid grid-2">
+    <div class="panel">
+      <div class="panel-titlebar">What makes this non-trivial</div>
+      <div class="panel-body">
+        <p>
+          The system filters ~10,000 SEC-registered securities down to ~4,200 investable equities,
+          pulls daily price history for all of them via a custom IBKR async connection pool,
+          engineers 50+ alpha features per ticker across all CPU cores, predicts next-day direction
+          with a calibrated XGBoost classifier, validates every strategy idea through a backtester
+          tracking 20+ risk metrics, runs a news scan via Claude in research mode, and submits
+          four-legged bracket orders with automated downside protection. All of this finishes before
+          market open each morning.
+        </p>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-titlebar">Why long-only equities, no ETFs, no REITs, no banks</div>
+      <div class="panel-body">
+        <p>
+          The prediction target is next-day directional move for individual operating companies.
+          ETFs introduce index replication noise. REITs are driven by cap rates and distribution
+          schedules. Banks have opaque balance sheets where standard momentum and mean-reversion
+          signals behave erratically. SPACs, leveraged products, and shell companies are rejected
+          at the ticker universe stage before any price data is even pulled. The filter keeps the
+          training set in a regime where the features are actually informative. Somewhat ironic
+          given the context of this document, but that's what the data said.
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ 02. PIPELINE MAP -->
+<div class="section">
+<div class="container">
+  <div class="section-head">
+    <div class="term-label">// 02. Pipeline</div>
+    <div class="section-title">Nine-Stage Execution Pipeline</div>
+    <p class="section-body">
+      Orchestrated by <span class="ic">trading_system.ps1</span>, which fires at 17:00 for the evening data run
+      and again at 07:00 for the morning broker run. Each card below links directly to that file in the
+      GitHub repository.
+    </p>
+  </div>
+
+  <!-- PIPELINE FLOW DIAGRAM -->
+  <div style="margin:0 0 12px;overflow-x:auto;">
+    <svg viewBox="0 0 820 740" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:820px;display:block;margin:0 auto;">
+      <defs>
+        <marker id="pm-arr" markerWidth="8" markerHeight="7" refX="7" refY="3.5" orient="auto">
+          <polygon points="0,0 8,3.5 0,7" fill="#d4890a"/>
+        </marker>
+        <marker id="pm-arr-c" markerWidth="8" markerHeight="7" refX="7" refY="3.5" orient="auto">
+          <polygon points="0,0 8,3.5 0,7" fill="#00b8cc"/>
+        </marker>
+        <marker id="pm-arr-m" markerWidth="8" markerHeight="7" refX="7" refY="3.5" orient="auto">
+          <polygon points="0,0 8,3.5 0,7" fill="#524e48"/>
+        </marker>
+      </defs>
+      <style>
+        .pm-stage { cursor:pointer; }
+        .pm-stage rect { fill:#111820; stroke:rgba(212,137,10,0.22); stroke-width:1; transition:stroke 0.15s; }
+        .pm-stage:hover rect { stroke:rgba(212,137,10,0.60); }
+        .pm-stagec { cursor:pointer; }
+        .pm-stagec rect { fill:#111820; stroke:rgba(0,184,204,0.22); stroke-width:1; transition:stroke 0.15s; }
+        .pm-stagec:hover rect { stroke:rgba(0,184,204,0.60); }
+        svg text { font-family:'JetBrains Mono',monospace; }
+      </style>
+
+      <!-- Phase 1 background -->
+      <rect x="8" y="8" width="604" height="422" rx="7" fill="rgba(212,137,10,0.04)" stroke="rgba(212,137,10,0.18)" stroke-width="1"/>
+      <text x="24" y="28" font-size="9" font-weight="600" fill="#d4890a" letter-spacing="2">17:00 ET — EVENING DATA PIPELINE</text>
+
+      <!-- Stage 01 -->
+      <a class="pm-stage" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/1__TickerDownloader.py" target="_blank">
+        <rect x="16" y="38" width="590" height="56" rx="5"/>
+        <text x="38" y="71" font-size="13" font-weight="700" fill="#d4890a">01</text>
+        <line x1="60" y1="46" x2="60" y2="86" stroke="#d4890a" stroke-opacity="0.18" stroke-width="1"/>
+        <text x="72" y="62" font-size="11" font-weight="600" fill="#e4dcd4">Ticker Universe Filter</text>
+        <text x="72" y="80" font-size="9" fill="#524e48">1__TickerDownloader.py</text>
+        <text x="598" y="62" font-size="9" fill="#d4890a" text-anchor="end">SEC API &rarr; ~4,200 clean equities</text>
+        <text x="598" y="80" font-size="9" fill="#524e48" text-anchor="end">&rarr; tickers.parquet</text>
+      </a>
+
+      <line x1="311" y1="97" x2="311" y2="115" stroke="#d4890a" stroke-opacity="0.5" stroke-width="1.5" marker-end="url(#pm-arr)"/>
+
+      <!-- Stage 02 -->
+      <a class="pm-stage" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/2__PriceDownloader.py" target="_blank">
+        <rect x="16" y="118" width="590" height="56" rx="5"/>
+        <text x="38" y="151" font-size="13" font-weight="700" fill="#d4890a">02</text>
+        <line x1="60" y1="126" x2="60" y2="166" stroke="#d4890a" stroke-opacity="0.18" stroke-width="1"/>
+        <text x="72" y="142" font-size="11" font-weight="600" fill="#e4dcd4">Price History Ingestion</text>
+        <text x="72" y="160" font-size="9" fill="#524e48">2__BulkPriceDownloader.py</text>
+        <text x="598" y="142" font-size="9" fill="#d4890a" text-anchor="end">IBKR async pool &middot; 32 workers</text>
+        <text x="598" y="160" font-size="9" fill="#524e48" text-anchor="end">&rarr; Data/StockData/*.parquet</text>
+      </a>
+
+      <line x1="311" y1="177" x2="311" y2="195" stroke="#d4890a" stroke-opacity="0.5" stroke-width="1.5" marker-end="url(#pm-arr)"/>
+
+      <!-- Stage 03 -->
+      <a class="pm-stage" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/3__AlphaSensitivity.py" target="_blank">
+        <rect x="16" y="198" width="590" height="56" rx="5"/>
+        <text x="38" y="231" font-size="13" font-weight="700" fill="#d4890a">03</text>
+        <line x1="60" y1="206" x2="60" y2="246" stroke="#d4890a" stroke-opacity="0.18" stroke-width="1"/>
+        <text x="72" y="222" font-size="11" font-weight="600" fill="#e4dcd4">Alpha Feature Matrix</text>
+        <text x="72" y="240" font-size="9" fill="#524e48">3__AlphaSensitivity.py</text>
+        <text x="598" y="222" font-size="9" fill="#d4890a" text-anchor="end">50+ factors &middot; all CPU cores</text>
+        <text x="598" y="240" font-size="9" fill="#524e48" text-anchor="end">&rarr; AlphaData.parquet</text>
+      </a>
+
+      <line x1="311" y1="257" x2="311" y2="275" stroke="#d4890a" stroke-opacity="0.5" stroke-width="1.5" marker-end="url(#pm-arr)"/>
+
+      <!-- Stage 04 -->
+      <a class="pm-stage" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/4__Predictor.py" target="_blank">
+        <rect x="16" y="278" width="590" height="56" rx="5"/>
+        <text x="38" y="311" font-size="13" font-weight="700" fill="#d4890a">04</text>
+        <line x1="60" y1="286" x2="60" y2="326" stroke="#d4890a" stroke-opacity="0.18" stroke-width="1"/>
+        <text x="72" y="302" font-size="11" font-weight="600" fill="#e4dcd4">XGBoost Directional Predictor</text>
+        <text x="72" y="320" font-size="9" fill="#524e48">4__Predictor.py</text>
+        <text x="598" y="302" font-size="9" fill="#d4890a" text-anchor="end">--predict daily &middot; --tune periodically</text>
+        <text x="598" y="320" font-size="9" fill="#524e48" text-anchor="end">&rarr; RFpredictions/*.parquet</text>
+      </a>
+
+      <line x1="311" y1="337" x2="311" y2="355" stroke="#d4890a" stroke-opacity="0.5" stroke-width="1.5" marker-end="url(#pm-arr)"/>
+
+      <!-- Stage 05 -->
+      <a class="pm-stage" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/5__NightlyBackTester.py" target="_blank">
+        <rect x="16" y="358" width="590" height="56" rx="5"/>
+        <text x="38" y="391" font-size="13" font-weight="700" fill="#d4890a">05</text>
+        <line x1="60" y1="366" x2="60" y2="406" stroke="#d4890a" stroke-opacity="0.18" stroke-width="1"/>
+        <text x="72" y="382" font-size="11" font-weight="600" fill="#e4dcd4">Backtester + Signal Queue</text>
+        <text x="72" y="400" font-size="9" fill="#524e48">5__NightlyBackTester.py</text>
+        <text x="598" y="382" font-size="9" fill="#d4890a" text-anchor="end">20+ risk metrics &middot; SQN quality scale</text>
+        <text x="598" y="400" font-size="9" fill="#524e48" text-anchor="end">&rarr; 0__Signals.parquet</text>
+      </a>
+
+      <!-- Overnight divider transition -->
+      <line x1="311" y1="417" x2="311" y2="441" stroke="#d4890a" stroke-opacity="0.4" stroke-width="1.5"/>
+      <line x1="12" y1="450" x2="608" y2="450" stroke="#524e48" stroke-opacity="0.4" stroke-dasharray="6,4" stroke-width="1"/>
+      <rect x="162" y="441" width="300" height="16" rx="2" fill="#07090d"/>
+      <text x="312" y="453" font-size="9" fill="#524e48" text-anchor="middle" letter-spacing="1">SIGNALS SAVED  &middot;  OVERNIGHT WAIT  &middot;  MARKET OPEN</text>
+      <line x1="311" y1="458" x2="311" y2="490" stroke="#d4890a" stroke-opacity="0.22" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <line x1="311" y1="490" x2="311" y2="501" stroke="#00b8cc" stroke-opacity="0.5" stroke-width="1.5" marker-end="url(#pm-arr-c)"/>
+
+      <!-- Phase 2 background -->
+      <rect x="8" y="476" width="604" height="256" rx="7" fill="rgba(0,184,204,0.04)" stroke="rgba(0,184,204,0.18)" stroke-width="1"/>
+      <text x="24" y="496" font-size="9" font-weight="600" fill="#00b8cc" letter-spacing="2">10:00 ET — MORNING EXECUTION</text>
+
+      <!-- Stage 06 -->
+      <a class="pm-stagec" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/7__MacroFilter.py" target="_blank">
+        <rect x="16" y="504" width="590" height="56" rx="5"/>
+        <text x="38" y="537" font-size="13" font-weight="700" fill="#00b8cc">06</text>
+        <line x1="60" y1="512" x2="60" y2="552" stroke="#00b8cc" stroke-opacity="0.18" stroke-width="1"/>
+        <text x="72" y="528" font-size="11" font-weight="600" fill="#e4dcd4">LLM Macro Filter</text>
+        <text x="72" y="546" font-size="9" fill="#524e48">7__MacroFilter.py</text>
+        <text x="598" y="528" font-size="9" fill="#00b8cc" text-anchor="end">Claude &middot; 14-day news &middot; 60-day M&amp;A scan</text>
+        <text x="598" y="546" font-size="9" fill="#524e48" text-anchor="end">&rarr; flags bankruptcy / crisis events</text>
+      </a>
+
+      <line x1="311" y1="563" x2="311" y2="581" stroke="#00b8cc" stroke-opacity="0.5" stroke-width="1.5" marker-end="url(#pm-arr-c)"/>
+
+      <!-- Stage 07 -->
+      <a class="pm-stagec" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/9_SuperFastBroker.py" target="_blank">
+        <rect x="16" y="584" width="590" height="56" rx="5"/>
+        <text x="38" y="617" font-size="13" font-weight="700" fill="#00b8cc">07</text>
+        <line x1="60" y1="592" x2="60" y2="632" stroke="#00b8cc" stroke-opacity="0.18" stroke-width="1"/>
+        <text x="72" y="608" font-size="11" font-weight="600" fill="#e4dcd4">SPY Direction Gate</text>
+        <text x="72" y="626" font-size="9" fill="#524e48">9_SuperFastBroker.py &middot; waits until 10:00 ET</text>
+        <text x="598" y="608" font-size="9" fill="#00b8cc" text-anchor="end">abort if SPY &lt; &minus;0.5% from open</text>
+        <text x="598" y="626" font-size="9" fill="#524e48" text-anchor="end">Sharpe &minus;6.50 on bad SPY days</text>
+      </a>
+
+      <line x1="311" y1="643" x2="311" y2="661" stroke="#00b8cc" stroke-opacity="0.5" stroke-width="1.5" marker-end="url(#pm-arr-c)"/>
+
+      <!-- Stage 08 -->
+      <a class="pm-stagec" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/9_SuperFastBroker.py" target="_blank">
+        <rect x="16" y="664" width="590" height="56" rx="5"/>
+        <text x="38" y="697" font-size="13" font-weight="700" fill="#00b8cc">08</text>
+        <line x1="60" y1="672" x2="60" y2="712" stroke="#00b8cc" stroke-opacity="0.18" stroke-width="1"/>
+        <text x="72" y="688" font-size="11" font-weight="600" fill="#e4dcd4">OCA Bracket Execution</text>
+        <text x="72" y="706" font-size="9" fill="#524e48">9_SuperFastBroker.py &middot; IBKR Adaptive Algo</text>
+        <text x="598" y="688" font-size="9" fill="#00b8cc" text-anchor="end">entry + take-profit + trail + hard stop</text>
+        <text x="598" y="706" font-size="9" fill="#524e48" text-anchor="end">&rarr; live position opened</text>
+      </a>
+
+      <!-- Side box 1: Runs independently -->
+      <rect x="628" y="38" width="184" height="110" rx="5" fill="#0c1018" stroke="#524e48" stroke-opacity="0.5" stroke-dasharray="4,3" stroke-width="1"/>
+      <text x="720" y="57" font-size="9" fill="#524e48" text-anchor="middle" letter-spacing="1">RUNS INDEPENDENTLY</text>
+      <line x1="638" y1="63" x2="802" y2="63" stroke="#524e48" stroke-opacity="0.3" stroke-width="1"/>
+      <text x="644" y="81" font-size="10" font-weight="600" fill="#c0b8b0">Asset Correlator</text>
+      <text x="644" y="97" font-size="9" fill="#524e48">0__AssetCorrolator.py</text>
+      <text x="644" y="115" font-size="9" fill="#7a7470">Cross-asset correlation</text>
+      <text x="644" y="131" font-size="9" fill="#7a7470">matrix &middot; refreshed weekly</text>
+      <line x1="608" y1="66" x2="625" y2="66" stroke="#524e48" stroke-opacity="0.5" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#pm-arr-m)"/>
+
+      <!-- Side box 2: Periodic retraining -->
+      <rect x="628" y="266" width="184" height="86" rx="5" fill="#0c1018" stroke="#d4890a" stroke-opacity="0.25" stroke-dasharray="4,3" stroke-width="1"/>
+      <text x="720" y="285" font-size="9" fill="#d4890a" text-anchor="middle" letter-spacing="1">PERIODIC RETRAINING</text>
+      <line x1="638" y1="291" x2="802" y2="291" stroke="#d4890a" stroke-opacity="0.2" stroke-width="1"/>
+      <text x="644" y="309" font-size="9" fill="#c0b8b0">--tune --runpercent 35</text>
+      <text x="644" y="325" font-size="9" fill="#524e48">Optuna hyperparameter</text>
+      <text x="644" y="341" font-size="9" fill="#524e48">search &middot; run manually</text>
+      <line x1="608" y1="306" x2="625" y2="306" stroke="#d4890a" stroke-opacity="0.35" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#pm-arr)"/>
+    </svg>
+  </div>
+  <p style="text-align:center;font-family:'JetBrains Mono',monospace;font-size:10px;color:#524e48;margin:0 0 36px;letter-spacing:0.08em;">click any stage to open that file on GitHub</p>
+
+  <div class="pipe-grid">
+    <a class="pipe-card" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/trading_system.ps1" target="_blank">
+      <span class="pipe-arrow">→ GitHub</span>
+      <div class="pipe-card-num">Stage 0</div>
+      <h4>Scheduler / Orchestrator</h4>
+      <p>PowerShell runner fires at 17:00 and 07:00. Executes the full pipeline sequentially with 20-second RAM flush pauses between stages. Timestamped logging to disk on every step.</p>
+      <div class="pipe-card-file">trading_system.ps1</div>
+    </a>
+
+    <a class="pipe-card" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/1__TickerDownloader.py" target="_blank">
+      <span class="pipe-arrow">→ GitHub</span>
+      <div class="pipe-card-num">Stage 1</div>
+      <h4>Ticker Universe Construction</h4>
+      <p>Pulls the live SEC company registry, applies 30+ keyword and regex filters, removes OTC and CBOE listings. Outputs ~4,200 clean equity tickers as a timestamped parquet.</p>
+      <div class="pipe-card-file">1__TickerDownloader.py</div>
+    </a>
+
+    <a class="pipe-card" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/2__PriceDownloader.py" target="_blank">
+      <span class="pipe-arrow">→ GitHub</span>
+      <div class="pipe-card-num">Stage 2</div>
+      <h4>High-Speed IBKR Price Ingestion</h4>
+      <p>Async connection pool (deque-backed, up to 32 workers) pulls incremental daily OHLCV bars from TWS at ~20 tickers/second. Retry logic, health tracking, and progress persistence across restarts.</p>
+      <div class="pipe-card-file">2__PriceDownloader.py</div>
+    </a>
+
+    <a class="pipe-card" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/3__AlphaSensitivity.py" target="_blank">
+      <span class="pipe-arrow">→ GitHub</span>
+      <div class="pipe-card-num">Stage 3</div>
+      <h4>Alpha Factor Engineering</h4>
+      <p>50+ features per ticker: rolling beta vs SPY/QQQ/IWM/DIA, VIX regime features, Kalman-filtered trend, FFT spectral decomposition, visibility graph metrics, entropy, skew, kurtosis, DVAMR probability. ProcessPoolExecutor saturates all CPU cores.</p>
+      <div class="pipe-card-file">3__AlphaSensitivity.py</div>
+    </a>
+
+    <a class="pipe-card" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/4__Predictor.py" target="_blank">
+      <span class="pipe-arrow">→ GitHub</span>
+      <div class="pipe-card-num">Stage 4</div>
+      <h4>XGBoost Directional Predictor</h4>
+      <p>Binary classifier (up vs not-up next day). Trained on temporal splits with 5-day embargo gaps. AUC-PR early stopping. Isotonic calibration converts raw scores to well-calibrated 0–1 probabilities. 24 parallel trees, 32 threads.</p>
+      <div class="pipe-card-file">4__Predictor.py</div>
+    </a>
+
+    <a class="pipe-card" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/5__NightlyBackTester.py" target="_blank">
+      <span class="pipe-arrow">→ GitHub</span>
+      <div class="pipe-card-num">Stage 5</div>
+      <h4>Research Backtesting Environment</h4>
+      <p>Backtrader-based simulator with exact IBKR commission model ($0.0035/share, $0.35 min). Computes 20+ metrics including Sharpe, Sortino, Calmar, Omega, Ulcer Index, VaR, CVaR, and a custom SQN quality scale. Each metric color-coded from red to green to Unicorn blue.</p>
+      <div class="pipe-card-file">5__NightlyBackTester.py</div>
+    </a>
+
+    <a class="pipe-card" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/7__MacroFilter.py" target="_blank">
+      <span class="pipe-arrow">→ GitHub</span>
+      <div class="pipe-card-num">Stage 6</div>
+      <h4>LLM Macro Filter</h4>
+      <p>Claude (Sonnet) in research mode searches recent news per signal ticker. Flags bankruptcy, active M&amp;A, geopolitical crisis, or catastrophic events that regex cannot reliably catch. Cached results with resume-on-failure support.</p>
+      <div class="pipe-card-file">7__MacroFilter.py</div>
+    </a>
+
+    <a class="pipe-card" href="https://github.com/JonIsHere242/Stock-Market-Production/blob/main/9_SuperFastBroker.py" target="_blank">
+      <span class="pipe-arrow">→ GitHub</span>
+      <div class="pipe-card-num">Stage 7</div>
+      <h4>Live Execution Engine</h4>
+      <p>Waits until 10:00 ET (EDA-derived: +256% Sharpe vs market open). Gates on SPY direction. Submits four-legged OCA bracket orders: entry, take-profit, trailing stop, hard stop. All exit legs share one OCA group so whichever fills first cancels the others automatically.</p>
+      <div class="pipe-card-file">9_SuperFastBroker.py</div>
+    </a>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ 03. TICKER UNIVERSE -->
+<div class="section">
+<div class="container">
+  <div class="section-head">
+    <div class="term-label">// 03. Stage 1: Ticker Universe</div>
+    <div class="section-title">Building a Clean Equity Universe from SEC Data</div>
+    <p class="section-body">
+      Every night the system pulls the SEC's <span class="ic">company_tickers_exchange.json</span> endpoint,
+      the same registry regulators use. Raw output contains 10,000+ entries: operating companies, SPACs,
+      ETFs, leveraged products, shell companies, funds, warrants. The filtering stage cuts that down to
+      ~4,200 investable equities using two passes: keyword rejection first, then regex patterns for
+      anything keywords miss.
+    </p>
+  </div>
+
+  <div class="grid grid-2" style="margin-bottom:20px;">
+    <div class="panel">
+      <div class="panel-titlebar">Layer 1: Instant-Reject Keywords</div>
+      <div class="panel-body">
+        <p style="margin-bottom:10px;">Any company whose name contains one of these words is rejected before further processing. This catches the vast majority of non-equity garbage in one O(n) pass:</p>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--amber-hi);line-height:2.0;display:flex;flex-wrap:wrap;gap:4px 12px;">
+          <span>acquisition</span><span>spac</span><span>etf</span><span>fund</span>
+          <span>reit</span><span>warrant</span><span>preferred</span><span>holdings</span>
+          <span>vehicle</span><span>ventures</span><span>income</span><span>blockchain</span>
+          <span>metaverse</span><span>crypto</span><span>merger</span><span>bitcoin</span>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-titlebar">Layer 2: Regex Pattern Filters</div>
+      <div class="panel-body">
+        <p style="margin-bottom:10px;">A second pass applies regex patterns for cases keywords miss. Catches leveraged products, series/class designations, numbered SPAC variants, and known fund provider names:</p>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--muted);line-height:2.0;display:flex;flex-wrap:wrap;gap:4px 12px;">
+          <span>vanguard</span><span>ishares</span><span>spdr</span><span>blackrock</span>
+          <span>\d+x\s</span><span>leveraged</span><span>inverse</span><span>series [a-z]</span>
+          <span>class [a-z]</span><span>shell company</span><span>blank check</span><span>roman numerals after corp/inc</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-titlebar">Why this matters for signal quality</div>
+    <div class="panel-body">
+      <p>
+        A directional equity predictor trained on a contaminated universe leaks ETF replication
+        behavior, SPAC announcement dynamics, and fund distribution effects into the feature space.
+        These have fundamentally different return drivers than operating companies. Filtering hard
+        at the universe stage, before any price data is downloaded or any feature is computed, keeps
+        the downstream feature matrix consistent across market regimes. The cost is a few false
+        positives on legitimate companies with unfortunate names. That tradeoff is worth it.
+      </p>
+    </div>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ 04. PRICE DOWNLOADER -->
+<div class="section">
+<div class="container">
+  <div class="section-head">
+    <div class="term-label">// 04. Stage 2: Price Ingestion</div>
+    <div class="section-title">Async IBKR Connection Pool: ~20 Tickers/Second</div>
+    <p class="section-body">
+      Pulling daily price history for 4,200 tickers via Interactive Brokers TWS is a rate-limiting
+      problem. IBKR throttles requests per connection, but allows multiple simultaneous connections
+      each with independent limits. The solution here is a custom async connection pool backed by
+      Python's <span class="ic">deque</span>, holding a set of live IB connections that workers check
+      out, use, and return. You won't find this pattern documented anywhere online for IBKR. It was
+      built from scratch.
+    </p>
+  </div>
+
+  <div class="grid grid-3" style="margin-bottom:20px;">
+    <div class="panel">
+      <div class="panel-titlebar">Architecture</div>
+      <div class="panel-body">
+        <p>A <span class="ic">ConnectionPool</span> class manages up to 8 simultaneous IBKR connections. Each request checks out a connection from the deque, performs the download, and returns it. Connections that fail health checks are silently replaced.</p>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-titlebar">Concurrency</div>
+      <div class="panel-body">
+        <p>Up to 32 async workers run simultaneously via <span class="ic">asyncio.Semaphore</span>. Tickers are batched and dispatched with <span class="ic">asyncio.gather()</span>. Failed tickers are retried up to 3 times with exponential backoff.</p>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-titlebar">Resilience</div>
+      <div class="panel-body">
+        <p>Progress is persisted to a JSON file after each ticker. Runs can be interrupted and resumed without re-downloading completed tickers. Stale connections trigger automatic reconnect. Error codes from TWS are suppressed selectively (contract-not-found vs genuine errors).</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="code-box">
+    <div class="code-box-bar">// 2__PriceDownloader.py | connection pool core (simplified)</div>
+    <pre>
+<span class="kw">class</span> <span class="cls">ConnectionPool</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, host, port, max_connections=<span class="num">8</span>):
+        self.connection_queue = <span class="fn">deque</span>()          <span class="cm"># double-ended queue of live IB connections</span>
+        self.lock = asyncio.<span class="fn">Lock</span>()               <span class="cm"># prevents concurrent pool mutations</span>
+        self.connection_health = {}               <span class="cm"># tracks failure/success per connection</span>
+
+    <span class="kw">async def</span> <span class="fn">get_connection</span>(self):
+        <span class="kw">async with</span> self.lock:
+            <span class="kw">while</span> self.connection_queue:
+                tag, ib = self.connection_queue.<span class="fn">popleft</span>()
+                <span class="kw">if</span> ib.<span class="fn">isConnected</span>():
+                    <span class="kw">return</span> tag, ib           <span class="cm"># healthy connection, check it out</span>
+            <span class="kw">return await</span> self.<span class="fn">_create_new_connection</span>()   <span class="cm"># pool exhausted, open new</span>
+
+<span class="cm"># 32 concurrent workers, each holding one checked-out connection</span>
+semaphore = asyncio.<span class="fn">Semaphore</span>(<span class="num">32</span>)
+tasks = [<span class="fn">process_with_semaphore</span>(ticker) <span class="kw">for</span> ticker <span class="kw">in</span> batch]
+<span class="kw">await</span> asyncio.<span class="fn">gather</span>(*tasks, return_exceptions=<span class="kw">True</span>)</pre>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ 05. ALPHA FACTORS -->
+<div class="section">
+<div class="container">
+  <div class="section-head">
+    <div class="term-label">// 05. Stage 3: Alpha Engineering</div>
+    <div class="section-title">50+ Features Engineered Across All CPU Cores</div>
+    <p class="section-body">
+      <span class="ic">3__AlphaSensitivity.py</span> transforms raw OHLCV bars into a feature matrix
+      for each ticker. It also pulls live market context directly from IBKR TWS (VIX, SPY, QQQ, IWM, DIA)
+      to compute features that place each stock in context of the current regime. All ticker-level
+      computation runs in a <span class="ic">ProcessPoolExecutor</span> that saturates every available
+      CPU core.
+    </p>
+  </div>
+
+  <div class="grid grid-2" style="margin-bottom:20px;">
+    <div>
+      <div class="term-label" style="margin-bottom:14px;">Feature Categories</div>
+      <table class="metric-table" style="border:1px solid var(--amber-border);">
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Features</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Market Beta &amp; Alpha</td>
+            <td class="col-val">Rolling beta, correlation, alpha vs SPY, QQQ, IWM, DIA (60-day window, 30-day min)</td>
+          </tr>
+          <tr>
+            <td>VIX Regime</td>
+            <td class="col-val">VIX level, VIX-of-VIX, VIX momentum, VIX z-score, VIX spike/trough detection, DVAMR probability</td>
+          </tr>
+          <tr>
+            <td>Kalman Filter</td>
+            <td class="col-val">Kalman-smoothed price trend, residuals from trend, regime state estimates</td>
+          </tr>
+          <tr>
+            <td>Spectral / FFT</td>
+            <td class="col-val">Dominant frequency, spectral entropy, cyclical component isolation via scipy.fft</td>
+          </tr>
+          <tr>
+            <td>Visibility Graph</td>
+            <td class="col-val">Natural visibility graph metrics via ts2vg + networkx: degree distribution, clustering, path length</td>
+          </tr>
+          <tr>
+            <td>Distribution</td>
+            <td class="col-val">Rolling skewness, kurtosis, entropy, Gaussian KDE density at current price</td>
+          </tr>
+          <tr>
+            <td>Stress Signals</td>
+            <td class="col-val">EWM-smoothed open-to-low drawdown frequency, volume-ratio stress, multi-severity stress indicators</td>
+          </tr>
+          <tr>
+            <td>Classic Technical</td>
+            <td class="col-val">Momentum, volatility normalization, price relative to rolling bands, gap analysis</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel" style="align-self:start;">
+      <div class="panel-titlebar">DVAMR Probability: a custom feature</div>
+      <div class="panel-body">
+        <p style="margin-bottom:12px;">
+          Dynamic Volatility Adjusted Mean Reversion Probability is a custom composite signal that
+          produces a 0–1 probability score for mean reversion conditions. It combines:
+        </p>
+        <div class="pipeline" style="margin-left:0;">
+          <div class="pipe-row" style="margin-left:14px;">
+            <div class="pipe-num" style="font-size:9px;width:20px;height:20px;left:-11px;top:14px;">1</div>
+            <div class="pipe-content" style="padding:10px 0 14px;">
+              <h4 style="font-size:11px;">VIX Regime</h4>
+              <p style="font-size:12px;">Current VIX vs. its own rolling z-score and VIX-of-VIX</p>
+            </div>
+          </div>
+          <div class="pipe-row" style="margin-left:14px;">
+            <div class="pipe-num" style="font-size:9px;width:20px;height:20px;left:-11px;top:14px;">2</div>
+            <div class="pipe-content" style="padding:10px 0 14px;">
+              <h4 style="font-size:11px;">Volatility Normalization</h4>
+              <p style="font-size:12px;">Stock's return deviation normalized by its own rolling volatility</p>
+            </div>
+          </div>
+          <div class="pipe-row" style="margin-left:14px;">
+            <div class="pipe-num" style="font-size:9px;width:20px;height:20px;left:-11px;top:14px;">3</div>
+            <div class="pipe-content" style="padding:10px 0 0;">
+              <h4 style="font-size:11px;">Market Stress Composite</h4>
+              <p style="font-size:12px;">Multi-severity stress indicator (moderate / severe / extreme) weighted by volume ratio</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel cyan-panel">
+    <div class="panel-titlebar">Why visibility graphs on price series?</div>
+    <div class="panel-body">
+      <p>
+        A Natural Visibility Graph (NVG) converts a price series into a graph: each bar is a node,
+        and two nodes are connected if one can "see" the other without a taller bar in between.
+        The resulting graph's topology (degree distribution, clustering coefficient, mean path length)
+        captures structural properties that FFT and rolling statistics miss, things like trend
+        persistence, local complexity, and dominant peak structure. These features come from the
+        academic literature on graph-theoretic time series analysis and add a genuinely distinct
+        information channel to the feature matrix.
+      </p>
+    </div>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ 06. PREDICTOR -->
+<div class="section">
+<div class="container">
+  <div class="section-head">
+    <div class="term-label">// 06. Stage 4: Prediction</div>
+    <div class="section-title">XGBoost Binary Classifier with Isotonic Calibration</div>
+    <p class="section-body">
+      The predictor answers one question per ticker per day: will this stock close higher tomorrow
+      than it closes today? That's it. The simplicity is deliberate, and it came from running
+      experiments where making the target more complex made the model measurably worse.
+    </p>
+  </div>
+
+  <div class="algo-card">
+    <h4>Simple target outperforms complex target <span class="tag tag-amber">Empirical Finding</span></h4>
+    <p>
+      An earlier version of this system tried to push trading rules directly into the prediction label:
+      encoding position sizing, stop logic, and exit conditions so the model could learn better
+      trading decisions in one shot. AUC-PR dropped consistently every time the label got richer.
+      What was happening: a complex label increases label variance without adding signal. Two identical
+      entry conditions can produce completely different outcomes depending on where the stop sits or
+      how long the trade runs. That variance goes into the training labels as noise. A simple binary
+      directional label has the lowest possible noise and the clearest relationship to the input
+      features. Trading logic belongs in the strategy layer. The predictor just calls direction.
+    </p>
+  </div>
+
+  <div class="grid grid-2" style="margin-top:20px;">
+    <div class="panel">
+      <div class="panel-titlebar">Model Configuration</div>
+      <div class="panel-body">
+        <table style="width:100%;font-size:12px;border-collapse:collapse;">
+          <tr><td style="padding:4px 0;color:var(--muted);font-family:var(--mono);font-size:10px;">objective</td><td style="padding:4px 0;color:var(--amber-hi);font-family:var(--mono);font-size:11px;">binary:logistic</td></tr>
+          <tr><td style="padding:4px 0;color:var(--muted);font-family:var(--mono);font-size:10px;">eval_metric</td><td style="padding:4px 0;color:var(--amber-hi);font-family:var(--mono);font-size:11px;">aucpr (precision-recall)</td></tr>
+          <tr><td style="padding:4px 0;color:var(--muted);font-family:var(--mono);font-size:10px;">num_parallel_tree</td><td style="padding:4px 0;color:var(--amber-hi);font-family:var(--mono);font-size:11px;">24</td></tr>
+          <tr><td style="padding:4px 0;color:var(--muted);font-family:var(--mono);font-size:10px;">nthread</td><td style="padding:4px 0;color:var(--amber-hi);font-family:var(--mono);font-size:11px;">32</td></tr>
+          <tr><td style="padding:4px 0;color:var(--muted);font-family:var(--mono);font-size:10px;">max_depth</td><td style="padding:4px 0;color:var(--amber-hi);font-family:var(--mono);font-size:11px;">3 (intentionally shallow)</td></tr>
+          <tr><td style="padding:4px 0;color:var(--muted);font-family:var(--mono);font-size:10px;">early_stopping_rounds</td><td style="padding:4px 0;color:var(--amber-hi);font-family:var(--mono);font-size:11px;">10</td></tr>
+          <tr><td style="padding:4px 0;color:var(--muted);font-family:var(--mono);font-size:10px;">data splits</td><td style="padding:4px 0;color:var(--amber-hi);font-family:var(--mono);font-size:11px;">temporal with 5-day embargo gaps</td></tr>
+          <tr><td style="padding:4px 0;color:var(--muted);font-family:var(--mono);font-size:10px;">calibration</td><td style="padding:4px 0;color:var(--amber-hi);font-family:var(--mono);font-size:11px;">isotonic (recency-weighted)</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel" style="margin-bottom:12px;">
+        <div class="panel-titlebar">Why AUC-PR instead of AUC-ROC?</div>
+        <div class="panel-body">
+          <p>
+            Stocks go up slightly less than half the time after fees, so the training data is
+            class-imbalanced. AUC-ROC is insensitive to class imbalance and scores well even for
+            a model that performs poorly on the minority class. AUC-PR (area under precision-recall
+            curve) specifically measures performance on positive cases. Early stopping on AUC-PR
+            means the model stops when it stops improving precision on actual up-moves, which is
+            the right objective for a trading signal.
+          </p>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-titlebar">Why isotonic calibration?</div>
+        <div class="panel-body">
+          <p>
+            Raw XGBoost scores are not probabilities. A score of 0.65 does not mean 65% chance of
+            going up. Isotonic regression maps raw scores to empirically calibrated probabilities on
+            a held-out set. A 2% confidence margin on top of the decision threshold cuts out marginal
+            calls. The output is a number the backtester and execution engine can treat as an actual
+            probability estimate rather than just a ranking signal.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ 07. BACKTESTER -->
+<div class="section">
+<div class="container">
+  <div class="section-head">
+    <div class="term-label">// 07. Stage 5: Backtesting</div>
+    <div class="section-title">Research-Grade Backtesting with 20+ Metrics</div>
+    <p class="section-body">
+      The backtester is where strategy ideas get tested and broken before any real capital is at risk.
+      It runs on Backtrader with an exact replica of the IBKR commission structure: $0.0035/share,
+      $0.35 minimum, 1% value cap, plus exchange fees. Every metric prints to the terminal in color,
+      graded from red to green. One exception: values so exceptional they qualify as "Unicorn" render
+      in cornflower blue. That label comes from Van Tharp's SQN framework, which turned out to be
+      a useful reference point for calibrating what a genuinely good result looks like.
+    </p>
+  </div>
+
+  <div class="grid grid-2" style="margin-bottom:24px;">
+    <div>
+      <div class="term-label" style="margin-bottom:14px;">Performance Metrics Tracked</div>
+      <table class="metric-table" style="border:1px solid var(--amber-border);">
+        <thead><tr><th>Metric</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td class="col-val">Annualized Return %</td><td>Core performance, CAGR equivalent</td></tr>
+          <tr><td class="col-val">Sharpe Ratio</td><td>Risk-adjusted return vs. daily vol</td></tr>
+          <tr><td class="col-val">Sortino Ratio</td><td>Downside-deviation adjusted return</td></tr>
+          <tr><td class="col-val">Calmar Ratio</td><td>Return / max drawdown</td></tr>
+          <tr><td class="col-val">Omega Ratio</td><td>Probability-weighted gain vs. loss</td></tr>
+          <tr><td class="col-val">Gain-to-Pain Ratio</td><td>Sum gains / sum losses</td></tr>
+          <tr><td class="col-val">Max Drawdown %</td><td>Worst peak-to-trough decline</td></tr>
+          <tr><td class="col-val">Max DD Duration</td><td>Days underwater</td></tr>
+          <tr><td class="col-val">Ulcer Index</td><td>RMS of drawdown depth over time</td></tr>
+          <tr><td class="col-val">Recovery Factor</td><td>Net profit / max drawdown</td></tr>
+          <tr><td class="col-val">VaR 95% / CVaR 95%</td><td>Tail risk, daily</td></tr>
+          <tr><td class="col-val">Annualized Volatility</td><td>Daily vol × √252</td></tr>
+          <tr><td class="col-val">Win Rate % (after fees)</td><td>Profitable trades / total</td></tr>
+          <tr><td class="col-val">Avg Win / Avg Loss</td><td>Payoff structure</td></tr>
+          <tr><td class="col-val">Risk of Ruin</td><td>Probability of catastrophic loss</td></tr>
+          <tr><td class="col-val">VWR</td><td>Variability-Weighted Return</td></tr>
+          <tr><td class="col-val">Common Sense Ratio</td><td>Profit factor adjusted for tail</td></tr>
+          <tr><td class="col-val">SQN (modified)</td><td>System Quality Number, see scale at right</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div>
+      <div class="term-label" style="margin-bottom:14px;">SQN Quality Scale (Colorized)</div>
+      <p style="font-size:12px;color:var(--text);margin-bottom:14px;line-height:1.60;">
+        The System Quality Number measures mean trade return divided by its standard deviation,
+        scaled by the square root of trade count. Every metric in the terminal maps to a continuous
+        red-to-green gradient. SQN values above 15 get a separate cornflower blue designation called
+        Unicorn. It comes up rarely enough that when it shows up, it actually means something.
+      </p>
+      <div class="sqn-scale">
+        <div class="sqn-row">
+          <div class="sqn-dot" style="background:#f00;"></div>
+          <span class="sqn-label" style="color:#f00;">Negative</span>
+          <span class="sqn-range">SQN &lt; 0</span>
+        </div>
+        <div class="sqn-row">
+          <div class="sqn-dot" style="background:#cc4400;"></div>
+          <span class="sqn-label" style="color:#cc4400;">Poor</span>
+          <span class="sqn-range">0 – 1.6</span>
+        </div>
+        <div class="sqn-row">
+          <div class="sqn-dot" style="background:#cc8800;"></div>
+          <span class="sqn-label" style="color:#cc8800;">Below Average</span>
+          <span class="sqn-range">1.6 – 2.0</span>
+        </div>
+        <div class="sqn-row">
+          <div class="sqn-dot" style="background:#cccc00;"></div>
+          <span class="sqn-label" style="color:#cccc00;">Average</span>
+          <span class="sqn-range">2.0 – 2.5</span>
+        </div>
+        <div class="sqn-row">
+          <div class="sqn-dot" style="background:#44cc00;"></div>
+          <span class="sqn-label" style="color:#44cc00;">Good</span>
+          <span class="sqn-range">2.5 – 3.0</span>
+        </div>
+        <div class="sqn-row">
+          <div class="sqn-dot" style="background:#00cc44;"></div>
+          <span class="sqn-label" style="color:#00cc44;">Excellent</span>
+          <span class="sqn-range">3.0 – 5.0</span>
+        </div>
+        <div class="sqn-row">
+          <div class="sqn-dot" style="background:#00ee88;"></div>
+          <span class="sqn-label" style="color:#00ee88;">Superb</span>
+          <span class="sqn-range">5.0 – 7.0</span>
+        </div>
+        <div class="sqn-row">
+          <div class="sqn-dot" style="background:#00ffcc;"></div>
+          <span class="sqn-label" style="color:#00ffcc;">Holy Grail Potential</span>
+          <span class="sqn-range">7.0+</span>
+        </div>
+        <div class="sqn-row">
+          <div class="sqn-dot" style="background:var(--unicorn);"></div>
+          <span class="sqn-label" style="color:var(--unicorn);">Unicorn ✦</span>
+          <span class="sqn-range">SQN ≥ 15 (cornflower blue)</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-titlebar">Dynamic thresholds: context-aware colorization</div>
+    <div class="panel-body">
+      <p>
+        Fixed red/green thresholds on every metric would be misleading. A 150%+ annualized-return
+        strategy will have higher volatility than a 20% strategy, and that's fine. The backtester
+        computes acceptable volatility bands, VaR bounds, and drawdown limits at runtime based on
+        Sharpe, Sortino, and raw return. Color coding is always relative to what the specific
+        strategy is actually doing, so a high-return system doesn't look broken just because it
+        has numbers that would be bad in a different context.
+      </p>
+    </div>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ 08. MACRO FILTER -->
+<div class="section">
+<div class="container">
+  <div class="section-head">
+    <div class="term-label">// 08. Stage 6: LLM Macro Filter</div>
+    <div class="section-title">Claude in Research Mode as a Soft Filter</div>
+    <p class="section-body">
+      Quantitative signals have a blind spot for catastrophic binary events. A company filing for
+      bankruptcy, announcing an emergency merger, or caught in a geopolitical freeze looks completely
+      normal in the feature matrix right up until it doesn't. Price history can't predict these.
+      Regex can't catch them reliably. This stage uses Claude (Sonnet) in research mode to scan
+      recent news on each signal ticker before the day's orders go out.
+    </p>
+  </div>
+
+  <div class="grid grid-2">
+    <div class="panel">
+      <div class="panel-titlebar">What the LLM checks</div>
+      <div class="panel-body">
+        <p style="margin-bottom:10px;">The model is prompted to search recent news (last 14 days for news, up to 60 days for M&amp;A) and flag any of the following:</p>
+        <ul style="font-size:13px;color:var(--text);line-height:2.0;padding-left:16px;">
+          <li>Active or announced M&amp;A (has_active_ma)</li>
+          <li>Bankruptcy filing or imminent insolvency</li>
+          <li>Geopolitical event affecting the company directly</li>
+          <li>Regulatory action, trading halt, or exchange delisting</li>
+          <li>Material crisis event (fraud, criminal investigation, etc.)</li>
+        </ul>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-titlebar">Engineering around the LLM</div>
+      <div class="panel-body">
+        <p style="margin-bottom:10px;">
+          The LLM is not trusted for quantitative judgement. Its job is to catch qualitative flags
+          a human analyst would spot in two minutes of reading headlines. Several engineering decisions
+          keep this practical:
+        </p>
+        <ul style="font-size:13px;color:var(--text);line-height:2.0;padding-left:16px;">
+          <li>Per-ticker results cached to JSON; interrupted runs resume without re-querying</li>
+          <li>Errored tickers (rate limit, network) tracked separately and retried on resume</li>
+          <li><span class="ic">--skip-claude</span> flag bypasses LLM for cheapest/fastest run</li>
+          <li>Hardcoded quantitative pre-filters run first (min price $2.00, min volume 206k)</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ 09. EXECUTION -->
+<div class="section">
+<div class="container">
+  <div class="section-head">
+    <div class="term-label">// 09. Stage 7: Live Execution</div>
+    <div class="section-title">Four-Legged OCA Brackets on a Personal Computer</div>
+    <p class="section-body">
+      The execution engine runs on a personal computer. Network outages happen. Power goes out.
+      Open positions need protection even when the local software is completely offline. The
+      approach is to submit all exit orders as server-side IBKR orders grouped in an OCA
+      (One-Cancels-All) group at the time of entry. Once transmitted, IBKR holds them. The local
+      machine can go dark and the downside protection stays live at the exchange.
+    </p>
+  </div>
+
+  <div class="algo-card">
+    <h4>Four-legged bracket structure <span class="tag tag-amber">OCA Group</span></h4>
+    <p>
+      Every position entry generates four orders submitted as a single atomic bracket. All three
+      exit legs share one OCA group name (<span class="ic">bracket_{symbol}_{parent_id}</span>).
+      The moment any exit fills at the exchange, IBKR cancels the remaining two. The local Python
+      process doesn't need to be running. This is how the system works safely on consumer hardware.
+    </p>
+  </div>
+
+  <div class="grid grid-2" style="margin-top:16px;margin-bottom:20px;">
+    <div class="panel">
+      <div class="panel-titlebar">Leg 1: Parent Entry (IBKR Adaptive Algo)</div>
+      <div class="panel-body">
+        <p>
+          A limit order using IBKR's Adaptive algorithm at Normal priority. The Adaptive algo submits
+          inside the spread and walks toward the ask over time, so fills land at mid-price or better
+          on liquid names. Expected slippage drops from 10-15 bps with a plain limit-at-ask down to
+          around 2-5 bps. The limit price is a safety ceiling, not the expected fill price. Slippage
+          at each fill is logged to CSV to build a running empirical record.
+        </p>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-titlebar">Leg 2: Take-Profit (LMT, GTC)</div>
+      <div class="panel-body">
+        <p>
+          A limit sell at the backtester-derived target price, or at entry + 2× risk if no target
+          is provided. Good-till-cancelled and valid outside regular hours so after-hours announcements
+          trigger the exit. OCA type 1: fills this, cancels the trailing stop and hard stop.
+        </p>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-titlebar">Leg 3: Trailing Stop (TRAIL, GTC)</div>
+      <div class="panel-body">
+        <p>
+          A percentage-based trailing stop computed from ATR at signal time. Floor 1.2%, ceiling 4.0%.
+          These are intentionally tighter than the backtester (1.5%/5.0%) to give back less from
+          peak in live trading. Stays server-side, rises with the price, never falls.
+        </p>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-titlebar">Leg 4: Hard Stop (LMT, GTC)</div>
+      <div class="panel-body">
+        <p>
+          A fixed limit order below the trailing floor. Covers the case where the trailing stop
+          gets gapped over during a halt or an after-hours move. Sits in the same OCA group and
+          is tighter than the trailing floor, so it only fires when something genuinely unexpected
+          happens.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid grid-2">
+    <div class="panel cyan-panel">
+      <div class="panel-titlebar">Entry Timing (Derived from EDA)</div>
+      <div class="panel-body">
+        <p style="margin-bottom:10px;">
+          The 10:00 ET entry time came from an EDA study on 1,231 signal-day observations.
+          Buy-at-open vs buy-at-10:00, exit at close:
+        </p>
+        <table style="width:100%;font-size:11px;font-family:var(--mono);border-collapse:collapse;">
+          <tr style="border-bottom:1px solid rgba(0,184,204,0.20);">
+            <td style="padding:5px 0;color:var(--muted);">Entry time</td>
+            <td style="padding:5px 0;color:var(--cyan);">Sharpe</td>
+            <td style="padding:5px 0;color:var(--cyan);">Win Rate</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(0,184,204,0.10);">
+            <td style="padding:5px 0;color:var(--text);">Buy at 9:30 open</td>
+            <td style="padding:5px 0;color:#e87878;">0.31</td>
+            <td style="padding:5px 0;color:var(--text);">49.4%</td>
+          </tr>
+          <tr>
+            <td style="padding:5px 0;color:var(--text);">Buy at 10:00 ET</td>
+            <td style="padding:5px 0;color:#86c882;">1.11</td>
+            <td style="padding:5px 0;color:var(--text);">50.9%</td>
+          </tr>
+        </table>
+        <p style="font-size:11px;color:var(--muted);margin-top:8px;">+256% Sharpe improvement from waiting 30 minutes.</p>
+      </div>
+    </div>
+    <div class="panel cyan-panel">
+      <div class="panel-titlebar">SPY Direction Gate (Also EDA-Derived)</div>
+      <div class="panel-body">
+        <p style="margin-bottom:10px;">
+          At 10:00 ET the system checks SPY's move from open. If SPY is down more than 0.5%,
+          all orders are cancelled for the day. From the same EDA dataset:
+        </p>
+        <table style="width:100%;font-size:11px;font-family:var(--mono);border-collapse:collapse;">
+          <tr style="border-bottom:1px solid rgba(0,184,204,0.20);">
+            <td style="padding:5px 0;color:var(--muted);">SPY condition</td>
+            <td style="padding:5px 0;color:var(--cyan);">Sharpe</td>
+            <td style="padding:5px 0;color:var(--cyan);">Win Rate</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(0,184,204,0.10);">
+            <td style="padding:5px 0;color:var(--text);">SPY &lt; -0.5%</td>
+            <td style="padding:5px 0;color:#cc2828;">-6.50</td>
+            <td style="padding:5px 0;color:#cc2828;">31.5%</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(0,184,204,0.10);">
+            <td style="padding:5px 0;color:var(--text);">SPY green day</td>
+            <td style="padding:5px 0;color:#86c882;">+5.34</td>
+            <td style="padding:5px 0;color:#86c882;">62.0%</td>
+          </tr>
+          <tr>
+            <td style="padding:5px 0;color:var(--text);">SPY &gt; +0.5%</td>
+            <td style="padding:5px 0;color:#00ee88;">+6.77</td>
+            <td style="padding:5px 0;color:#00ee88;">68.2%</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ 10. DESIGN DECISIONS -->
+<div class="section">
+<div class="container">
+  <div class="section-head">
+    <div class="term-label">// 10. Design Decisions</div>
+    <div class="section-title">Key Engineering and Research Choices</div>
+    <p class="section-body">
+      Several decisions in this system are non-obvious. This section explains the ones that come
+      up most often when walking someone through the codebase.
+    </p>
+  </div>
+
+  <div class="algo-card">
+    <h4>Temporal data splits with 5-day embargo gaps <span class="tag tag-cyan">ML</span></h4>
+    <p>
+      Standard train/test splits chosen at random introduce lookahead bias in financial time series.
+      A row from 2022 in the test set alongside a row from the same week in training means both
+      share the same market regime, making the split artificially easy. This system uses strictly
+      temporal splits where all training data precedes all test data, with a 5-day embargo gap
+      between them. The embargo prevents the model from learning on data that is temporally adjacent
+      to, and therefore correlated with, the test period. This approach comes from
+      <em>Advances in Financial Machine Learning</em> (Lopez de Prado) and is standard practice in
+      serious quantitative ML.
+    </p>
+  </div>
+
+  <div class="algo-card">
+    <h4>Why not more complex targets for XGBoost? <span class="tag tag-amber">Architecture</span></h4>
+    <p>
+      When the prediction target was enriched to encode exit rules, sizing logic, and multi-day
+      holding behavior, measured AUC-PR dropped consistently across experiments. The explanation is
+      that a complex target increases label noise without increasing signal: the variance in realized
+      outcomes from identical entry conditions (due to stop placement, holding period, market
+      microstructure) adds irreducible noise to the training labels. A simple binary directional
+      target has the lowest possible label noise and the clearest relationship to the input features.
+      Complexity belongs in the strategy layer, not the prediction layer.
+    </p>
+  </div>
+
+  <div class="algo-card">
+    <h4>Zero-slippage assumption is defensible <span class="tag tag-green">Execution</span></h4>
+    <p>
+      Backtests with zero slippage get dismissed as unrealistic. For this system the assumption holds
+      up: the IBKR Adaptive Algo fills limit orders at mid-price or better on liquid names. Empirical
+      slippage logging from live trading confirms fills landing at 2-5 bps, well inside the noise
+      floor of daily return variance. Commissions are modeled exactly ($0.0035/share, $0.35 minimum),
+      and fills are treated as occurring at the signal price. That is consistent with what the
+      execution data actually shows.
+    </p>
+  </div>
+
+  <div class="algo-card">
+    <h4>Why exclude banks, REITs, ETFs? <span class="tag tag-dim">Universe</span></h4>
+    <p>
+      OHLCV-derived alpha factors work well for industrial, technology, consumer, and healthcare
+      companies. Banks are a different problem: their returns correlate more with credit spreads and
+      rate regimes than with the price-based features this system measures, and their balance sheets
+      are opaque enough to make standard signals unreliable. REITs are driven by distribution yield
+      dynamics. ETFs add index arbitrage and replication mechanics to the mix. Removing all of these
+      concentrates the model's training signal where the features are actually informative.
+    </p>
+  </div>
+
+  <div class="algo-card">
+    <h4>Recency-weighted isotonic calibration <span class="tag tag-cyan">ML</span></h4>
+    <p>
+      Standard isotonic calibration weights all calibration samples equally. This system applies
+      recency weighting so recent observations carry more influence. Market regimes shift. A
+      calibration curve fit on 2019 data produces miscalibrated probabilities in 2024. Recency
+      weighting keeps the probability outputs tracking the current relationship between raw scores
+      and realized outcomes rather than a stale historical average.
+    </p>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ 11. BOOKS -->
+<div class="section">
+<div class="container">
+  <div class="section-head">
+    <div class="term-label">// 11. Academic Foundations</div>
+    <div class="section-title">The Research That Shaped This System</div>
+    <p class="section-body">
+      Five books contributed specific techniques that appear directly in the code. This section covers
+      what each one actually contributed rather than listing them as general influences.
+    </p>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:12px;">
+    <div class="book-card">
+      <div class="book-num">01</div>
+      <div>
+        <div class="book-title">Advances in Active Portfolio Management</div>
+        <div class="book-author">Richard C. Grinold &amp; Ronald N. Kahn</div>
+        <div class="book-desc">
+          The IC framework for scoring alpha factors, the Fundamental Law of Active Management,
+          and the concept of breadth as independent bets all fed directly into the alpha factor
+          engineering stage. The asset correlation work in <span class="ic">0__AssetCorrolator.py</span>
+          draws from the covariance estimation methods in this book specifically.
+        </div>
+      </div>
+    </div>
+
+    <div class="book-card">
+      <div class="book-num">02</div>
+      <div>
+        <div class="book-title">Machine Learning for Algorithmic Trading</div>
+        <div class="book-author">Stefan Jansen</div>
+        <div class="book-desc">
+          The feature engineering approach (rolling windows, lag features, cross-sectional
+          normalization) follows patterns from this book. The AUC-PR evaluation methodology
+          and the framing of prediction as a ranking problem rather than a regression problem
+          both appear directly in this system. Practically focused and worth reading before
+          touching any financial ML work.
+        </div>
+      </div>
+    </div>
+
+    <div class="book-card">
+      <div class="book-num">03</div>
+      <div>
+        <div class="book-title">Advances in Financial Machine Learning</div>
+        <div class="book-author">Marcos Lopez de Prado</div>
+        <div class="book-desc">
+          The source of the temporal split methodology with embargo gaps used in this system.
+          De Prado's demonstration that random cross-validation is inappropriate for financial
+          time series, and that walk-forward splits with purging and embargo are the correct
+          approach, directly motivated the training pipeline. The meta-labeling discussion
+          (predicting trade quality rather than just direction) also influenced the decision
+          to keep the prediction target simple.
+        </div>
+      </div>
+    </div>
+
+    <div class="book-card">
+      <div class="book-num">04</div>
+      <div>
+        <div class="book-title">Dynamic Hedging: Managing Vanilla and Exotic Options</div>
+        <div class="book-author">Nassim Nicholas Taleb</div>
+        <div class="book-desc">
+          No options in this system. The book contributed anyway. Taleb's treatment of tail
+          risk and the inadequacy of variance as a complete risk description informed the
+          decision to track Ulcer Index, CVaR, and Risk of Ruin in the backtester alongside
+          standard volatility measures. The priority on downside protection (bracket orders,
+          hard stops, server-side exits) comes from that same orientation.
+        </div>
+      </div>
+    </div>
+
+    <div class="book-card">
+      <div class="book-num">05</div>
+      <div>
+        <div class="book-title">Assessing and Improving Prediction and Classification</div>
+        <div class="book-author">Timothy Masters</div>
+        <div class="book-desc">
+          Probably the least known book on this list and worth tracking down. Masters covers
+          how to avoid fooling yourself with in-sample performance, how to design robust
+          out-of-sample tests, and how calibration affects the practical usefulness of a
+          probabilistic predictor. That material directly shaped the AUC-PR methodology, the
+          calibration stage, and the confidence margin on the decision threshold. His approach
+          of treating prediction quality as multi-dimensional rather than a single number also
+          influenced the metrics system in the backtester.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════ FOOTER -->
+<div class="footer">
+<div class="container">
+  <div class="footer-inner">
+    <div>
+      <div class="footer-name">Jonathan Bellmont</div>
+      <div class="footer-contact"><a href="mailto:masamunex9000@gmail.com">masamunex9000@gmail.com</a></div>
+      <div class="footer-detail" style="margin-top:6px;">github.com/JonIsHere242 &nbsp;|&nbsp; github.com/JonIsHere242/Stock-Market-Production</div>
+      <div class="footer-detail" style="margin-top:3px;">Autonomous Trading System &nbsp;|&nbsp; End-to-End Quantitative Pipeline</div>
+    </div>
+    <div>
+      <div class="footer-stack-label">Languages &amp; Infrastructure</div>
+      <span class="stack-pill">Python 3.11+</span>
+      <span class="stack-pill">PowerShell</span>
+
+      <div style="height:10px;"></div>
+      <div class="footer-stack-label">Market Data &amp; Execution</div>
+      <span class="stack-pill">ib_insync</span>
+      <span class="stack-pill">backtrader</span>
+      <span class="stack-pill">backtrader_ib_insync</span>
+      <span class="stack-pill">yfinance</span>
+      <span class="stack-pill">exchange_calendars</span>
+      <span class="stack-pill">pandas_market_calendars</span>
+
+      <div style="height:10px;"></div>
+      <div class="footer-stack-label">Data Engineering</div>
+      <span class="stack-pill">NumPy</span>
+      <span class="stack-pill">pandas</span>
+      <span class="stack-pill">pyarrow</span>
+      <span class="stack-pill">joblib</span>
+      <span class="stack-pill">pytz</span>
+
+      <div style="height:10px;"></div>
+      <div class="footer-stack-label">Machine Learning</div>
+      <span class="stack-pill">XGBoost</span>
+      <span class="stack-pill">scikit-learn</span>
+      <span class="stack-pill">Numba</span>
+
+      <div style="height:10px;"></div>
+      <div class="footer-stack-label">Signal Processing &amp; Feature Engineering</div>
+      <span class="stack-pill">scipy</span>
+      <span class="stack-pill">pykalman</span>
+      <span class="stack-pill">ts2vg</span>
+      <span class="stack-pill">networkx</span>
+
+      <div style="height:10px;"></div>
+      <div class="footer-stack-label">Visualization</div>
+      <span class="stack-pill">Plotly</span>
+      <span class="stack-pill">Matplotlib</span>
+
+      <div style="height:10px;"></div>
+      <div class="footer-stack-label">Async &amp; Networking</div>
+      <span class="stack-pill">asyncio</span>
+      <span class="stack-pill">nest_asyncio</span>
+      <span class="stack-pill">requests</span>
+      <span class="stack-pill">urllib3</span>
+      <span class="stack-pill">watchdog</span>
+
+      <div style="height:10px;"></div>
+      <div class="footer-stack-label">AI Research Layer</div>
+      <span class="stack-pill">Anthropic SDK</span>
+      <span class="stack-pill">tqdm</span>
+    </div>
+  </div>
+</div>
+</div>
+
+<script>
+/* Dynamically set @page height to the full document so Chrome prints one page with no breaks */
+(function(){
+  var h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, 18000);
+  var s = document.createElement('style');
+  s.textContent = '@media print { @page { size: 1280px ' + h + 'px !important; margin: 0 !important; } }';
+  document.head.appendChild(s);
+})();
+</script>
+</body>
+</html>

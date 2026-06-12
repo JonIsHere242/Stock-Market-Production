@@ -1,0 +1,3 @@
+﻿# Put your FRED API key on the first line (no quotes).
+# Get one free at https://fred.stlouisfed.org/docs/api/api_key.html
+# Then rename this file to  .fred_api_key

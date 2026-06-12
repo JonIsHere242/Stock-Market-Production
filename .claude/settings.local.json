@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(NUL)",
+      "Bash(findstr:*)",
+      "Bash(dir:*)",
+      "Bash(python:*)",
+      "Bash(cat:*)",
+      "Bash(./stock_env/Scripts/python.exe:*)",
+      "Bash(timeout /t 90)",
+      "Bash(del temp_analysis.py temp_analysis2.py temp_analysis3.py)",
+      "WebFetch(domain:github.com)",
+      "Bash(PYTHONIOENCODING=utf-8 python3:*)",
+      "Bash(python3:*)",
+      "Bash(pip install:*)",
+      "Bash(stock_env/Scripts/python -c \":*)",
+      "Bash(stock_env/Scripts/python.exe 4__Predictor.py --tune --tune_trials 50)",
+      "WebSearch"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

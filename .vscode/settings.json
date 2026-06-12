@@ -1,0 +1,25 @@
+{
+    "git.ignoreLimitWarning": true,
+    "files.watcherExclude": {
+        "**/Data/**": true,
+        "**/stock_env/**": true,
+        "**/__pycache__/**": true,
+        "**/.git/objects/**": true,
+        "**/_old_versions/**": true,
+        "**/analysis_output/**": true
+    },
+    "search.exclude": {
+        "**/Data": true,
+        "**/stock_env": true,
+        "**/__pycache__": true,
+        "**/_old_versions": true,
+        "**/analysis_output": true
+    },
+    "python.analysis.exclude": [
+        "**/Data/**",
+        "**/stock_env/**",
+        "**/_old_versions/**"
+    ],
+    "python.languageServer": "None",
+    "python.useEnvironmentsExtension": false
+}

@@ -1,661 +1,601 @@
 #!/usr/bin/env python
-import os
-import sys
-import logging
-import argparse
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import json
-import yfinance as yf
-from typing import Dict, List, Optional, Tuple
-import time
+"""
+7__MacroFilter.py — the signal FUNNEL (pool -> final book).
 
-from Util import get_logger
+Reads the candidate POOL (Data/0__signals.parquet, ~12 names written by the
+nightly backtester) and narrows it to the final book of <=4 names that the live
+broker (9_SuperFastBroker.py) trades from _Buy_Signals.parquet. Cost-ordered, so
+the expensive LLM step only ever sees the few names that survive the free
+mechanical screens:
+
+  Stage 0  Load pool, align to the next NYSE trading day, attach price history.
+  Stage 1  HARD mechanical exclusions (free, no API): price floor, micro-cap,
+           weekly-vol cliff, RSI death-zone, ideological quarantine. Dropped.
+  Stage 2  SOFT mechanical delisting / merger flags (free, no API): penny/illiquid,
+           and a big-gap-then-vol-collapse "deal-peg" signature. These DEPRIORITIZE
+           and hand the name to the LLM to confirm; they do not drop on their own.
+  Stage 3  LLM summary judgement (paid, best model, max effort) on survivors ONLY:
+           claude-opus-4-8 + web_search confirms active M&A target / material
+           crisis. Auto-SKIPS cleanly if the API key is unfunded/invalid — the
+           mechanical funnel alone still produces a book.
+  Stage 4  Rank survivors by UpProbability, take the top 4 (clean first, then relax
+           soft-flags to fill 4 so capital stays deployed), write the book.
+
+IDEMPOTENT: if _Buy_Signals.parquet already holds a narrowed book dated for the
+next trading day (e.g. you funneled by hand via the trade-signals skill), this
+exits immediately and spends $0. Use --force to re-run anyway.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+
+from Util import get_logger, get_next_trading_day
 
 logger = get_logger(script_name="7__MacroFilter")
 
-# ============ CONFIGURATION ============
+# ── Files ─────────────────────────────────────────────────────────────────────
+POOL_FILE = "Data/0__signals.parquet"      # input: ~12-name candidate pool
+BOOK_FILE = "_Buy_Signals.parquet"         # output: final narrowed book (broker reads this)
+PRICE_DIR = "Data/PriceData"               # per-ticker daily OHLCV (price source of truth)
+QUARANTINE_DIR = "Data/_quarantine_ideological"
 API_KEY_FILE = "Claud-API-KEY.txt"
 
-# Try to load API key from file first, then fall back to environment variable
-ANTHROPIC_API_KEY = None
-if os.path.exists(API_KEY_FILE):
+# ── Book sizing ─────────────────────────────────────────────────────────────────
+TARGET_BOOK_SIZE = 10  # 4->8->10 (2026-06-08): joint seed x config x book grid (Data/
+                       # _jointstress) — k10 most robust marginally (best mean Sharpe 2.90,
+                       # lowest sd 0.92, best mean rank 2.20 across model+config noise).
+                       # 6-12 is the plateau; 4 robustly worst. Broker PositionSizer
+                       # (9_SuperFastBroker line ~73, max_positions) must match (=10).
+MAX_BOOK = 12          # mirrors the broker's fail-safe guard
+
+# ── Stage 1 hard-exclusion thresholds (FilterRubric Step-1) ──────────────────────
+PRICE_FLOOR = 5.00         # exclude if latest close < $5
+MICRO_CAP_MAX_M = 952.0    # exclude if market cap < $952M (micro)
+WEEKLY_VOL_MAX_PCT = 5.0   # exclude if weekly volatility > 5.0% (the sharp cliff)
+RSI_DEATH_LO, RSI_DEATH_HI = 30.0, 40.0   # exclude if RSI(14) in the death zone
+
+# Hardcoded ideological quarantine (union'd with QUARANTINE_DIR contents at runtime).
+QUARANTINE_SEED = {"HIMS", "DJT", "ODD"}
+
+# ── Stage 2 soft (delisting / merger) heuristic params ───────────────────────────
+MERGER_LOOKBACK = 40       # sessions to scan for a deal-gap
+MERGER_GAP_PCT = 15.0      # a single-day move this big...
+MERGER_POSTVOL_MAX = 1.0   # ...followed by daily realized vol below this % => deal-peg
+DELIST_PRICE = 3.00        # penny-ish
+DELIST_DOLLAR_VOL = 1_000_000.0   # median 20d dollar volume below this => illiquid
+
+# ── Stage 3 LLM config (see claude-api skill) ────────────────────────────────────
+LLM_MODEL = "claude-opus-4-8"   # best model — real money
+LLM_EFFORT = "max"              # maximum effort (Opus-tier); dial to "high" to save tokens
+LLM_MAX_TOKENS = 16000          # streamed, so well clear of the non-streaming timeout guard
+WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search"}
+LLM_SLEEP_BETWEEN = 2.0         # gentle spacing between the handful of calls
+LLM_MAX_CHECKS = TARGET_BOOK_SIZE + 2   # cap calls: research top names until book full (+2 buffer)
+LLM_CALL_TIMEOUT = 150.0        # seconds/call — hard deadline: broker locks in at 10:00 ET
+
+# ── Research timing ──────────────────────────────────────────────────────────────
+# Run the LLM AFTER the open for fresher news, but finish well before the broker
+# locks in at 10:00 ET. When launched within MAX_PREOPEN_WAIT_MIN of the window the
+# funnel self-waits to RESEARCH_START_ET before web-searching; otherwise (off-hours
+# / manual run, or already past) it proceeds immediately. The cheap mechanical
+# screens always run first — they use prior-close data, so their timing is moot.
+ET = ZoneInfo("America/New_York")
+RESEARCH_START_ET = (9, 35)     # 5 min after the 9:30 ET open
+MAX_PREOPEN_WAIT_MIN = 45       # never idle-wait longer than this (guards off-hours runs)
+
+LLM_SYSTEM_RUBRIC = (
+    "You are a risk screener for a short-horizon (about 5 trading days), long-only US "
+    "equity strategy. For the single ticker given, use web search to determine TWO things "
+    "about events in roughly the last 30-60 days:\n"
+    "1) ACTIVE M&A TARGET: is the company itself being acquired / taken private / merged "
+    "INTO another company (announced or pending)? The ACQUIRER in a deal does NOT count. "
+    "Closed/abandoned deals do NOT count.\n"
+    "2) MATERIAL CRISIS: a recent, confirmed event that raises 5-day downside risk — SEC "
+    "enforcement or fraud allegations, bankruptcy/liquidity warning, going-concern doubt, "
+    "major product recall, accounting restatement, exchange delisting notice, or a CEO/CFO "
+    "ouster amid scandal.\n"
+    "Only flag MATERIAL, RECENT, CONFIRMED events from reputable sources. Routine "
+    "litigation, analyst rating changes, normal price volatility, guidance tweaks, and "
+    "ordinary news do NOT count.\n"
+    "Respond with ONLY a JSON object, no prose before or after:\n"
+    "{\n"
+    '  "has_active_ma": true|false,\n'
+    '  "ma_details": "one sentence or null",\n'
+    '  "has_crisis": true|false,\n'
+    '  "crisis_details": "one sentence or null",\n'
+    '  "summary": "2-3 sentence justification citing what you found"\n'
+    "}"
+)
+
+NEUTRAL_VERDICT = {
+    "has_active_ma": False, "ma_details": None,
+    "has_crisis": False, "crisis_details": None,
+    "summary": "skipped", "skipped": True,
+}
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ════════════════════════════════════════════════════════════════════════════════
+def _next_trading_day():
+    ntd = get_next_trading_day(datetime.now().date())
+    return pd.Timestamp(ntd).date()
+
+
+def load_quarantine():
+    q = set(QUARANTINE_SEED)
+    if os.path.isdir(QUARANTINE_DIR):
+        for p in glob.glob(os.path.join(QUARANTINE_DIR, "*.parquet")):
+            q.add(os.path.splitext(os.path.basename(p))[0].upper())
+    return q
+
+
+def load_price_history(ticker):
+    path = os.path.join(PRICE_DIR, f"{ticker}.parquet")
+    if not os.path.exists(path):
+        return None
     try:
-        with open(API_KEY_FILE, 'r') as f:
-            ANTHROPIC_API_KEY = f.read().strip()
-            if not ANTHROPIC_API_KEY:
-                print(f"Warning: {API_KEY_FILE} exists but is empty")
+        df = pd.read_parquet(path)
+        if "Date" in df.columns:
+            df = df.sort_values("Date")
+        return df if not df.empty else None
     except Exception as e:
-        print(f"Warning: Could not read API key file: {e}")
+        logger.warning(f"[{ticker}] could not read price history: {e}")
+        return None
 
-if not ANTHROPIC_API_KEY:
-    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", None)
 
-SIGNALS_PATH = "Data/0__signals.parquet"
-FILTER_RESULTS_PATH = "Data/ModelData/filter_results.json"
-CACHE_PATH = "Data/ModelData/filter_run_cache.json"
-RUBRIC_PATH = "FilterRubric.txt"
+def compute_rsi14(close):
+    """Wilder's RSI(14); returns the latest value or None if too short."""
+    if close is None or len(close) < 15:
+        return None
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + rs)
+    val = rsi.iloc[-1]
+    return float(val) if pd.notna(val) else None
 
-# Hardcoded thresholds from the rubric
-MIN_PRICE = 2.00
-MIN_VOLUME = 206_000  # Very low volume threshold
-MEDIAN_VOLUME = 608_701  # Where performance degrades
-HIGH_VOLUME = 1_640_000  # High volume threshold
 
-# Market cap boundaries (in millions)
-MICRO_CAP_MAX = 952
-SMALL_CAP_MIN = 952
-SMALL_CAP_MAX = 2_200
-MID_CAP_MIN = 2_200
-MID_CAP_MAX = 7_900
-LARGE_CAP_MIN = 7_900
+def compute_weekly_vol_pct(price_df, window=5):
+    """Approx FinViz 'Volatility (Week)': mean daily (High-Low)/Close over the last
+    ~5 sessions, in %. Calibrated to within ~0.3% of FinViz across test names
+    (AU/DRS/KGC/AG/CVI/TIGO/RBLX/MSTR). A std*sqrt(5) scaling ran ~2x hot and
+    nuked the whole pool — do not use it."""
+    if price_df is None or len(price_df) < 3:
+        return None
+    if {"High", "Low", "Close"}.issubset(price_df.columns):
+        rng = ((price_df["High"] - price_df["Low"]) / price_df["Close"]).dropna().tail(window)
+        if len(rng) < 3:
+            return None
+        return float(rng.mean() * 100.0)
+    rets = price_df["Close"].pct_change().abs().dropna().tail(window)   # fallback: close-to-close
+    if len(rets) < 3:
+        return None
+    return float(rets.mean() * 100.0)
 
-# ============ ARGUMENT PARSER ============
-parser = argparse.ArgumentParser(description="Macro Filter for Trading Signals")
-parser.add_argument("--mock", action="store_true", help="Run in mock mode without Claude API")
-parser.add_argument("--dry-run", action="store_true", help="Don't modify the signals file, just report")
-parser.add_argument("--verbose", action="store_true", help="Verbose output")
-parser.add_argument("--skip-claude", action="store_true", help="Skip Claude API calls, use only hardcoded checks (fastest, cheapest)")
-parser.add_argument("--resume", action="store_true", help="Resume a previous run, skipping already-completed tickers and retrying errored ones")
-args = parser.parse_args()
 
-# ============ CACHE FUNCTIONS ============
-
-def load_run_cache() -> Dict:
-    """Load the persistent run cache from disk."""
-    if not os.path.exists(CACHE_PATH):
-        return {}
+# ════════════════════════════════════════════════════════════════════════════════
+# Idempotency — has the funnel already produced today's book?
+# ════════════════════════════════════════════════════════════════════════════════
+def already_funneled(next_td):
+    """True if _Buy_Signals.parquet already holds a narrowed book for next_td."""
+    if not os.path.exists(BOOK_FILE):
+        return False, None
     try:
-        with open(CACHE_PATH, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        logger.warning(f"Could not load run cache: {e}")
-        return {}
+        df = pd.read_parquet(BOOK_FILE)
+    except Exception:
+        return False, None
+    if "Status" not in df.columns:          # raw ledger / unnarrowed
+        return False, None
+    pend = df[df["Status"] == "Pending"]
+    if pend.empty or len(pend) > MAX_BOOK:   # empty or still pool-sized
+        return False, None
+    if "TargetDate" not in pend.columns:
+        return False, None
+    dates = set(pd.to_datetime(pend["TargetDate"], errors="coerce").dt.date.dropna())
+    if dates == {next_td}:                   # narrowed AND dated for the upcoming session
+        return True, pend["Symbol"].tolist()
+    return False, None
 
 
-def save_ticker_to_cache(date_key: str, ticker: str, result: Dict, status: str = "completed"):
-    """
-    Persist a ticker result to the run cache.
-    status: 'completed' (full result saved) or 'errored' (API/network failure)
-    On resume, completed tickers are skipped; errored tickers are retried.
-    """
-    cache = load_run_cache()
-    if date_key not in cache:
-        cache[date_key] = {"completed": {}, "errored": [], "run_timestamp": datetime.now().isoformat()}
+# ════════════════════════════════════════════════════════════════════════════════
+# Stage 1 — hard mechanical exclusions
+# ════════════════════════════════════════════════════════════════════════════════
+def hard_exclude(symbol, row, price_df, quarantine):
+    reasons = []
 
-    if status == "errored":
-        if ticker not in cache[date_key]["errored"]:
-            cache[date_key]["errored"].append(ticker)
+    if symbol.upper() in quarantine:
+        reasons.append("ideological quarantine")
+
+    # Market cap (from the pool's FinViz snapshot at signal-generation time)
+    cap = row.get("CapMillions")
+    if pd.notna(cap) and float(cap) < MICRO_CAP_MAX_M:
+        reasons.append(f"micro-cap ${float(cap):.0f}M < ${MICRO_CAP_MAX_M:.0f}M")
+
+    # Price floor — prefer the live price-history close over the (sometimes stale) pool price
+    price = None
+    if price_df is not None and "Close" in price_df.columns and len(price_df):
+        price = float(price_df["Close"].iloc[-1])
+    elif pd.notna(row.get("CurrentPrice")):
+        price = float(row["CurrentPrice"])
+    if price is not None and price < PRICE_FLOOR:
+        reasons.append(f"price ${price:.2f} < ${PRICE_FLOOR:.2f}")
+
+    # Weekly volatility cliff + RSI death-zone (computed from price history)
+    if price_df is not None and "Close" in price_df.columns:
+        close = price_df["Close"]
+        wv = compute_weekly_vol_pct(price_df)
+        if wv is not None and wv > WEEKLY_VOL_MAX_PCT:
+            reasons.append(f"weekly vol {wv:.1f}% > {WEEKLY_VOL_MAX_PCT:.1f}%")
+        rsi = compute_rsi14(close)
+        if rsi is not None and RSI_DEATH_LO <= rsi <= RSI_DEATH_HI:
+            reasons.append(f"RSI {rsi:.0f} in death-zone [{RSI_DEATH_LO:.0f},{RSI_DEATH_HI:.0f}]")
     else:
-        cache[date_key]["completed"][ticker] = result
-        # Remove from errored list if it was previously failed but now succeeded
-        if ticker in cache[date_key].get("errored", []):
-            cache[date_key]["errored"].remove(ticker)
+        logger.info(f"[{symbol}] no price history — vol/RSI checks skipped")
 
-    os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
-    with open(CACHE_PATH, 'w') as f:
-        json.dump(cache, f, indent=2, default=str)
+    return (len(reasons) > 0), reasons
 
 
-# ============ HELPER FUNCTIONS ============
+# ════════════════════════════════════════════════════════════════════════════════
+# Stage 2 — soft delisting / merger flags
+# ════════════════════════════════════════════════════════════════════════════════
+def soft_flags(symbol, price_df):
+    flags = []
+    if price_df is None or "Close" not in price_df.columns or len(price_df) < 11:
+        return flags
+    close = price_df["Close"]
 
-def get_ticker_fundamentals(ticker: str) -> Dict:
-    """
-    Fetch fundamental data for a ticker using yfinance.
-    Returns dict with price, volume, market_cap, exchange.
-    """
-    try:
-        logger.info(f"Fetching fundamentals for {ticker}...")
-        stock = yf.Ticker(ticker)
-        info = stock.info
+    # Delisting / illiquidity
+    last = float(close.iloc[-1])
+    if last < DELIST_PRICE:
+        flags.append(f"penny (${last:.2f})")
+    if "Volume" in price_df.columns:
+        dv = (close * price_df["Volume"]).tail(20)
+        if len(dv) >= 10 and float(dv.median()) < DELIST_DOLLAR_VOL:
+            flags.append(f"illiquid (med $vol ${float(dv.median())/1e6:.1f}M)")
 
-        # Get recent trading data for volume
-        hist = stock.history(period="30d")
-        avg_volume = hist['Volume'].mean() if len(hist) > 0 else 0
-
-        # Get current price
-        current_price = info.get('currentPrice') or info.get('regularMarketPrice', 0)
-        if current_price == 0 and len(hist) > 0:
-            current_price = hist['Close'].iloc[-1]
-
-        # Get market cap
-        market_cap = info.get('marketCap', 0)
-        market_cap_millions = market_cap / 1_000_000 if market_cap else 0
-
-        # Get exchange
-        exchange = info.get('exchange', 'UNKNOWN')
-
-        return {
-            'ticker': ticker,
-            'price': float(current_price),
-            'avg_volume_30d': int(avg_volume),
-            'market_cap_millions': float(market_cap_millions),
-            'exchange': exchange,
-            'success': True
-        }
-    except Exception as e:
-        logger.error(f"Error fetching fundamentals for {ticker}: {e}")
-        return {
-            'ticker': ticker,
-            'price': 0,
-            'avg_volume_30d': 0,
-            'market_cap_millions': 0,
-            'exchange': 'UNKNOWN',
-            'success': False,
-            'error': str(e)
-        }
+    # Merger / deal-peg: a big single-day gap recently, then collapsed daily vol
+    rets = close.pct_change().tail(MERGER_LOOKBACK)
+    if len(rets) >= 15:
+        max_move = float(rets.abs().max() * 100.0)
+        recent_vol = float(rets.tail(10).std() * 100.0)
+        if max_move >= MERGER_GAP_PCT and recent_vol < MERGER_POSTVOL_MAX:
+            flags.append(f"deal-peg signature (gap {max_move:.0f}%, vol {recent_vol:.1f}%)")
+    return flags
 
 
-def classify_market_cap(market_cap_millions: float) -> str:
-    """Classify market cap into categories based on rubric."""
-    if market_cap_millions < MICRO_CAP_MAX:
-        return "Micro"
-    elif market_cap_millions < SMALL_CAP_MAX:
-        return "Small"
-    elif market_cap_millions < MID_CAP_MAX:
-        return "Mid"
-    else:
-        return "Large"
+# ════════════════════════════════════════════════════════════════════════════════
+# Stage 3 — LLM summary judgement (auto-skips on unfunded/invalid key)
+# ════════════════════════════════════════════════════════════════════════════════
+def _resolve_api_key():
+    if os.path.exists(API_KEY_FILE):
+        try:
+            k = open(API_KEY_FILE).read().strip()
+            if k:
+                return k
+        except Exception:
+            pass
+    return os.environ.get("ANTHROPIC_API_KEY")
 
 
-def classify_volume_tier(avg_volume: float) -> str:
-    """Classify volume into tiers based on rubric."""
-    if avg_volume >= HIGH_VOLUME:
-        return "High"
-    elif avg_volume >= MEDIAN_VOLUME:
-        return "Medium"
-    elif avg_volume >= MIN_VOLUME:
-        return "Low"
-    else:
-        return "VeryLow"
+def _parse_verdict(text):
+    t = (text or "").strip()
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", t, re.DOTALL)
+    if m:
+        t = m.group(1)
+    elif not t.startswith("{"):
+        i, j = t.find("{"), t.rfind("}")
+        if i != -1 and j != -1:
+            t = t[i:j + 1]
+    return json.loads(t)
 
 
-def calculate_strategy_fit_score(fundamentals: Dict) -> Dict:
-    """
-    Calculate strategy fit score based on volume and market cap.
-    Returns dict with volume_score, cap_score, premium_bonus, and total.
-    """
-    volume = fundamentals['avg_volume_30d']
-    market_cap = fundamentals['market_cap_millions']
-
-    # Volume tier score
-    volume_tier = classify_volume_tier(volume)
-    volume_score_map = {
-        "High": 3,
-        "Medium": 1,
-        "Low": 0,
-        "VeryLow": -2
-    }
-    volume_score = volume_score_map[volume_tier]
-
-    # Market cap tier score
-    cap_tier = classify_market_cap(market_cap)
-    cap_score_map = {
-        "Small": 3,
-        "Mid": 1,
-        "Large": 1,
-        "Micro": -3
-    }
-    cap_score = cap_score_map[cap_tier]
-
-    # Premium stock bonus (High Volume + Large Cap)
-    premium_bonus = 2 if (volume_tier == "High" and cap_tier == "Large") else 0
-
-    # Raw total (before normalization)
-    raw_total = volume_score + cap_score + premium_bonus
-
-    # Normalize to 1-10 scale (range is -5 to 8, so shift and scale)
-    # Map -5 to 1, 8 to 10
-    normalized_score = ((raw_total + 5) / 13) * 9 + 1
-    normalized_score = max(1, min(10, normalized_score))
-
-    return {
-        'volume_tier': volume_tier,
-        'volume_score': volume_score,
-        'cap_tier': cap_tier,
-        'cap_score': cap_score,
-        'premium_bonus': premium_bonus,
-        'raw_total': raw_total,
-        'normalized_score': round(normalized_score, 2)
-    }
+def _is_fatal_key_error(exc, anthropic):
+    """Key-level failure (unfunded/invalid/unreachable) -> skip the whole stage."""
+    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError,
+                        anthropic.APIConnectionError)):
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        msg = (getattr(exc, "message", "") or str(exc)).lower()
+        if any(s in msg for s in ("credit", "billing", "balance", "quota")):
+            return True
+    return False
 
 
-def calculate_risk_adjustments(fundamentals: Dict, claude_analysis: Dict) -> Dict:
-    """
-    Calculate risk penalties based on fundamentals and Claude analysis.
-    Returns dict with risk_points and list of concerns.
-    """
-    risk_points = 0
-    concerns = []
-
-    price = fundamentals['price']
-    market_cap = fundamentals['market_cap_millions']
-    volume = fundamentals['avg_volume_30d']
-
-    # Price < $2.00
-    if price < MIN_PRICE:
-        risk_points += 4
-        concerns.append(f"Price below ${MIN_PRICE:.2f} (delisting risk)")
-
-    # Micro-cap
-    if classify_market_cap(market_cap) == "Micro":
-        risk_points += 2
-        concerns.append("Micro-cap (historical profit factor: 0.11)")
-
-    # Very low volume
-    if classify_volume_tier(volume) == "VeryLow":
-        risk_points += 1
-        concerns.append(f"Very low volume (<{MIN_VOLUME:,})")
-
-    # Active M&A (from Claude analysis)
-    if claude_analysis.get('has_active_ma', False):
-        risk_points += 3
-        concerns.append(f"Active M&A: {claude_analysis.get('ma_details', 'Pending merger/acquisition')}")
-
-    # Current crisis event (from Claude analysis)
-    if claude_analysis.get('has_crisis_event', False):
-        risk_points += 3
-        concerns.append(f"Crisis event: {claude_analysis.get('crisis_details', 'Material negative event')}")
-
-    return {
-        'risk_points': risk_points,
-        'concerns': concerns
-    }
+def _llm_call(client, system_blocks, user_text):
+    """One streamed Opus call with web_search; resumes through pause_turn."""
+    messages = [{"role": "user", "content": user_text}]
+    msg = None
+    client = client.with_options(timeout=LLM_CALL_TIMEOUT)
+    for _ in range(4):
+        with client.messages.stream(
+            model=LLM_MODEL,
+            max_tokens=LLM_MAX_TOKENS,
+            system=system_blocks,
+            thinking={"type": "adaptive"},
+            output_config={"effort": LLM_EFFORT},
+            tools=[WEB_SEARCH_TOOL],
+            messages=messages,
+        ) as stream:
+            msg = stream.get_final_message()
+        if msg.stop_reason == "pause_turn":            # server tool loop paused — resume
+            messages.append({"role": "assistant", "content": msg.content})
+            continue
+        break
+    text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
+    return text
 
 
-def research_ticker_with_claude(ticker: str, fundamentals: Dict) -> Dict:
-    """
-    Use Claude API with web search to research M&A status and current events.
-    Returns dict with has_active_ma, ma_details, has_crisis_event, crisis_details.
-    """
-    if args.mock or args.skip_claude or not ANTHROPIC_API_KEY:
-        mode = "mock" if args.mock else "skip-claude" if args.skip_claude else "no API key"
-        logger.info(f"Skipping Claude API for {ticker} ({mode})")
-        return {
-            'ticker': ticker,
-            'has_active_ma': False,
-            'ma_details': None,
-            'has_crisis_event': False,
-            'crisis_details': None,
-            'news_summary': f'Skipped ({mode})',
-            'mock': True
-        }
+class LLMJudge:
+    """Stage 3 judge. Lazily inits the Opus client and judges ONE ticker per call, so
+    the funnel can research candidates top-down and stop once the book is full (bounds
+    cost AND wall-clock — the broker locks in at 10:00 ET). Disables itself permanently
+    on a key-level error (unfunded/invalid/unreachable) so the rest of the run is
+    mechanical-only."""
 
-    try:
-        import anthropic
+    def __init__(self, skip=False):
+        self.enabled = False
+        self.anthropic = None
+        self.client = None
+        self.system_blocks = None
+        if skip:
+            logger.info("Stage 3 (LLM): skipped by flag — mechanical only.")
+            return
+        try:
+            import anthropic
+        except ImportError:
+            logger.warning("Stage 3 (LLM): anthropic SDK not installed — mechanical only.")
+            return
+        key = _resolve_api_key()
+        if not key:
+            logger.warning("Stage 3 (LLM): no API key — mechanical only.")
+            return
+        self.anthropic = anthropic
+        self.client = anthropic.Anthropic(api_key=key)
+        # Stable rubric -> cache_control (engages once the prefix exceeds Opus's
+        # 4096-token cache minimum; harmless and correct below that).
+        self.system_blocks = [{"type": "text", "text": LLM_SYSTEM_RUBRIC,
+                               "cache_control": {"type": "ephemeral"}}]
+        self.enabled = True
+        logger.info(f"Stage 3 (LLM): {LLM_MODEL} effort={LLM_EFFORT}, web-searching up to "
+                    f"{LLM_MAX_CHECKS} candidate(s) on demand.")
 
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-        # Build the research prompt - short and focused on recent news
-        prompt = f"""Search for recent news about {ticker}. Focus on the last 14 days, but check up to 60 days for M&A.
-
-Check for:
-1. M&A activity (pending/announced mergers, acquisitions, buyout rumors)
-2. Crisis events (regulatory issues, lawsuits, bankruptcy signals, scandals, recalls, major layoffs)
-
-Context: Price ${fundamentals['price']:.2f}, Market Cap ${fundamentals['market_cap_millions']:.0f}M
-
-Return JSON:
-{{
-    "has_active_ma": true/false,
-    "ma_details": "description or null",
-    "has_crisis_event": true/false,
-    "crisis_details": "description or null",
-    "news_summary": "2-3 sentence summary"
-}}
-
-Prioritize recent news. Only flag material events."""
-
-        # Retry loop for rate limit (429) errors
-        max_retries = 3
-        retry_delays = [45, 90, 180]  # seconds between retries
-        last_exception = None
-
-        for attempt in range(max_retries):
-            try:
-                message = client.messages.create(
-                    model="claude-sonnet-4-5-20250929",
-                    max_tokens=1024,
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ],
-                    tools=[
-                        {
-                            "type": "web_search_20250305",
-                            "name": "web_search"
-                        }
-                    ]
-                )
-                break  # success — exit retry loop
-            except anthropic.RateLimitError as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    wait_time = retry_delays[attempt]
-                    logger.warning(
-                        f"Rate limit hit for {ticker} (attempt {attempt + 1}/{max_retries}). "
-                        f"Waiting {wait_time}s before retry..."
-                    )
-                    time.sleep(wait_time)
-                else:
-                    logger.error(f"Rate limit persisted after {max_retries} attempts for {ticker}: {e}")
-                    raise
-        else:
-            # Should not reach here normally, but guard against it
-            raise last_exception
-
-        # Handle tool use (web search) in the response
-        response_text = ""
-        for block in message.content:
-            if block.type == "text":
-                response_text += block.text
-
-        # Extract JSON from response (handle markdown code blocks)
-        if "```json" in response_text:
-            json_start = response_text.find("```json") + 7
-            json_end = response_text.find("```", json_start)
-            response_text = response_text[json_start:json_end].strip()
-        elif "```" in response_text:
-            json_start = response_text.find("```") + 3
-            json_end = response_text.find("```", json_start)
-            response_text = response_text[json_start:json_end].strip()
-
-        analysis = json.loads(response_text)
-        analysis['ticker'] = ticker
-        analysis['mock'] = False
-
-        logger.info(f"Claude analysis for {ticker}: {json.dumps(analysis, indent=2)}")
-        return analysis
-
-    except Exception as e:
-        logger.error(f"Error calling Claude API for {ticker}: {e}")
-        return {
-            'ticker': ticker,
-            'has_active_ma': False,
-            'ma_details': None,
-            'has_crisis_event': False,
-            'crisis_details': None,
-            'news_summary': f'Error: {str(e)}',
-            'mock': False,
-            'error': str(e)
-        }
+    def judge(self, symbol, row):
+        """Return a verdict dict (has_active_ma/ma_details/has_crisis/crisis_details/
+        summary/skipped). Never raises."""
+        if not self.enabled:
+            return dict(NEUTRAL_VERDICT)
+        cap = row.get("CapMillions")
+        cap_s = f"${float(cap):.0f}M" if pd.notna(cap) else "unknown"
+        price = row.get("CurrentPrice")
+        price_s = f"${float(price):.2f}" if pd.notna(price) else "unknown"
+        user_text = (f"Ticker: {symbol}\n"
+                     f"Context: price {price_s}, market cap {cap_s}.\n"
+                     "Search recent news and return the JSON verdict.")
+        try:
+            text = _llm_call(self.client, self.system_blocks, user_text)
+            v = _parse_verdict(text)
+            verdict = {
+                "has_active_ma": bool(v.get("has_active_ma", False)),
+                "ma_details": v.get("ma_details"),
+                "has_crisis": bool(v.get("has_crisis", False)),
+                "crisis_details": v.get("crisis_details"),
+                "summary": v.get("summary", ""),
+                "skipped": False,
+            }
+            tag = []
+            if verdict["has_active_ma"]:
+                tag.append(f"M&A: {verdict['ma_details']}")
+            if verdict["has_crisis"]:
+                tag.append(f"CRISIS: {verdict['crisis_details']}")
+            logger.info(f"[{symbol}] LLM: {'; '.join(tag) if tag else 'clear'}")
+            time.sleep(LLM_SLEEP_BETWEEN)
+            return verdict
+        except Exception as e:
+            if _is_fatal_key_error(e, self.anthropic):
+                logger.warning(f"Stage 3 (LLM): key-level error ({type(e).__name__}) — disabling "
+                               f"LLM for the rest of the run (mechanical only). Detail: {e}")
+                self.enabled = False
+            else:
+                logger.error(f"[{symbol}] LLM error — treating as neutral: {e}")
+            return dict(NEUTRAL_VERDICT)
 
 
-def evaluate_ticker(ticker: str) -> Dict:
-    """
-    Main evaluation function that combines all checks.
-    Returns comprehensive evaluation dict.
-    """
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Evaluating ticker: {ticker}")
-    logger.info(f"{'='*60}")
+# ════════════════════════════════════════════════════════════════════════════════
+# Output
+# ════════════════════════════════════════════════════════════════════════════════
+def write_book(pool_df, selected_symbols, dry_run):
+    """Write the chosen symbols (rich pool schema) to _Buy_Signals.parquet."""
+    book = pool_df[pool_df["Symbol"].isin(selected_symbols)].copy()
+    # Preserve rank order
+    book["Symbol"] = pd.Categorical(book["Symbol"], categories=selected_symbols, ordered=True)
+    book = book.sort_values("Symbol").reset_index(drop=True)
+    book["Symbol"] = book["Symbol"].astype(str)
 
-    # Step 1: Get fundamentals
-    fundamentals = get_ticker_fundamentals(ticker)
-    if not fundamentals['success']:
-        logger.error(f"Failed to fetch fundamentals for {ticker}")
-        return {
-            'ticker': ticker,
-            'pass': False,
-            'reason': f"Failed to fetch data: {fundamentals.get('error', 'Unknown error')}",
-            'final_score': 10,
-            'recommendation': 'Exclude'
-        }
+    if "Status" in book.columns:
+        book["Status"] = "Pending"
+    # Null stale price-derived risk levels — broker anchors stop/target/trail to live mid.
+    for c in ("StopPrice", "TargetPrice", "ATR"):
+        if c in book.columns:
+            book[c] = pd.NA
 
-    # Step 2: Hardcoded checks (fast exit)
-    if fundamentals['price'] < MIN_PRICE:
-        logger.warning(f"{ticker} FAILED: Price ${fundamentals['price']:.2f} below ${MIN_PRICE:.2f}")
-        return {
-            'ticker': ticker,
-            'pass': False,
-            'reason': f"Price ${fundamentals['price']:.2f} below ${MIN_PRICE:.2f} (delisting risk)",
-            'final_score': 10,
-            'recommendation': 'Exclude',
-            'fundamentals': fundamentals
-        }
+    if dry_run:
+        logger.info("DRY RUN — not writing the book.")
+        return book
 
-    # Step 3: Calculate strategy fit score
-    strategy_fit = calculate_strategy_fit_score(fundamentals)
-    logger.info(f"Strategy Fit Score: {strategy_fit['normalized_score']}/10")
-
-    # Step 4: Research with Claude (M&A and crisis events) - NOW WITH WEB SEARCH
-    claude_analysis = research_ticker_with_claude(ticker, fundamentals)
-
-    # Step 5: Calculate risk adjustments
-    risk_adjustments = calculate_risk_adjustments(fundamentals, claude_analysis)
-
-    # Step 6: Calculate final score
-    final_score = strategy_fit['normalized_score'] + risk_adjustments['risk_points']
-    final_score = min(10, max(1, final_score))
-
-    # Step 7: Make decision based on rubric
-    # Exclude if Final Score >= 7 or price < $2 or active M&A or material crisis
-    should_exclude = (
-        final_score >= 7 or
-        fundamentals['price'] < MIN_PRICE or
-        claude_analysis.get('has_active_ma', False) or
-        claude_analysis.get('has_crisis_event', False)
-    )
-
-    # Conditional if score 4-6
-    is_conditional = 4 <= final_score <= 6
-
-    if should_exclude:
-        recommendation = "Exclude"
-        position_sizing = "No Position"
-    elif is_conditional:
-        recommendation = "Conditional"
-        position_sizing = "Reduced (50%)"
-    else:
-        recommendation = "Include"
-        position_sizing = "Standard"
-
-    # Build result
-    result = {
-        'ticker': ticker,
-        'pass': not should_exclude,
-        'price': fundamentals['price'],
-        'exchange': fundamentals['exchange'],
-        'avg_volume_30d': fundamentals['avg_volume_30d'],
-        'volume_tier': strategy_fit['volume_tier'],
-        'market_cap_millions': fundamentals['market_cap_millions'],
-        'cap_tier': strategy_fit['cap_tier'],
-        'has_active_ma': claude_analysis.get('has_active_ma', False),
-        'ma_details': claude_analysis.get('ma_details'),
-        'has_crisis_event': claude_analysis.get('has_crisis_event', False),
-        'crisis_details': claude_analysis.get('crisis_details'),
-        'news_summary': claude_analysis.get('news_summary'),
-        'strategy_fit_score': strategy_fit['normalized_score'],
-        'volume_score': strategy_fit['volume_score'],
-        'cap_score': strategy_fit['cap_score'],
-        'premium_bonus': strategy_fit['premium_bonus'],
-        'risk_points': risk_adjustments['risk_points'],
-        'risk_concerns': risk_adjustments['concerns'],
-        'final_score': round(final_score, 2),
-        'recommendation': recommendation,
-        'position_sizing': position_sizing,
-        'reason': '; '.join(risk_adjustments['concerns']) if risk_adjustments['concerns'] else 'Passed all checks',
-        'mock_mode': claude_analysis.get('mock', False)
-    }
-
-    # Log result
-    logger.info(f"\n--- EVALUATION RESULT for {ticker} ---")
-    logger.info(f"Price: ${result['price']:.2f} | Volume: {result['avg_volume_30d']:,} ({result['volume_tier']})")
-    logger.info(f"Market Cap: ${result['market_cap_millions']:.0f}M ({result['cap_tier']})")
-    logger.info(f"M&A: {result['has_active_ma']} | Crisis: {result['has_crisis_event']}")
-    logger.info(f"Strategy Fit: {result['strategy_fit_score']}/10 | Risk Points: {result['risk_points']}")
-    logger.info(f"FINAL SCORE: {result['final_score']}/10")
-    logger.info(f"RECOMMENDATION: {result['recommendation']} ({result['position_sizing']})")
-    if result['risk_concerns']:
-        logger.info(f"Concerns: {'; '.join(result['risk_concerns'])}")
-    logger.info(f"---")
-
-    return result
+    if os.path.exists(BOOK_FILE):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = f"_Buy_Signals_backup_{ts}.parquet"
+        try:
+            pd.read_parquet(BOOK_FILE).to_parquet(backup, index=False)
+            logger.info(f"Backed up existing book -> {backup}")
+        except Exception as e:
+            logger.warning(f"Could not back up existing book: {e}")
+    book.to_parquet(BOOK_FILE, index=False)
+    logger.info(f"Wrote {len(book)} rows to {BOOK_FILE}: {selected_symbols}")
+    return book
 
 
-# ============ MAIN EXECUTION ============
+def wait_for_research_window(no_wait=False):
+    """Sleep until RESEARCH_START_ET so the LLM sees post-open news — but only if that
+    window is a short hop away (scheduler fires ~9:28 ET). Skips the wait if already
+    past it, if it's too far off (off-hours/manual run), or if --no-wait is given."""
+    if no_wait:
+        return
+    now = datetime.now(ET)
+    target = now.replace(hour=RESEARCH_START_ET[0], minute=RESEARCH_START_ET[1],
+                         second=0, microsecond=0)
+    delta = (target - now).total_seconds()
+    if delta <= 0:
+        logger.info(f"Past the {target:%H:%M} ET research window — researching now.")
+        return
+    if delta > MAX_PREOPEN_WAIT_MIN * 60:
+        logger.info(f"Research window {target:%H:%M} ET is {delta/60:.0f} min away "
+                    f"(> {MAX_PREOPEN_WAIT_MIN} min) — not waiting (off-hours/manual run).")
+        return
+    logger.info(f"Waiting {delta/60:.1f} min until {target:%H:%M} ET so research sees "
+                f"post-open news (broker locks in at 10:00 ET). Use --no-wait to skip.")
+    time.sleep(delta)
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Main
+# ════════════════════════════════════════════════════════════════════════════════
 def main():
-    logger.info("="*70)
-    logger.info("MACRO FILTER - SIGNAL SCREENING")
-    logger.info("="*70)
+    ap = argparse.ArgumentParser(description="Signal funnel: pool -> final book (<=4).")
+    ap.add_argument("--force", action="store_true",
+                    help="Re-run even if a narrowed book already exists for the next session.")
+    ap.add_argument("--skip-llm", action="store_true",
+                    help="Skip the paid Stage 3 LLM check (mechanical funnel only).")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Report the selection but do not write _Buy_Signals.parquet.")
+    ap.add_argument("--no-wait", action="store_true",
+                    help="Skip the self-wait to the post-open research window (run LLM now).")
+    args = ap.parse_args()
 
-    if args.mock:
-        logger.warning("Running in MOCK mode - Claude API calls will be simulated")
-    if args.skip_claude:
-        logger.warning("SKIP-CLAUDE mode - Only hardcoded checks will be used (no AI research)")
-    if args.dry_run:
-        logger.warning("DRY RUN mode - signals file will NOT be modified")
+    logger.info("=" * 70)
+    logger.info("MACRO FILTER — SIGNAL FUNNEL")
+    logger.info("=" * 70)
 
-    # Check if API key is set
-    if not args.mock and not args.skip_claude and not ANTHROPIC_API_KEY:
-        logger.error("ANTHROPIC_API_KEY not found!")
-        logger.error("Please either:")
-        logger.error(f"  1. Create a file '{API_KEY_FILE}' with your API key")
-        logger.error("  2. Set ANTHROPIC_API_KEY environment variable")
-        logger.error("  3. Run with --mock or --skip-claude flag")
-        sys.exit(1)
+    next_td = _next_trading_day()
+    logger.info(f"Next trading day: {next_td}")
 
-    if ANTHROPIC_API_KEY and not args.mock and not args.skip_claude:
-        logger.info(f"API key loaded successfully (from {'file' if os.path.exists(API_KEY_FILE) else 'environment'})")
-        logger.info(f"API key: {ANTHROPIC_API_KEY[:8]}...{ANTHROPIC_API_KEY[-4:]} (masked)")
+    # ── Idempotency: skip (spend $0) if already funneled for this session ─────────
+    done, syms = already_funneled(next_td)
+    if done and not args.force:
+        logger.info(f"Book already narrowed for {next_td}: {syms}. "
+                    f"Nothing to do (use --force to re-run). Spent $0.")
+        return
+    if done and args.force:
+        logger.info(f"Existing book for {next_td} found ({syms}) — --force given, re-running.")
 
-    # Load signals
-    if not os.path.exists(SIGNALS_PATH):
-        logger.error(f"Signals file not found: {SIGNALS_PATH}")
-        sys.exit(1)
+    # ── Stage 0: load + align ────────────────────────────────────────────────────
+    if not os.path.exists(POOL_FILE):
+        logger.error(f"Pool file not found: {POOL_FILE}. Nothing to funnel.")
+        return
+    pool = pd.read_parquet(POOL_FILE)
+    if "Status" in pool.columns:
+        pool = pool[pool["Status"] == "Pending"].copy()
+    logger.info(f"Pool: {len(pool)} pending candidate(s).")
 
-    logger.info(f"Loading signals from: {SIGNALS_PATH}")
-    df_signals = pd.read_parquet(SIGNALS_PATH)
-    logger.info(f"Loaded {len(df_signals)} total signals")
-
-    # Filter to pending signals only
-    pending_signals = df_signals[df_signals['Status'] == 'Pending'].copy()
-    logger.info(f"Found {len(pending_signals)} pending signals")
-
-    if len(pending_signals) == 0:
-        logger.info("No pending signals to filter. Exiting.")
+    if "TargetDate" in pool.columns:
+        td = pd.to_datetime(pool["TargetDate"], errors="coerce").dt.date
+        day = pool[td == next_td].copy()
+        if day.empty:
+            logger.warning(f"No pool rows dated {next_td}; falling back to all pending rows.")
+            day = pool.copy()
+        pool = day
+    if pool.empty:
+        logger.info("No candidates to funnel. Exiting.")
         return
 
-    # Calculate next trading day (skip weekends)
-    today = datetime.now().date()
-    next_trading_day = today + timedelta(days=1)
+    quarantine = load_quarantine()
+    price_cache = {s: load_price_history(s) for s in pool["Symbol"].unique()}
 
-    # Skip Saturday (5) and Sunday (6)
-    while next_trading_day.weekday() >= 5:
-        next_trading_day += timedelta(days=1)
-
-    logger.info(f"Today: {today} | Next trading day: {next_trading_day}")
-
-    # Filter to signals with TargetDate matching next trading day
-    pending_signals['TargetDate'] = pd.to_datetime(pending_signals['TargetDate']).dt.date
-    next_day_signals = pending_signals[pending_signals['TargetDate'] == next_trading_day].copy()
-
-    logger.info(f"Signals for next trading day ({next_trading_day}): {len(next_day_signals)}")
-    logger.info(f"Signals with other dates (skipped): {len(pending_signals) - len(next_day_signals)}")
-
-    if len(next_day_signals) == 0:
-        logger.info(f"No signals for next trading day ({next_trading_day}). Exiting.")
+    # ── Stages 1 & 2 ─────────────────────────────────────────────────────────────
+    survivors = []   # list of dicts: symbol, row, up_prob, soft
+    for _, row in pool.iterrows():
+        sym = str(row["Symbol"])
+        pdf = price_cache.get(sym)
+        excluded, reasons = hard_exclude(sym, row, pdf, quarantine)
+        if excluded:
+            logger.info(f"[{sym}] EXCLUDED (hard): {'; '.join(reasons)}")
+            continue
+        flags = soft_flags(sym, pdf)
+        if flags:
+            logger.info(f"[{sym}] soft-flag: {'; '.join(flags)}")
+        survivors.append({
+            "symbol": sym, "row": row.to_dict(),
+            "up_prob": float(row.get("UpProbability", 0.0) or 0.0),
+            "soft": flags,
+        })
+    logger.info(f"After mechanical screens: {len(survivors)} survivor(s).")
+    if not survivors:
+        logger.warning("No survivors after mechanical screens — leaving the existing book "
+                       "UNTOUCHED (refusing to write an empty book). Investigate the pool or "
+                       "thresholds; the broker will trade whatever the current book holds.")
         return
 
-    # Get unique tickers from next trading day signals
-    tickers = next_day_signals['Symbol'].unique().tolist()
-    logger.info(f"Unique tickers to evaluate for {next_trading_day}: {tickers}")
+    # ── Stage 4 priority order, computed BEFORE the LLM so we only research names
+    #    that can actually make the book: clean by UpProb, then soft-flagged by UpProb.
+    clean = sorted([s for s in survivors if not s["soft"]], key=lambda x: x["up_prob"], reverse=True)
+    flagged = sorted([s for s in survivors if s["soft"]], key=lambda x: x["up_prob"], reverse=True)
+    ordered = clean + flagged
 
-    # Load cache for resume support
-    date_key = str(next_trading_day)
-    date_cache = load_run_cache().get(date_key, {"completed": {}, "errored": []})
-
-    if args.resume:
-        completed_set = set(date_cache.get("completed", {}).keys())
-        errored_set = set(date_cache.get("errored", []))
-        results = list(date_cache.get("completed", {}).values())
-        logger.info(
-            f"Resume mode active for {date_key}: "
-            f"{len(completed_set)} completed (skipping), "
-            f"{len(errored_set)} errored (retrying): {sorted(errored_set)}"
-        )
-    else:
-        completed_set = set()
-        results = []
-
-    # Determine which tickers still need processing
-    tickers_to_run = [t for t in tickers if t not in completed_set]
-    logger.info(f"Tickers to process: {tickers_to_run}")
-
-    # Evaluate each ticker
-    for i, ticker in enumerate(tickers_to_run):
-        result = evaluate_ticker(ticker)
-        results.append(result)
-
-        # Detect whether the Claude API call errored (result carries an 'error' field
-        # if research_ticker_with_claude returned an error dict)
-        claude_had_error = result.get('news_summary', '').startswith('Error:')
-        cache_status = "errored" if claude_had_error else "completed"
-        save_ticker_to_cache(date_key, ticker, result, status=cache_status)
-
-        if claude_had_error:
-            logger.warning(
-                f"Ticker {ticker} saved as ERRORED in cache — run with --resume to retry it."
-            )
-
-        # Rate limiting between tickers only (skip after the last one)
-        is_last = (i == len(tickers_to_run) - 1)
-        if not args.mock and not args.skip_claude and not is_last:
-            logger.info(f"Rate limiting: waiting 60 seconds before next ticker...")
-            time.sleep(60)
-
-    # Save results to JSON
-    logger.info(f"\nSaving filter results to: {FILTER_RESULTS_PATH}")
-    os.makedirs(os.path.dirname(FILTER_RESULTS_PATH), exist_ok=True)
-    with open(FILTER_RESULTS_PATH, 'w') as f:
-        json.dump(results, f, indent=2)
-
-    # Summary
-    passed = [r for r in results if r['pass']]
-    failed = [r for r in results if not r['pass']]
-
-    logger.info("\n" + "="*70)
-    logger.info("FILTER SUMMARY")
-    logger.info("="*70)
-    logger.info(f"Total evaluated: {len(results)}")
-    logger.info(f"Passed: {len(passed)}")
-    logger.info(f"Failed: {len(failed)}")
-
-    if failed:
-        logger.info("\nFailed tickers:")
-        for r in failed:
-            logger.info(f"  {r['ticker']}: {r['reason']} (Score: {r['final_score']}/10)")
-
-    if passed:
-        logger.info("\nPassed tickers:")
-        for r in passed:
-            logger.info(f"  {r['ticker']}: {r['recommendation']} - {r['position_sizing']} (Score: {r['final_score']}/10)")
-
-    # Update signals file (remove failed tickers)
-    if not args.dry_run:
-        failed_tickers = [r['ticker'] for r in failed]
-        if failed_tickers:
-            logger.info(f"\nRemoving {len(failed_tickers)} failed tickers from signals file...")
-
-            # Remove rows where Symbol is in failed_tickers and Status is Pending
-            original_count = len(df_signals)
-            df_signals = df_signals[~((df_signals['Symbol'].isin(failed_tickers)) & (df_signals['Status'] == 'Pending'))]
-            removed_count = original_count - len(df_signals)
-
-            # Save updated signals
-            df_signals.to_parquet(SIGNALS_PATH, index=False)
-            logger.info(f"Removed {removed_count} rows from signals file")
-            logger.info(f"Signals file updated: {SIGNALS_PATH}")
+    # ── Stage 3: web-search top-down ONLY until the book is full (bounds cost + time;
+    #    must finish before the broker locks in at 10:00 ET). Confirmed active-M&A /
+    #    crisis is dropped and we research the next-ranked name instead.
+    judge = LLMJudge(skip=args.skip_llm)
+    if judge.enabled:
+        wait_for_research_window(args.no_wait)   # hold for post-open news before web-searching
+    chosen = []   # list of (survivor-dict, verdict, was_checked)
+    checks = 0
+    for cand in ordered:
+        if len(chosen) >= TARGET_BOOK_SIZE:
+            break
+        if judge.enabled and checks < LLM_MAX_CHECKS:
+            verdict = judge.judge(cand["symbol"], cand["row"])
+            checks += 1
+            checked = not verdict.get("skipped", True)
+            if verdict["has_active_ma"] or verdict["has_crisis"]:
+                why = verdict["ma_details"] if verdict["has_active_ma"] else verdict["crisis_details"]
+                logger.info(f"[{cand['symbol']}] DROPPED (LLM): {why}")
+                continue
         else:
-            logger.info("\nNo tickers to remove - all passed!")
-    else:
-        logger.info("\nDRY RUN - signals file NOT modified")
+            verdict, checked = dict(NEUTRAL_VERDICT), False
+        chosen.append((cand, verdict, checked))
 
-    logger.info("\n" + "="*70)
-    logger.info("MACRO FILTER COMPLETE")
-    logger.info("="*70)
+    selected = [c["symbol"] for c, _, _ in chosen]
+    if not selected:
+        logger.warning("Nothing survived to selection — leaving the existing book UNTOUCHED "
+                       "(refusing to write an empty book).")
+        return
 
+    logger.info("─" * 70)
+    logger.info(f"SELECTED ({len(selected)}/{TARGET_BOOK_SIZE}): {selected}  [{checks} LLM check(s)]")
+    for rank, (c, v, checked) in enumerate(chosen, 1):
+        bits = ["clean" if not c["soft"] else f"soft-relaxed: {'; '.join(c['soft'])}",
+                "LLM-cleared" if checked else "LLM-unchecked"]
+        logger.info(f"  {rank}. {c['symbol']:6s} UpProb={c['up_prob']:.3f}  [{'; '.join(bits)}]")
+    if len(selected) < TARGET_BOOK_SIZE:
+        logger.info(f"  (thin day — only {len(selected)} qualified; "
+                    f"{TARGET_BOOK_SIZE - len(selected)} slot(s) left empty)")
+    logger.info("─" * 70)
+
+    write_book(pool, selected, args.dry_run)
+    logger.info("FUNNEL COMPLETE")
 
 
 if __name__ == "__main__":
@@ -666,5 +606,3 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
-

@@ -247,6 +247,440 @@ def rolling_hurst_exponent(series, window_size):
     return series_clean.rolling(window=window_size).apply(hurst_window, raw=True)
 
 
+# ── GP-discovered cross-sectional alpha features ──────────────────────────────
+# compute_gp_input_features() runs inside indicators() (per-ticker, time-series).
+# add_gp_cross_sectional_features() runs after the parallel loop (cross-ticker).
+
+from scipy.stats import rankdata as _gp_rankdata
+
+GP_REQUIRED_COLS = [
+    'Return', 'High_Low', 'High_Close', 'Low_Close',
+    'time_reversal_asymmetry', 'time_between_extremes', 'volume_entropy',
+    'information_rate_of_change',
+    'emd_features_IMF_1_Energy', 'emd_features_IMF_1_Std',
+    'emd_features_IMF_2_Energy', 'emd_features_IMF_2_Std',
+    'entropy', 'noise_WhiteNoise', 'noise_PinkNoise',
+    'higuchi_fractal_dimension', 'lyapunov_exponent', 'dfa_alpha',
+    'spectral_entropy', 'autocorrelation', 'hurst_exponent',
+    'higher_order_moments_Skewness', 'higher_order_moments_Kurtosis',
+]
+
+def _gp_cs_rank(arr):
+    r = _gp_rankdata(arr, method='average')
+    return r / (len(arr) + 1) * 2.0 - 1.0
+
+def _gp_conditional(x, y):
+    return np.where(x > 0, y, -y)
+
+def _gp_safe_div(x, y):
+    safe_y = np.where(np.abs(y) > 1e-10, y, 1.0)
+    return np.where(np.abs(y) > 1e-10, x / safe_y, 0.0)
+
+def _gp_safe_sqrt(x):
+    return np.sqrt(np.abs(x))
+
+def _gp_apply_cs_rank(signal, groups):
+    out = np.zeros_like(signal, dtype=np.float64)
+    for idx in groups:
+        s = signal[idx]
+        mask = np.isfinite(s)
+        if mask.sum() >= 2:
+            tmp = np.zeros(len(s))
+            tmp[mask] = _gp_cs_rank(s[mask])
+            out[idx] = tmp
+    return out
+
+def _gp_apply_cs_zscore(signal, groups):
+    out = np.zeros_like(signal, dtype=np.float64)
+    for idx in groups:
+        s = signal[idx]
+        mu = np.nanmean(s)
+        sigma = np.nanstd(s)
+        out[idx] = (s - mu) / (sigma + 1e-10)
+    return out
+
+
+def compute_gp_input_features(df, window=60):
+    """
+    Compute per-ticker rolling inputs (GP_REQUIRED_COLS) for the cross-sectional
+    GP feature pass. Called inside indicators() on each single-ticker DataFrame.
+    All new columns are batched into a dict and joined once via pd.concat to avoid
+    the PerformanceWarning that results from repeated in-place column insertion.
+    """
+    close  = df['Close']
+    high   = df['High']
+    low    = df['Low']
+    volume = df['Volume']
+    prev_c = close.shift(1)
+    ret    = close.pct_change().fillna(0)
+    min_p  = max(window // 2, 10)
+
+    new_cols = {}
+
+    new_cols['Return']     = ret
+    new_cols['High_Low']   = (high - low) / (close + 1e-10)
+    new_cols['High_Close'] = (high - prev_c) / (prev_c + 1e-10)
+    new_cols['Low_Close']  = (low  - prev_c) / (prev_c + 1e-10)
+
+    # time_reversal_asymmetry: mean((x_t^2 * x_{t-1}) - (x_{t-1}^2 * x_t))
+    new_cols['time_reversal_asymmetry'] = (
+        ret ** 2 * ret.shift(1) - ret.shift(1) ** 2 * ret
+    ).rolling(window, min_periods=min_p).mean()
+
+    # time_between_extremes: (argmax - argmin) / window, in (-1, 1)
+    def _tbe(x):
+        return (np.argmax(x) - np.argmin(x)) / max(len(x) - 1, 1)
+    new_cols['time_between_extremes'] = close.rolling(window, min_periods=min_p).apply(_tbe, raw=True)
+
+    # volume_entropy: normalized Shannon entropy of volume within window
+    def _vol_ent(x):
+        x = x[x > 0]
+        if len(x) < 4:
+            return 0.0
+        p = x / x.sum()
+        return float(-np.sum(p * np.log(p + 1e-10)))
+    new_cols['volume_entropy'] = volume.rolling(window, min_periods=min_p).apply(_vol_ent, raw=True)
+
+    # information_rate_of_change: mean absolute first difference of returns
+    new_cols['information_rate_of_change'] = ret.diff().abs().rolling(window, min_periods=min_p).mean()
+
+    # EMD approximations: IMF1 = close - fast_ma (high-freq), IMF2 = fast_ma - slow_ma (mid-freq)
+    fast_ma = close.rolling(5, min_periods=2).mean()
+    slow_ma = close.rolling(20, min_periods=5).mean()
+    imf1 = close - fast_ma
+    imf2 = fast_ma - slow_ma
+    new_cols['emd_features_IMF_1_Energy'] = (imf1 ** 2).rolling(window, min_periods=min_p).mean()
+    new_cols['emd_features_IMF_1_Std']    = imf1.rolling(window, min_periods=min_p).std()
+    new_cols['emd_features_IMF_2_Energy'] = (imf2 ** 2).rolling(window, min_periods=min_p).mean()
+    new_cols['emd_features_IMF_2_Std']    = imf2.rolling(window, min_periods=min_p).std()
+
+    # entropy: Shannon entropy over 10 equal-width return buckets
+    def _ent(x):
+        counts, _ = np.histogram(x, bins=10)
+        p = counts / (counts.sum() + 1e-10)
+        p = p[p > 0]
+        return float(-np.sum(p * np.log(p)))
+    new_cols['entropy'] = ret.rolling(window, min_periods=min_p).apply(_ent, raw=True)
+
+    # noise_WhiteNoise / noise_PinkNoise: proximity to spectral slope 0 or -1
+    def _spectral_slope(x):
+        if len(x) < 8:
+            return 0.0
+        vals = np.abs(np.fft.rfft(x - x.mean()))
+        freqs = np.fft.rfftfreq(len(x))[1:]
+        vals = vals[1:]
+        if len(freqs) < 2:
+            return 0.0
+        slope, _ = np.polyfit(np.log(freqs + 1e-10), np.log(vals + 1e-10), 1)
+        return float(slope)
+    slopes = ret.rolling(window, min_periods=min_p).apply(_spectral_slope, raw=True)
+    new_cols['noise_WhiteNoise'] = np.exp(-(slopes ** 2) / 0.5)
+    new_cols['noise_PinkNoise']  = np.exp(-((slopes + 1.0) ** 2) / 0.5)
+
+    # higuchi_fractal_dimension
+    def _higuchi(x, kmax=6):
+        n = len(x)
+        if n < kmax * 2:
+            return 1.5
+        lm = []
+        for k in range(1, kmax + 1):
+            lk = 0.0
+            for m in range(1, k + 1):
+                idxs = np.arange(m - 1, n, k)
+                if len(idxs) < 2:
+                    continue
+                lmk = np.sum(np.abs(np.diff(x[idxs]))) * (n - 1) / (k * (len(idxs) - 1))
+                lk += lmk
+            lm.append(lk / k)
+        if len(lm) < 2:
+            return 1.5
+        slope, _ = np.polyfit(np.log(range(1, len(lm) + 1)), np.log(np.array(lm) + 1e-10), 1)
+        return float(slope)
+    new_cols['higuchi_fractal_dimension'] = close.rolling(window, min_periods=min_p).apply(
+        _higuchi, raw=True
+    )
+
+    # lyapunov_exponent: mean log of absolute price differences
+    def _lyap(x):
+        d = np.abs(np.diff(x))
+        d = d[d > 1e-10]
+        return float(np.mean(np.log(d))) if len(d) > 0 else 0.0
+    new_cols['lyapunov_exponent'] = close.rolling(window, min_periods=min_p).apply(_lyap, raw=True)
+
+    # dfa_alpha: detrended fluctuation analysis scaling exponent
+    def _dfa(x):
+        n = len(x)
+        if n < 16:
+            return 0.5
+        y = np.cumsum(x - np.mean(x))
+        max_scale = max(4, n // 4)
+        scales = np.unique(np.round(np.logspace(1, np.log10(max_scale), 6)).astype(int))
+        scales = scales[scales >= 4]
+        flucts = []
+        for s in scales:
+            n_segs = n // s
+            if n_segs < 1:
+                continue
+            f2 = 0.0
+            for i in range(n_segs):
+                seg = y[i * s:(i + 1) * s]
+                t = np.arange(len(seg), dtype=float)
+                p = np.polyfit(t, seg, 1)
+                f2 += np.mean((seg - np.polyval(p, t)) ** 2)
+            flucts.append(np.sqrt(f2 / n_segs))
+        if len(flucts) < 2:
+            return 0.5
+        valid = [(scales[i], flucts[i]) for i in range(len(flucts)) if flucts[i] > 0]
+        if len(valid) < 2:
+            return 0.5
+        ls, lf = zip(*valid)
+        alpha, _ = np.polyfit(np.log(ls), np.log(lf), 1)
+        return float(np.clip(alpha, -1, 3))
+    new_cols['dfa_alpha'] = ret.rolling(window, min_periods=min_p).apply(_dfa, raw=True)
+
+    # spectral_entropy: FFT power-spectrum entropy of returns
+    def _spec_ent(x):
+        if len(x) < 8:
+            return 0.0
+        ps = np.abs(np.fft.rfft(x - x.mean())) ** 2
+        ps = ps / (ps.sum() + 1e-10)
+        return float(-np.sum(ps * np.log(ps + 1e-10)))
+    new_cols['spectral_entropy'] = ret.rolling(window, min_periods=min_p).apply(_spec_ent, raw=True)
+
+    # autocorrelation: lag-1 autocorrelation of returns
+    def _ac1(x):
+        if len(x) < 3:
+            return 0.0
+        cc = np.corrcoef(x[:-1], x[1:])
+        return float(cc[0, 1]) if np.isfinite(cc[0, 1]) else 0.0
+    new_cols['autocorrelation'] = ret.rolling(window, min_periods=min_p).apply(_ac1, raw=True)
+
+    # hurst_exponent: reuse existing rolling implementation
+    new_cols['hurst_exponent'] = rolling_hurst_exponent(close, window_size=window)
+
+    new_cols['higher_order_moments_Skewness'] = ret.rolling(window, min_periods=min_p).skew()
+    new_cols['higher_order_moments_Kurtosis'] = ret.rolling(window, min_periods=min_p).kurt()
+
+    # Single concat — avoids the PerformanceWarning from repeated in-place insertion
+    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+
+def compute_gp_features(df, date_col='Date'):
+    """
+    Compute GP-discovered cross-sectional alpha features.
+
+    Operates on a panel DataFrame (multiple tickers stacked with a date column).
+    All expressions rank within each date cross-sectionally.
+
+    Returns DataFrame with columns:
+        F1_PinkNoise, F3_Return_Rev, F4_Price_Ratio,
+        N1_WN_LC, N4_SpectralEnt, composite
+    """
+    missing = [c for c in GP_REQUIRED_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"GP features: missing columns {missing}")
+    if date_col not in df.columns:
+        raise ValueError(f"GP features: date_col '{date_col}' not found")
+
+    df = df.copy().reset_index(drop=True)
+
+    groups = [
+        grp.index.to_numpy()
+        for _, grp in df.groupby(date_col, sort=False)
+    ]
+
+    # Cross-sectionally rank all 23 inputs within each date → x[0..22]
+    x = {}
+    for i, col in enumerate(GP_REQUIRED_COLS):
+        raw = np.nan_to_num(df[col].values.astype(np.float64), nan=0.0)
+        x[i] = _gp_apply_cs_rank(raw, groups)
+
+    # F1 — seed 1017: x14 + 0.993 * x3  (PinkNoise + Low_Close)
+    # conditional(|1.77| + x19, ...) always takes positive branch since 1.77 + x19 > 0
+    f1_raw = x[14] - _gp_conditional(
+        np.abs(1.77026646253569) + x[19],
+        -0.9931974192883872 * x[3]
+    )
+
+    # F3 — seed 1004: -0.073 * x0  (return reversal)
+    f3_raw = -0.07320318705361156 * x[0]
+
+    # F4 — seed 1002: (|0.177| + x2) / (x3 + (x7 + 2.694²) + x8)
+    f4_raw = _gp_safe_div(
+        np.abs(0.17726009244632013) + x[2],
+        x[3] + (x[7] + 2.6940490745579684 ** 2) + x[8]
+    )
+
+    # N1 — seed 3003: x13 + x3  (WhiteNoise + Low_Close)
+    n1_raw = x[13] + x[3]
+
+    # N4 — seed 3029: sqrt(|x3| * ((-1.710 + x18 + x0) / 4.978))
+    _denom_n4 = np.abs(-1.2577672553937247 * 3.959124395312415)
+    n4_raw = _gp_safe_sqrt(
+        np.abs(x[3]) * _gp_safe_div(-1.7102360477772514 + x[18] + x[0], _denom_n4)
+    )
+
+    # Per-feature cross-sectional transforms
+    F1 = _gp_apply_cs_rank(f1_raw, groups)
+    F3 = _gp_apply_cs_rank(f3_raw, groups)
+    F4 = _gp_apply_cs_zscore(f4_raw, groups)
+    N1 = _gp_apply_cs_rank(n1_raw, groups)
+    N4 = _gp_apply_cs_rank(n4_raw, groups)
+
+    def _safe(a):
+        return np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
+    F1, F3, F4, N1, N4 = _safe(F1), _safe(F3), _safe(F4), _safe(N1), _safe(N4)
+
+    # ridge_interactions composite (test IC=+0.0591, WF IC=+0.0523, IR=6.74)
+    # Dominant nonlinear term: F3*N4 (+2.39) — return reversal × spectral entropy
+    composite = (
+        -0.034224 * F1 + 1.296387 * F3 + 0.004473 * F4
+        + 0.012287 * N1 + 0.009157 * N4
+        - 0.274113 * F1 * F3 + 0.085361 * F1 * F4
+        + 0.021151 * F1 * N1 - 0.181167 * F1 * N4
+        - 1.295755 * F3 * F4 + 0.355264 * F3 * N1
+        + 2.387638 * F3 * N4 - 0.044057 * F4 * N1
+        - 0.000961 * F4 * N4 + 0.048930 * N1 * N4
+        + 0.002355
+    )
+
+    return pd.DataFrame({
+        'F1_PinkNoise':   F1,
+        'F3_Return_Rev':  F3,
+        'F4_Price_Ratio': F4,
+        'N1_WN_LC':       N1,
+        'N4_SpectralEnt': N4,
+        'composite':      _safe(composite),
+    }, index=df.index)
+
+
+def add_gp_cross_sectional_features(output_dir):
+    """
+    Post-processing cross-sectional pass.
+    Loads all per-ticker processed parquet files, computes GP features
+    (F1_PinkNoise … composite) cross-sectionally per date, and saves back.
+    Called once in process_data_files() after the parallel processing loop.
+
+    Uses pyarrow + ThreadPoolExecutor for both load and save (matches the
+    fast-load pattern in 4__Predictor.py — ~10s for 4000 files on NVMe).
+    Verbose: prints progress and timing for each phase.
+    """
+    import pyarrow.parquet as pq
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    print("\n" + "=" * 70)
+    print("GP CROSS-SECTIONAL PASS")
+    print("=" * 70)
+
+    files = [
+        os.path.join(output_dir, f)
+        for f in os.listdir(output_dir)
+        if f.endswith('.parquet')
+    ]
+    if not files:
+        print("  no processed parquet files found, skipping")
+        return
+
+    # ---- Phase 1: parallel load via pyarrow + ThreadPool ----
+    print(f"\n[1/4] Loading {len(files):,} parquet files (16 threads)...")
+    t0 = time.time()
+    dfs = []
+    n_fail = 0
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        future_to_fp = {ex.submit(pq.read_table, fp): fp for fp in files}
+        with tqdm(total=len(files), desc="  loading", unit="file") as pbar:
+            for fut in as_completed(future_to_fp):
+                fp = future_to_fp[fut]
+                try:
+                    tmp = fut.result().to_pandas()
+                    tmp['_gp_src'] = fp
+                    dfs.append(tmp)
+                except Exception as e:
+                    n_fail += 1
+                    if n_fail <= 5:
+                        print(f"    load fail {os.path.basename(fp)}: {e}")
+                pbar.update(1)
+    print(f"  loaded {len(dfs):,} files in {time.time()-t0:.1f}s "
+          f"({len(dfs)/(time.time()-t0):.0f} files/s, {n_fail} failed)")
+
+    if not dfs:
+        print("  no files loaded successfully, skipping")
+        return
+
+    # ---- Phase 2: concat ----
+    print(f"\n[2/4] Concatenating {len(dfs):,} frames...")
+    t0 = time.time()
+    combined = pd.concat(dfs, ignore_index=True)
+    del dfs  # free memory before the big compute
+    mem_gb = combined.memory_usage(deep=True).sum() / 1e9
+    print(f"  combined: {len(combined):,} rows × {len(combined.columns)} cols, "
+          f"{mem_gb:.2f} GB ({time.time()-t0:.1f}s)")
+
+    missing = [c for c in GP_REQUIRED_COLS if c not in combined.columns]
+    if missing:
+        print(f"  MISSING REQUIRED COLUMNS, skipping: {missing}")
+        return
+
+    # ---- Phase 3: compute GP cross-sectional features ----
+    print(f"\n[3/4] Computing GP cross-sectional features "
+          f"(F1-N4 + composite)...")
+    t0 = time.time()
+    try:
+        gp_feats = compute_gp_features(combined, date_col='Date')
+    except Exception as e:
+        import traceback
+        print(f"  GP FEATURE COMPUTE FAILED: {e}")
+        traceback.print_exc()
+        return
+    gp_cols = list(gp_feats.columns)
+    for col in gp_cols:
+        combined[col] = gp_feats[col].values
+    del gp_feats
+    print(f"  added {len(gp_cols)} columns in {time.time()-t0:.1f}s: {gp_cols}")
+
+    # ---- Phase 4: parallel write back ----
+    print(f"\n[4/4] Writing back {len(files):,} parquet files (16 threads)...")
+    t0 = time.time()
+
+    # Pre-split combined by source file. groupby on the _gp_src column is one
+    # vectorized pass — far cheaper than per-file boolean masking in a loop.
+    print("  splitting combined by source file...")
+    grouped = {fp: g.drop(columns=['_gp_src']).reset_index(drop=True)
+               for fp, g in combined.groupby('_gp_src', sort=False)}
+    print(f"  split into {len(grouped):,} subsets in {time.time()-t0:.1f}s")
+
+    def _write_one(item):
+        fp, subset = item
+        try:
+            subset.to_parquet(fp, index=False)
+            return True, fp, None
+        except Exception as e:
+            return False, fp, str(e)
+
+    t1 = time.time()
+    n_ok = n_bad = 0
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        futures = [ex.submit(_write_one, item) for item in grouped.items()]
+        with tqdm(total=len(futures), desc="  writing", unit="file") as pbar:
+            for fut in as_completed(futures):
+                ok, fp, err = fut.result()
+                if ok:
+                    n_ok += 1
+                else:
+                    n_bad += 1
+                    if n_bad <= 5:
+                        print(f"    save fail {os.path.basename(fp)}: {err}")
+                pbar.update(1)
+    print(f"  wrote {n_ok:,} files in {time.time()-t1:.1f}s "
+          f"({n_ok/(time.time()-t1):.0f} files/s, {n_bad} failed)")
+
+    print(f"\nGP cross-sectional pass complete: {gp_cols}")
+    print("=" * 70 + "\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def fetch_index(symbol, start_date=None, end_date=None, cache_dir='Data/Indexes'):
 
@@ -1556,7 +1990,7 @@ def add_volatility_regime_signals(df, base_column, vol_window=20, regime_window=
     
     df[f'{base_column}_HighVolatilityRegime'] = (rolling_vol > vol_threshold_high).astype(int)
     df[f'{base_column}_LowVolatilityRegime'] = (rolling_vol < vol_threshold_low).astype(int)
-    
+
     return df
 
 def add_signal_persistence_features(df, base_column, window=20, epsilon=1e-6):
@@ -2626,10 +3060,10 @@ def calculate_liquidity_features(df):
     volume_burst_threshold = vol_10d_avg * 3
     recent_volumes = current_volume.rolling(5, min_periods=3)
     features['sustained_volume_burst_count'] = recent_volumes.apply(
-        lambda x: (x > volume_burst_threshold.iloc[x.index[-1]]).sum() if len(x) > 0 else 0, 
+        lambda x: (x > volume_burst_threshold.iloc[x.index[-1]]).sum() if len(x) > 0 else 0,
         raw=False
     )
-    
+
     return features
 
 
@@ -2673,7 +3107,7 @@ def calculate_volatility_atr_features(df):
     # ATR regime classification
     features['atr_regime_low'] = (features['atr_percentile_rank'] <= 25).astype(float)
     features['atr_regime_high'] = (features['atr_percentile_rank'] >= 75).astype(float)
-    
+
     return features
 
 
@@ -2687,7 +3121,7 @@ def calculate_price_momentum_features(df):
     for period in [3, 5, 10, 20]:
         features[f'return_{period}d'] = close.pct_change(period)
         features[f'return_{period}d_abs'] = np.abs(features[f'return_{period}d'])
-    
+
     # Momentum strength indicators
     features['momentum_strength_5d'] = np.where(features['return_5d'] > 0.005, 1.0, 0.0)
     features['momentum_strength_continuous'] = np.tanh(features['return_5d'] * 100)  # Continuous version
@@ -2798,10 +3232,10 @@ def calculate_price_action_features(df):
         np.abs(features['open_close_ratio']) < 0.001, 1.0, 0.0
     )
     features['hammer_pattern'] = np.where(
-        (features['low_close_ratio'] > features['high_close_ratio'] * 2) & 
+        (features['low_close_ratio'] > features['high_close_ratio'] * 2) &
         (features['open_close_ratio'] > 0), 1.0, 0.0
     )
-    
+
     return features
 
 
@@ -2829,7 +3263,7 @@ def calculate_volatility_cv_features(df):
         # CV regime classification
         features[f'cv_{window}d_regime_high'] = (features[f'cv_{window}d_percentile'] >= 80).astype(float)
         features[f'cv_{window}d_regime_low'] = (features[f'cv_{window}d_percentile'] <= 20).astype(float)
-    
+
     return features
 
 
@@ -3013,13 +3447,134 @@ def forward_fill(df):
     return df
 
 
+# Matrix-power indicators
+# 14 mp_* features specified by Data/matrix_power_spec.json. Each builds a DxD
+# matrix M[t] from sign-weighted, panel-normalized OHLCV primitives over a
+# rolling window, applies a variant (raw/sym/skew), computes expm(M[t]) via
+# scaling-and-squaring + Taylor expansion, and extracts a scalar
+# (trace, Frobenius norm, or top-left element).
+#
+# Output column names are `mp_<spec_name>` where <spec_name> matches the
+# `name` field in the JSON spec, e.g. `mp_d4_b65_sym_frob`.
+#
+# Sanity-check IC reproduction with analysis_output/_validate_matrix_power_full.py.
+import json as _mp_json
+
+_MP_SPEC_PATH = "Data/matrix_power_spec.json"
+_MP_SPEC_CACHE = None
 
 
+def _mp_load_spec():
+    global _MP_SPEC_CACHE
+    if _MP_SPEC_CACHE is None:
+        with open(_MP_SPEC_PATH, "r") as _f:
+            _MP_SPEC_CACHE = _mp_json.load(_f)
+    return _MP_SPEC_CACHE
+
+
+def _mp_compute_primitives(df, window):
+    """14 causal OHLCV primitives. Returns ndarray (N, 14) in spec order."""
+    O = df["Open"].astype(np.float64)
+    H = df["High"].astype(np.float64)
+    L = df["Low"].astype(np.float64)
+    C = df["Close"].astype(np.float64)
+    V = df["Volume"].astype(np.float64)
+    log_ret = np.log(C).diff()
+    log_vol = np.log(V.replace(0, np.nan)).diff()
+    range_pct = (H - L) / C
+    body_pct = (C - O) / C
+    upper_wick = (H - np.maximum(O, C)) / C
+    lower_wick = (np.minimum(O, C) - L) / C
+    rv = log_ret.rolling(window).std()
+    z_close = (C - C.rolling(window).mean()) / (C.rolling(window).std() + 1e-9)
+    z_vol = (V - V.rolling(window).mean()) / (V.rolling(window).std() + 1e-9)
+    skew_p = log_ret.rolling(window).skew()
+    kurt_p = log_ret.rolling(window).kurt()
+    mom5 = np.log(C / C.shift(5))
+    mom20 = np.log(C / C.shift(window))
+    sign_last = np.sign(log_ret)
+    # Column order MUST match spec['primitive_names'].
+    return np.column_stack([
+        log_ret.to_numpy(), log_vol.to_numpy(),
+        range_pct.to_numpy(), body_pct.to_numpy(),
+        upper_wick.to_numpy(), lower_wick.to_numpy(),
+        rv.to_numpy(), z_close.to_numpy(), z_vol.to_numpy(),
+        skew_p.to_numpy(), kurt_p.to_numpy(),
+        mom5.to_numpy(), mom20.to_numpy(),
+        sign_last.to_numpy(),
+    ])
+
+
+def _mp_expm_batch(M_batch, K=16):
+    """Batched matrix exponential. M_batch: (N, D, D). Returns (N, D, D)."""
+    N, D, _ = M_batch.shape
+    norms = np.linalg.norm(M_batch, ord="fro", axis=(1, 2))
+    nmax = float(norms.max()) if norms.size else 0.0
+    s = max(0, int(np.ceil(np.log2(max(nmax, 1e-9)))))
+    scale = 2.0 ** s
+    M_s = M_batch / scale
+    I = np.broadcast_to(np.eye(D, dtype=M_batch.dtype), (N, D, D)).copy()
+    result = I.copy()
+    term = I.copy()
+    for k in range(1, K + 1):
+        term = (term @ M_s) / k
+        result = result + term
+    for _ in range(s):
+        result = result @ result
+    return result
+
+
+def add_matrix_power_features(df):
+    """Append 14 mp_* features to df. Rows before the rolling window are NaN."""
+    spec = _mp_load_spec()
+    window = spec["window"]
+    scales = np.asarray(spec["primitive_scales"], dtype=np.float64)
+    scales = np.where(scales > 0, scales, 1.0)
+
+    prim_arr = _mp_compute_primitives(df, window)  # (N, 14)
+    # Rows where any primitive is non-finite must produce NaN output, otherwise
+    # the zero-replaced values below would yield expm(0) = I — bogus signal.
+    nan_mask = ~np.isfinite(prim_arr).all(axis=1)
+    # Panel-normalize and bound entries to [-1, 1] via tanh (matches EDA).
+    prim_norm = np.tanh(prim_arr / scales)
+    prim_norm = np.nan_to_num(prim_norm, nan=0.0, posinf=0.0, neginf=0.0)
+
+    N = prim_norm.shape[0]
+    for feat in spec["features"]:
+        D = int(feat["d"])
+        idx_mat = np.asarray(feat["idx_matrix"], dtype=np.int64)
+        sgn_mat = np.asarray(feat["sign_matrix"], dtype=np.float64)
+        # M[t, i, j] = sgn_mat[i, j] * prim_norm[t, idx_mat[i, j]]
+        M_all = sgn_mat[None, :, :] * prim_norm[:, idx_mat]
+        variant = feat["variant"]
+        if variant == "sym":
+            M_all = 0.5 * (M_all + M_all.transpose(0, 2, 1))
+        elif variant == "skew":
+            M_all = 0.5 * (M_all - M_all.transpose(0, 2, 1))
+        elif variant != "raw":
+            raise ValueError(f"Unknown matrix-power variant: {variant!r}")
+        try:
+            E_all = _mp_expm_batch(M_all)
+        except Exception:
+            E_all = np.broadcast_to(np.eye(D, dtype=np.float64), (N, D, D)).copy()
+        extractor = feat["extractor"]
+        if extractor == "trace":
+            vals = E_all.trace(axis1=1, axis2=2).real
+        elif extractor == "frob":
+            vals = np.linalg.norm(E_all, ord="fro", axis=(1, 2))
+        elif extractor == "top_left":
+            v00 = E_all[:, 0, 0]
+            vals = v00.real if np.iscomplexobj(v00) else v00
+        else:
+            raise ValueError(f"Unknown matrix-power extractor: {extractor!r}")
+        vals = np.where(nan_mask, np.nan, vals)
+        df[f"mp_{feat['name']}"] = vals
+    return df
 
 
 def indicators(df):
-    # Make a copy to avoid in-place modifications causing fragmentation
     df = forward_fill(df)
+    df = df.copy()  # defragment after forward_fill before adding ~300 new columns
 
     df = add_genetic_info_decay_3d(df)
     df = add_genetic_autocorr_3d(df)
@@ -3035,11 +3590,11 @@ def indicators(df):
     df = calculate_kalman_indicators(df)
     df = calculate_volatility_indicators(df)
     df = calculate_significant_indicators(df)
-        
+
     df = add_price_differential_ratio(df, epsilon = 1e-10)
     df = add_top_stress_indicators(df)
     base_column = 'Price_Differential_Ratio'
-    
+
     df = add_rolling_log_scaled_features(df, base_column)
     df = add_rate_of_change_features(df, base_column)
     df = add_z_score_signals(df, base_column)
@@ -3055,8 +3610,13 @@ def indicators(df):
     #df = calculate_vol_fade_signal(df)
 
     df = calculate_beta(df, window=60, min_periods=30)
+    df = df.copy()  # defragment mid-way before the final GP feature block
 
     df = add_can_buy_features_to_indicators(df)
+
+    df = compute_gp_input_features(df)
+
+    df = add_matrix_power_features(df)
 
     df = final_cleanup(df)
     return df
@@ -3269,7 +3829,56 @@ def process_files(file_path, output_dir, index_temp_files=None):
 
 
 
-def process_data_files(run_percent):
+def _resolve_cores(spec, core_class, n, logical, physical):
+    """Logical-CPU indices to pin to, or None. `spec`='16-31'/'24,26' overrides class.
+    class: weak=highest physical cores (2nd CCD on this Ryzen / E-cores on Intel hybrid),
+    strong=lowest, medium=middle. Picks DISTINCT physical cores first (first SMT thread),
+    then siblings — so '--cores 2' gives 2 real cores, not 2 threads of one core."""
+    if spec:
+        out = []
+        for part in str(spec).split(','):
+            part = part.strip()
+            if '-' in part:
+                a, b = part.split('-'); out += list(range(int(a), int(b) + 1))
+            elif part:
+                out.append(int(part))
+        return sorted({c for c in out if 0 <= c < logical}) or None
+    if not core_class:
+        return None
+    n = max(1, min(int(n or 2), logical))
+    smt = max(1, logical // max(1, physical))          # threads per physical core (2 here)
+    order = list(range(physical))                       # strong: low physical indices
+    if core_class == 'weak':
+        order = order[::-1]                             # high physical indices (2nd CCD)
+    elif core_class == 'medium':
+        m = physical / 2.0
+        order = sorted(range(physical), key=lambda c: abs(c - m))
+    picks, t = [], 0
+    while len(picks) < n and t < smt:
+        for pc in order:
+            picks.append(pc * smt + t)
+            if len(picks) >= n:
+                break
+        t += 1
+    return sorted(dict.fromkeys(picks))[:n]
+
+
+def _pin_current_process(cores, nice_val):
+    """Pin this process to `cores` and/or set priority. Used as the ProcessPoolExecutor
+    initializer (every worker pins itself) and on the main process. Silent no-op if
+    psutil is missing or both values are None."""
+    try:
+        import psutil
+        p = psutil.Process()
+        if cores:
+            p.cpu_affinity(list(cores))
+        if nice_val is not None:
+            p.nice(nice_val)
+    except Exception:
+        pass
+
+
+def process_data_files(run_percent, num_cores=None, affinity=None, nice_val=None):
     """Main processing function with all market indexes."""
     
     print(f"Processing {run_percent}% of files from {CONFIG['input_directory']}")
@@ -3290,13 +3899,16 @@ def process_data_files(run_percent):
     ]
     
     files_to_process = file_paths[:int(len(file_paths) * (run_percent / 100))]
-    num_workers = min(32, len(files_to_process))
+    num_workers = num_cores if num_cores else min(32, len(files_to_process))
+    num_workers = max(1, min(num_workers, max(1, len(files_to_process))))
     
     completed = 0
     failed = 0
     
     # Process files in parallel - each worker will load indexes independently
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+    with ProcessPoolExecutor(max_workers=num_workers,
+                             initializer=_pin_current_process,
+                             initargs=(affinity, nice_val)) as executor:
         futures = []
         for file_path in files_to_process:
             future = executor.submit(
@@ -3332,6 +3944,8 @@ def process_data_files(run_percent):
     print(f'Successfully processed: {completed}')
     print(f'Failed to process: {failed}')
 
+    add_gp_cross_sectional_features(CONFIG['output_directory'])
+
 
 
 
@@ -3343,6 +3957,31 @@ if __name__ == "__main__":
     logger.info("Starting the process...")
     parser = argparse.ArgumentParser(description="Process financial market data files.")
     parser.add_argument('--runpercent', type=int, default=100, help="Percentage of files to process from the input directory.")
+    parser.add_argument('--cores', type=int, default=None, help="Max worker processes. Lower (e.g. 2-4) to leave cores for a game. Default: min(32, #files).")
+    parser.add_argument('--cpu_affinity', type=str, default=None, help="Explicit logical CPU indices to pin to, e.g. '16-31' (this Ryzen's 2nd CCD) or '24,26,28,30'. Overrides --core_class.")
+    parser.add_argument('--core_class', choices=['weak', 'medium', 'strong'], default=None, help="Auto-pick --cores CPUs: weak=highest (2nd CCD on this Ryzen — best while gaming), strong=lowest, medium=middle.")
+    parser.add_argument('--priority', choices=['normal', 'below', 'idle'], default='normal', help="Process priority. 'idle'/'below' yield CPU to your game so the pipeline only sips spare cycles (the strongest don't-hurt-my-game lever).")
     args = parser.parse_args()
 
-    process_data_files(args.runpercent)
+    # Resolve CPU affinity + priority so you can game on the good cores while this runs.
+    _cores = None
+    _nice = None
+    _num_cores = args.cores
+    try:
+        import psutil
+        _LOG = psutil.cpu_count(logical=True) or 1
+        _PHYS = psutil.cpu_count(logical=False) or _LOG
+        _cores = _resolve_cores(args.cpu_affinity, args.core_class, args.cores, _LOG, _PHYS)
+        _nice = {'normal': None,
+                 'below': psutil.BELOW_NORMAL_PRIORITY_CLASS,
+                 'idle': psutil.IDLE_PRIORITY_CLASS}[args.priority]
+        _num_cores = args.cores or (len(_cores) if _cores else None)
+        if _cores or _nice is not None:
+            _pin_current_process(_cores, _nice)   # pin main proc + its I/O thread pools too
+            print(f"[cores] logical CPUs={_cores if _cores else 'all'} | "
+                  f"workers={_num_cores or 'auto'} | priority={args.priority} "
+                  f"(of {_LOG} logical / {_PHYS} physical)")
+    except Exception as _e:
+        print(f"[cores] affinity/priority setup skipped: {_e}")
+
+    process_data_files(args.runpercent, num_cores=_num_cores, affinity=_cores, nice_val=_nice)

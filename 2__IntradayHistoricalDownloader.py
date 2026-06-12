@@ -30,6 +30,7 @@ import logging
 import re
 from collections import deque
 from datetime import datetime, timedelta
+import zoneinfo
 
 import pandas as pd
 from tqdm import tqdm
@@ -58,7 +59,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # max_lookback_days:  sensible cap for strategy testing
 BAR_CONFIGS = {
     '1min':  {'bar_size': '1 min',  'max_days_per_chunk': 1,  'max_lookback_days': 7,   'desc': '1-minute bars'},
-    '5min':  {'bar_size': '5 mins', 'max_days_per_chunk': 5,  'max_lookback_days': 90,  'desc': '5-minute bars'},
+    '5min':  {'bar_size': '5 mins', 'max_days_per_chunk': 730, 'max_lookback_days': 1095, 'desc': '5-minute bars'},
     '15min': {'bar_size': '15 mins','max_days_per_chunk': 10, 'max_lookback_days': 180, 'desc': '15-minute bars'},
     '30min': {'bar_size': '30 mins','max_days_per_chunk': 20, 'max_lookback_days': 365, 'desc': '30-minute bars'},
     '1hour': {'bar_size': '1 hour', 'max_days_per_chunk': 30, 'max_lookback_days': 730, 'desc': '1-hour bars'},
@@ -68,8 +69,34 @@ BAR_CONFIGS = {
 # IBKR allows up to ~50 simultaneous historical-data requests across all connections.
 # We stay conservative at 25 to leave headroom and avoid pacing violations.
 IBKR_REQUEST_SEMAPHORE = asyncio.Semaphore(25)   # created fresh per event loop below
-REQUEST_TIMEOUT   = 30   # seconds per request
+REQUEST_TIMEOUT   = 180  # seconds per request (a single "2 Y" 5min chunk is ~108s to transmit)
 INTER_CHUNK_DELAY = 0.35 # seconds between successive chunk requests on one thread
+
+
+def ibkr_duration(days: int) -> str:
+    """IBKR durationStr. KEY: for 5min, '730 D'/'3 Y' are REJECTED but 'N Y' works — so
+    express anything over a year in YEAR units. Fewer/bigger requests dodge the account-wide
+    pacing throttle (measured: 7x'120 D' chunks = 240s/ticker vs one '2 Y' = ~108s/ticker)."""
+    days = max(1, int(days))
+    if days <= 365:
+        return f"{days} D"
+    return f"{(days + 364) // 365} Y"   # ceil to whole years
+
+# Pause historical pulls during US equity RTH so this doesn't share IBKR's account-wide
+# pacing budget with the live broker (9_SuperFastBroker). Disable with --ignore-market-hours.
+PAUSE_MARKET_HOURS = True
+
+
+def seconds_until_market_close_if_open() -> float:
+    """If it's a weekday between 09:30 and 16:00 ET, return seconds until 16:00; else 0."""
+    et = datetime.now(zoneinfo.ZoneInfo('US/Eastern'))
+    if et.weekday() >= 5:
+        return 0.0
+    open_t  = et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_t = et.replace(hour=16, minute=0,  second=0, microsecond=0)
+    if open_t <= et < close_t:
+        return (close_t - et).total_seconds()
+    return 0.0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -152,6 +179,20 @@ def get_tickers_from_rf_predictions(limit: int | None = None) -> list[str]:
     except Exception as e:
         print(f"Error reading RF predictions directory: {e}")
     result = sorted(tickers)
+    return result[:limit] if limit else result
+
+
+def get_traded_tickers(limit: int | None = None) -> list[str]:
+    """Symbols that actually traded (union of the trade-history parquets)."""
+    trade_files = ['trade_history.parquet', os.path.join(script_dir, 'Data', 'TradeHistory.parquet')]
+    syms = set()
+    for f in trade_files:
+        if os.path.exists(f):
+            try:
+                syms |= set(pd.read_parquet(f, columns=['Symbol'])['Symbol'].astype(str).str.upper())
+            except Exception as e:
+                print(f"  warn: could not read {f}: {e}")
+    result = sorted(syms)
     return result[:limit] if limit else result
 
 
@@ -259,6 +300,14 @@ class TickerDownloader:
                 continue
 
             ticker = task
+
+            # Respect the live broker: idle through market hours (account-wide pacing).
+            if PAUSE_MARKET_HOURS:
+                wait_s = seconds_until_market_close_if_open()
+                while wait_s > 0 and not self.stop_event.is_set():
+                    await asyncio.sleep(min(wait_s, 60.0))
+                    wait_s = seconds_until_market_close_if_open()
+
             success, reason = await self._download_ticker(ib, ticker, sem)
 
             with self.results_lock:
@@ -312,7 +361,7 @@ class TickerDownloader:
                     bars = await ib.reqHistoricalDataAsync(
                         contract       = contract,
                         endDateTime    = end_str,
-                        durationStr    = f"{chunk_days} D",
+                        durationStr    = ibkr_duration(chunk_days),
                         barSizeSetting = self.bar_cfg['bar_size'],
                         whatToShow     = 'TRADES',
                         useRTH         = True,
@@ -438,14 +487,23 @@ def main():
                              'Higher = faster but more pacing pressure.')
     parser.add_argument('--port',          type=int, default=7496,
                         help='TWS port — 7496 live (default), 7497 paper, 4001 Gateway live')
+    parser.add_argument('--universe',      type=str, default='rf', choices=['rf', 'traded'],
+                        help="Ticker source when no explicit ticker given: "
+                             "'rf' = all RFpredictions (~4.2k), 'traded' = names that actually traded (~805)")
     parser.add_argument('--limit',         type=int,
-                        help='Limit tickers from RF predictions (for quick tests)')
+                        help='Limit tickers from the chosen universe (for quick tests)')
     parser.add_argument('--force',         action='store_true',
                         help='Re-download data even if file already exists')
     parser.add_argument('--show-data',     action='store_true',
                         help='Print a preview of each saved file after download')
+    parser.add_argument('--ignore-market-hours', action='store_true',
+                        help='Do NOT pause during US market hours (faster, but shares IBKR '
+                             'pacing with the live broker — only use if not trading)')
 
     args = parser.parse_args()
+
+    global PAUSE_MARKET_HOURS
+    PAUSE_MARKET_HOURS = not args.ignore_market_hours
 
     cfg          = BAR_CONFIGS[args.bar_size]
     lookback_days = args.lookback_days or cfg['max_lookback_days']
@@ -456,6 +514,11 @@ def main():
         tickers = [args.ticker.upper()]
     elif args.tickers:
         tickers = [t.upper() for t in args.tickers]
+    elif args.universe == 'traded':
+        tickers = get_traded_tickers(limit=args.limit)
+        if not tickers:
+            print("No traded tickers found in trade-history files. Use --ticker or --tickers.")
+            return
     else:
         tickers = get_tickers_from_rf_predictions(limit=args.limit)
         if not tickers:
@@ -484,6 +547,7 @@ def main():
     print(f"  Lookback     : {lookback_days} calendar days")
     print(f"  Port         : {args.port}  ({'live TWS' if args.port == 7496 else 'paper/gateway'})")
     print(f"  Threads      : {args.num_threads}")
+    print(f"  Market pause : {'ON (idle 09:30-16:00 ET)' if PAUSE_MARKET_HOURS else 'OFF (--ignore-market-hours)'}")
     print(f"  Tickers total: {len(tickers)}  |  to download: {len(to_process)}  |  skipped (current): {len(skipped)}")
     print(f"  Output dir   : {DATA_DIR}")
     print("=" * 70)
@@ -532,7 +596,7 @@ def main():
             df['Date'] = pd.to_datetime(df['Date'])
             df = df.sort_values('Date')
             print(f"\n  DATA PREVIEW — {ticker} ({args.bar_size})")
-            print(f"  {len(df)} bars  |  {df['Date'].min()}  →  {df['Date'].max()}")
+            print(f"  {len(df)} bars  |  {df['Date'].min()}  ->  {df['Date'].max()}")
             print()
             print(df.head(5).to_string(index=False))
             print("  ...")
