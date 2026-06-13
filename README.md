@@ -11,7 +11,17 @@ Pulls the current tradeable universe from the SEC. Runs nightly to keep the tick
 Fetches daily OHLCV bars for the full universe through IBKR. Stores per-ticker parquet files in `Data/PriceData/`.
 
 ### 3. Alpha Sensitivity
-Computes roughly 300 technical and statistical features per ticker: momentum, volatility, VIX-adaptive indicators, matrix-power cross-sectional features, and GP-evolved synthetic indicators. Outputs processed parquets to `Data/ProcessedData/`.
+The feature engineering stage. Runs in parallel across ~4000 tickers and produces roughly 300 features per ticker per day. The more interesting parts:
+
+**Visibility graph features.** Each rolling price window is converted into a Natural Visibility Graph: each bar is a node, and two bars share an edge if no intermediate bar blocks the line of sight between them. The stage builds two graphs per window, one on the raw detrended log-price series and one on its inverse, then extracts the average shortest path length from each. The difference between the two paths encodes directional momentum structure in a way that standard indicators cannot.
+
+**Matrix power features.** 14 `mp_*` features are derived by building a DxD matrix M from sign-weighted, panel-normalized OHLCV primitives over a rolling window, computing the matrix exponential `expm(M)` via scaling-and-squaring with Taylor expansion, and extracting a scalar summary (trace, Frobenius norm, or top-left element). The geometry of the matrix exponential captures interaction effects between price, volume, volatility, and higher moments that are invisible to single-variable indicators. The 14 specs are stored in `Data/matrix_power_spec.json` and were validated against held-out IC targets.
+
+**GP cross-sectional features.** After the parallel per-ticker pass completes, a second pass runs across the full universe panel grouped by date. This applies genetic-programming-discovered formulas that combine cross-sectionally ranked inputs: rolling Higuchi fractal dimension, Lyapunov exponent estimates, DFA scaling, spectral entropy, time-between-extremes distributions, and volume entropy. The formulas were evolved to discriminate the top percentile of next-day movers rather than maximize global rank IC.
+
+**VIX-adaptive dynamic RSI.** RSI window length is driven by the current VIX regime. Rather than recomputing RSI from scratch at each row, the stage precomputes a full 26-column RSI matrix (windows 5-30) and selects the appropriate column per row via numpy indexing.
+
+Standard indicators also included: rolling Hurst exponent, ATR percentile ranks, DVAMR probability, beta to major indexes, volume spectral analysis, and a suite of genetic autocorrelation features.
 
 ### 4. Predictor
 Trains and runs an XGBoost binary classifier on the processed features. Outputs a calibrated 0-1 probability per ticker per day to `Data/RFpredictions/`. Run with `--predict_only` nightly to skip retraining.
@@ -41,17 +51,6 @@ Narrows the candidate pool to a final book using a cost-ordered funnel: mechanic
 Evening mode runs stages 1 through 5 sequentially with 20-second gaps for memory cleanup. Morning mode runs the macro filter funnel, waits until the configured launch time, then hands off to the broker with connection-failure retry logic and a hard cutoff.
 
 A file lock prevents concurrent runs from corrupting shared parquet writes.
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `Util.py` | Shared utilities, signal file paths, backtester helpers |
-| `trading_system.ps1` | Production orchestrator |
-| `5__NightlyBackTester.py` | Backtest engine, also generates the candidate pool |
-| `Data/RFpredictions/` | Per-ticker daily probability outputs |
-| `Data/0__signals.parquet` | 12-name candidate pool from backtester |
-| `_Buy_Signals.parquet` | Narrowed book read by the broker |
 
 ## Experimental
 
