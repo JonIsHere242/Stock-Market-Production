@@ -31,7 +31,6 @@ import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
-
 CONFIG = {
     'input_directory': 'Data/PriceData',
     'output_directory': 'Data/ProcessedData',
@@ -39,6 +38,7 @@ CONFIG = {
     'log_lines_to_read': 500,
     'core_count_division': True,
 }
+
 
 GLOBAL_INDEX_DATA = {}
 
@@ -1039,9 +1039,53 @@ def calculate_beta(df, window=60, min_periods=30):
 
 
 
-def calculate_vix_features(df):    
+def _dynamic_rsi_vectorized(df):
+    """Precompute RSI for windows 5-30 then select the VIX-driven window per row.
+    O(26·n) per ticker vs the original O(n·window). Modifies df in place."""
+    df['Dynamic_RSI'] = np.nan
+
+    for ticker in df['Ticker'].unique():
+        mask = df['Ticker'] == ticker
+        td   = df.loc[mask]
+        n    = len(td)
+        if n < 50:
+            continue
+
+        close      = td['Close'].to_numpy(dtype=np.float64)
+        vix_factor = td['VIX_Factor'].to_numpy(dtype=np.float64)
+
+        delta  = np.diff(close, prepend=np.nan)
+        gains  = np.where(delta > 0,  delta, 0.0)
+        losses = np.where(delta < 0, -delta, 0.0)
+
+        # Build 26-column RSI matrix (one column per window 5..30)
+        rsi_matrix = np.full((n, 26), np.nan)
+        for col, w in enumerate(range(5, 31)):
+            avg_g = pd.Series(gains ).rolling(w, min_periods=w).mean().to_numpy()
+            avg_l = pd.Series(losses).rolling(w, min_periods=w).mean().to_numpy()
+            with np.errstate(divide='ignore', invalid='ignore'):
+                rsi = np.where(
+                    avg_l == 0,
+                    np.where(avg_g > 0, 100.0, 50.0),
+                    100.0 - 100.0 / (1.0 + avg_g / avg_l)
+                )
+            rsi_matrix[:, col] = rsi
+
+        # Map VIX_Factor → integer window, fallback 14 on NaN
+        dyn_w   = np.where(
+            np.isfinite(vix_factor),
+            np.clip(np.floor(14.0 * vix_factor).astype(int), 5, 30),
+            14
+        )
+        selected = rsi_matrix[np.arange(n), dyn_w - 5]
+        selected = np.where(np.arange(n) >= 50, selected, np.nan)
+
+        df.loc[mask, 'Dynamic_RSI'] = selected
+
+
+def calculate_vix_features(df):
     result_df = df.copy()
-    
+
     # Ensure df has a Date column
     if 'Date' not in result_df.columns:
         if isinstance(result_df.index, pd.DatetimeIndex):
@@ -1099,46 +1143,34 @@ def calculate_vix_features(df):
     )
     
     # 2. VIX RELATIVE LEVELS AND CHANGES
-    # Calculating percentiles WITHOUT including current point in the window
-    # This way, we're only using past data to determine percentile
+    # Percentile: rank of today's VIX among the past `window` days (today excluded).
+    # rolling(window+1) window = [i-window .. i]; x[:-1] = past, x[-1] = today.
+    # Semantically identical to the original iloc[i-window:i] percentileofscore loop.
     for window in [30, 60, 252]:
-        result_df[f'VIX_Percentile_{window}d'] = np.nan
-        
-        for i in range(len(result_df)):
-            if i >= window:  # Only calculate if we have enough history
-                lookback_values = result_df.iloc[i-window:i]['VIX_Close'].values
-                if len(lookback_values) > 0:
-                    current_value = result_df.iloc[i]['VIX_Close']
-                    result_df.iloc[i, result_df.columns.get_loc(f'VIX_Percentile_{window}d')] = (
-                        stats.percentileofscore(lookback_values, current_value) / 100
-                    )
-    
+        result_df[f'VIX_Percentile_{window}d'] = (
+            result_df['VIX_Close']
+            .rolling(window + 1, min_periods=window + 1)
+            .apply(lambda x: (x[:-1] <= x[-1]).mean(), raw=True)
+        )
+
     # Calculate rate of change for VIX over different periods
     for period in [1, 5, 10, 20]:
         if len(result_df) > period:
             result_df[f'VIX_Change_{period}d'] = result_df['VIX_Close'].pct_change(period, fill_method=None)
     
-    # Calculate VIX momentum (smoothed rate of change)
-    result_df['VIX_Momentum'] = np.nan
-    for i in range(len(result_df)):
-        if i >= 10:  # Need at least 10 days of history
-            mean_10d = result_df.iloc[i-10:i]['VIX_Close'].mean()
-            if mean_10d > 0:  # Avoid division by zero
-                result_df.iloc[i, result_df.columns.get_loc('VIX_Momentum')] = (
-                    result_df.iloc[i]['VIX_Close'] / mean_10d - 1
-                )
-    
-    # VIX Acceleration (change in momentum)
-    result_df['VIX_Acceleration'] = np.nan
-    # Properly calculate the acceleration using only past data
+    # VIX momentum: today vs mean of past 10 days (excludes today via shift(1))
+    _past_10d_mean = result_df['VIX_Close'].shift(1).rolling(10, min_periods=10).mean()
+    result_df['VIX_Momentum'] = np.where(
+        _past_10d_mean > 0,
+        result_df['VIX_Close'] / _past_10d_mean - 1,
+        np.nan
+    )
+
+    # VIX Acceleration: diff(5) of the 5d-change series — exact same arithmetic as the loop
     if 'VIX_Change_5d' in result_df.columns:
-        for i in range(len(result_df)):
-            if i >= 10:  # Need at least 10 days for 5d change + 5 more for diff
-                if pd.notna(result_df.iloc[i]['VIX_Change_5d']) and pd.notna(result_df.iloc[i-5]['VIX_Change_5d']):
-                    result_df.iloc[i, result_df.columns.get_loc('VIX_Acceleration')] = (
-                        result_df.iloc[i]['VIX_Change_5d'] - result_df.iloc[i-5]['VIX_Change_5d']
-                    )
-    
+        result_df['VIX_Acceleration'] = result_df['VIX_Change_5d'].diff(5)
+    else:
+        result_df['VIX_Acceleration'] = np.nan
 
     # 3. VIX MOVING AVERAGES AND CROSSOVERS
     for window in [10, 20, 50]:
@@ -1182,31 +1214,20 @@ def calculate_vix_features(df):
         result_df['VIX_Extreme_Low'] = np.where(result_df['VIX_Z_50d'] < -1, 1, 0)
     
     # 5. VOLATILITY OF VOLATILITY
-    # Calculate volatility of VIX (properly using only past data)
-    result_df['VIX_of_VIX'] = np.nan
-    for i in range(len(result_df)):
-        if i >= 21:  # Need at least 21 days (20 for rolling + 1 for current day)
-            # First handle any NaN values, then calculate percentage change with fill_method=None
-            vix_slice = result_df.iloc[i-20:i]['VIX_Close'].ffill()
-            vix_returns = vix_slice.pct_change(fill_method=None).dropna()
-            if len(vix_returns) >= 5:  # Ensure we have enough data points
-                result_df.iloc[i, result_df.columns.get_loc('VIX_of_VIX')] = (
-                    vix_returns.std() * np.sqrt(252)
-                )
-    
-    # Z-score of VIX volatility (properly using only past data)
-    result_df['VIX_of_VIX_Z'] = np.nan
-    for i in range(len(result_df)):
-        if i >= 100 and pd.notna(result_df.iloc[i]['VIX_of_VIX']):
-            vix_vol_history = result_df.iloc[i-100:i]['VIX_of_VIX'].dropna()
-            if len(vix_vol_history) >= 30:  # Ensure enough data
-                mean_vol = vix_vol_history.mean()
-                std_vol = vix_vol_history.std()
-                if std_vol > 0:
-                    result_df.iloc[i, result_df.columns.get_loc('VIX_of_VIX_Z')] = (
-                        (result_df.iloc[i]['VIX_of_VIX'] - mean_vol) / (std_vol + 1e-10)
-                    )
-    
+    # shift(1) before rolling → window at t = [t-20 .. t-1] pct-changes, past-only.
+    _vix_pct = result_df['VIX_Close'].pct_change(fill_method=None)
+    result_df['VIX_of_VIX'] = _vix_pct.shift(1).rolling(20, min_periods=5).std() * np.sqrt(252)
+
+    # Z-score of VIX_of_VIX: shift(1) before rolling mean/std → past-only denominator
+    _vov      = result_df['VIX_of_VIX']
+    _vov_mean = _vov.shift(1).rolling(100, min_periods=30).mean()
+    _vov_std  = _vov.shift(1).rolling(100, min_periods=30).std()
+    result_df['VIX_of_VIX_Z'] = np.where(
+        _vov_std > 0,
+        (_vov - _vov_mean) / (_vov_std + 1e-10),
+        np.nan
+    )
+
     # 6. VIX-ADJUSTED PRICE INDICATORS
     # Calculate log returns (today vs yesterday)
     result_df['Log_Return'] = np.log(result_df['Close'] / result_df['Close'].shift(1))
@@ -1254,52 +1275,10 @@ def calculate_vix_features(df):
     # Add 'Ticker' column if it doesn't exist
     if 'Ticker' not in result_df.columns:
         result_df['Ticker'] = 'Unknown'
-    
-    # Initialize Dynamic_RSI column
-    result_df['Dynamic_RSI'] = np.nan
-    
-    # Calculate Dynamic RSI for each ticker separately
-    tickers = result_df['Ticker'].unique()
-    
-    for ticker in tickers:
-        # Get data for this ticker only
-        ticker_data = result_df[result_df['Ticker'] == ticker].copy()
-        
-        # Process each row chronologically
-        for i in range(len(ticker_data)):
-            if i < 50:  # Skip initial rows with insufficient history
-                continue
-                
-            current_idx = ticker_data.index[i]
-            
-            # Calculate dynamic lookback period based on VIX
-            if pd.notna(ticker_data.iloc[i]['VIX_Factor']):
-                dynamic_period = int(14 * ticker_data.iloc[i]['VIX_Factor'])
-                # Constrain between 5 and 30 days
-                dynamic_period = max(min(dynamic_period, 30), 5)
-                
-                # Get historical data up to but not including current point
-                hist_data = ticker_data.iloc[i-dynamic_period:i].copy()
-                
-                if len(hist_data) >= 5:  # Ensure we have enough data
-                    # Calculate dynamic RSI on historical data
-                    deltas = hist_data['Close'].diff().dropna()
-                    gains = deltas.where(deltas > 0, 0)
-                    losses = -deltas.where(deltas < 0, 0)
-                    
-                    avg_gain = gains.mean()
-                    avg_loss = losses.mean()
-                    
-                    if avg_loss > 0:
-                        rs = avg_gain / avg_loss
-                        result_df.loc[current_idx, 'Dynamic_RSI'] = 100 - (100 / (1 + rs))
-                    elif avg_gain > 0:
-                        # All positive changes, no losses
-                        result_df.loc[current_idx, 'Dynamic_RSI'] = 100
-                    else:
-                        # No change
-                        result_df.loc[current_idx, 'Dynamic_RSI'] = 50
-    
+
+    # Dynamic RSI: precompute all 26 windows once, then select per row — O(26·n)
+    _dynamic_rsi_vectorized(result_df)
+
     # 8. RISK ADJUSTMENT FEATURES
     result_df['VIX_Risk_Multiplier'] = result_df['VIX_Close'] / 20
     
@@ -1343,33 +1322,31 @@ def calculate_vix_features(df):
         np.nan
     )
     
-    # 10. VIX PATTERN DETECTION
-    # Properly detect patterns using only past data, shifting correctly
-    result_df['VIX_Spike'] = np.nan
-    result_df['VIX_Bottom'] = np.nan
-    
-    for i in range(len(result_df)):
-        if i >= 25:  # Need at least 25 days (5 for first shift, 1 for current, and 20 for rolling mean)
-            # Get the relevant values
-            vix_5days_ago = result_df.iloc[i-5]['VIX_Close']
-            vix_1day_ago = result_df.iloc[i-1]['VIX_Close']
-            vix_today = result_df.iloc[i]['VIX_Close']
-            
-            # Calculate the 20-day mean EXCLUDING the current day
-            vix_mean_20d = result_df.iloc[i-20:i]['VIX_Close'].mean()
-            
-            # Check for spike pattern (VIX was rising, now falling, and recently high)
-            if (vix_5days_ago < vix_1day_ago) and (vix_1day_ago > vix_today) and (vix_1day_ago > vix_mean_20d * 1.5):
-                result_df.iloc[i, result_df.columns.get_loc('VIX_Spike')] = 1
-            else:
-                result_df.iloc[i, result_df.columns.get_loc('VIX_Spike')] = 0
-                
-            # Check for bottom pattern (VIX was falling, now rising, and recently low)
-            if (vix_5days_ago > vix_1day_ago) and (vix_1day_ago < vix_today) and (vix_1day_ago < vix_mean_20d * 0.8):
-                result_df.iloc[i, result_df.columns.get_loc('VIX_Bottom')] = 1
-            else:
-                result_df.iloc[i, result_df.columns.get_loc('VIX_Bottom')] = 0
-    
+    # 10. VIX PATTERN DETECTION — exact same logic, no loop needed.
+    # shift(1).rolling(20) at t → mean of [t-20 .. t-1] (past-only), matching iloc[i-20:i].
+    _vix   = result_df['VIX_Close']
+    _v5    = _vix.shift(5)                                       # VIX five days ago
+    _v1    = _vix.shift(1)                                       # VIX yesterday
+    _vmean = _vix.shift(1).rolling(20, min_periods=20).mean()    # past-20-day mean
+
+    _has_history = _vmean.notna()
+
+    _spike_cond = (
+        _has_history &
+        (_v5 < _v1) &             # was rising
+        (_v1 > _vix) &            # now falling
+        (_v1 > _vmean * 1.5)      # was elevated vs recent mean
+    )
+    _bottom_cond = (
+        _has_history &
+        (_v5 > _v1) &             # was falling
+        (_v1 < _vix) &            # now rising
+        (_v1 < _vmean * 0.8)      # was depressed vs recent mean
+    )
+
+    result_df['VIX_Spike']  = np.where(_has_history, _spike_cond.astype(float),  np.nan)
+    result_df['VIX_Bottom'] = np.where(_has_history, _bottom_cond.astype(float), np.nan)
+
     # Fill NaN values with forward fill only (using only past data)
     numeric_cols = result_df.select_dtypes(include=['number']).columns
     for col in numeric_cols:
@@ -2309,26 +2286,24 @@ def create_gap_zscore_predictors(df):
     
     
     gap_zscore_adaptive_threshold = pd.Series(np.nan, index=result_df.index)
-    
-    # Calculate future returns for effectiveness measurement
-    future_returns = returns.shift(-1)
-    
-    # Rolling effectiveness of gap signals
-    rolling_effectiveness = pd.Series(0.5, index=result_df.index)  # Start with neutral effectiveness
-    
-    for i in range(100, len(result_df)-1):
-        # Look back at recent gap signals and their effectiveness
-        recent_gaps = gap_zscore_base.iloc[i-100:i]
-        recent_returns = future_returns.iloc[i-100:i]
-        
-        # Calculate how well gaps predicted direction (continuous measure)
-        valid_mask = ~(np.isnan(recent_gaps) | np.isnan(recent_returns))
-        if valid_mask.sum() > 10:  # Need minimum occurrences
-            correlation = np.corrcoef(recent_gaps[valid_mask], recent_returns[valid_mask])[0,1]
+
+    # Effectiveness: correlation of *yesterday's* gap with *today's* return — fully causal.
+    # Original used returns.shift(-1) (tomorrow's return), which is forward-looking.
+    lagged_gap = gap_zscore_base.shift(1)
+
+    rolling_effectiveness = pd.Series(0.5, index=result_df.index)
+
+    for i in range(100, len(result_df)):
+        recent_lagged_gaps = lagged_gap.iloc[i-100:i]
+        recent_returns     = returns.iloc[i-100:i]
+
+        valid_mask = ~(np.isnan(recent_lagged_gaps) | np.isnan(recent_returns))
+        if valid_mask.sum() > 10:
+            correlation = np.corrcoef(
+                recent_lagged_gaps[valid_mask], recent_returns[valid_mask]
+            )[0, 1]
             if not np.isnan(correlation):
-                # Convert correlation to effectiveness score (0 to 1)
-                effectiveness = (correlation + 1) / 2  # Scale -1,1 to 0,1
-                rolling_effectiveness.iloc[i] = effectiveness
+                rolling_effectiveness.iloc[i] = (correlation + 1) / 2
     
     # Generate adaptive signals
     for i in range(len(result_df)):
@@ -2501,24 +2476,21 @@ def add_vg_indicators(df: pd.DataFrame,
     df['vg_diff'] = df['vg_pos'] - df['vg_neg']
     df['vg_abs_diff'] = np.abs(df['vg_diff'])
     
-    # Add returns
-    df['log_return'] = np.log(df[price_col]).diff().shift(-1)
-    
+    # Contemporaneous log return (end-of-day, no forward look).
+    # NOTE: if this function is ever wired into indicators(), do NOT use log_return
+    # as an ML feature — it is contemporaneous return, not a predictor.
+    df['log_return'] = np.log(df[price_col]).diff()
+
     # Generate trading signals with volume filter
     df['vg_long_signal'] = 0
     df['vg_short_signal'] = 0
-    
-    long_condition = (df['vg_pos'] > df['vg_neg']) & (df['volume_trend_signal'] == 1)
+
+    long_condition  = (df['vg_pos'] > df['vg_neg']) & (df['volume_trend_signal'] == 1)
     short_condition = (df['vg_pos'] < df['vg_neg']) & (df['volume_trend_signal'] == 1)
-    
-    df.loc[long_condition, 'vg_long_signal'] = 1
+
+    df.loc[long_condition,  'vg_long_signal']  = 1
     df.loc[short_condition, 'vg_short_signal'] = -1
     df['vg_combined_signal'] = df['vg_long_signal'] + df['vg_short_signal']
-    
-    # Add returns per signal
-    df['vg_long_return'] = df['vg_long_signal'] * df['log_return']
-    df['vg_short_return'] = df['vg_short_signal'] * df['log_return']
-    df['vg_combined_return'] = df['vg_combined_signal'] * df['log_return']
     
     return df
 

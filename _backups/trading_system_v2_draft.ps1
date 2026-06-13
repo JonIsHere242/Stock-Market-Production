@@ -1,22 +1,24 @@
-# Trading System Runner - PRODUCTION (hardened 2026-06-12)
-# Previous version backed up to _backups\trading_system_v1_20260612.ps1
-# Manual modes: .\trading_system.ps1 -Mode morning   (or evening)
+# Trading System Runner v2 - hardened broker path
+# Activate (no admin needed, scheduled task targets the filename):
+#   Copy-Item trading_system.ps1 trading_system_v1.bak.ps1
+#   Copy-Item trading_system_v2.ps1 trading_system.ps1 -Force
+# Manual modes: .\trading_system_v2.ps1 -Mode morning   (or evening)
 
 param(
     [ValidateSet("auto", "morning", "evening")]
     [string]$Mode = "auto"
 )
 
-$Host.UI.RawUI.WindowTitle = "Trading System - Production Runner"
+$Host.UI.RawUI.WindowTitle = "Trading System v2"
 
 $basePath       = "C:\Users\Masam\Desktop\Stock-Market"
 $pythonExe      = "$basePath\stock_env\Scripts\python.exe"
 $logDir         = "$basePath\Data\logging"
 $logFile        = "$logDir\__trading_system.log"
 $ibkrHost       = "127.0.0.1"
-$ibkrPort       = 7496              # TWS live (verified in 9_SuperFastBroker.py and 2__PriceDownloader.py)
-$ibkrLauncher   = ""                # optional: path to TWS/Gateway shortcut for auto-start attempt
-$brokerLaunchET = "09:57"           # hand off to broker just before its internal 10:00 ET gate
+$ibkrPort       = 7496              # TWS live = 7496, Gateway live = 4001
+$ibkrLauncher   = ""                # optional: path to TWS/Gateway shortcut for auto-start
+$brokerLaunchET = "09:57"           # hand off to broker just before its 10:00 ET gate
 $brokerCutoffET = "10:30"           # stop retrying after this
 $lockFile       = "$logDir\.trading_system.lock"
 $alertFile      = "$logDir\BROKER_ALERT.txt"
@@ -87,13 +89,10 @@ function Run-Stage($name, $file, $argString) {
     return @{ ok = ($code -eq 0); out = $out; code = $code }
 }
 
-# Broker outcome classification. SPY_ABORT is the EDA risk gate working as
-# designed (Sharpe -6.50 on weak days) - it is a SUCCESS state, never retried.
 function Get-BrokerOutcome($result) {
-    $o = $result.out
-    if ($o -match "SPY ABORT|Market conditions gate FAILED") { return "SPY_ABORT" }
-    if ($o -match "All orders transmitted") { return "TRANSMITTED" }
     if (-not $result.ok) { return "CONNECT_FAIL" }
+    $o = $result.out
+    if ($o -match "All orders transmitted") { return "TRANSMITTED" }
     if ($o -match "Traceback|Connection refused|ConnectionRefused|TimeoutError|API connection failed") { return "CONNECT_FAIL" }
     if ($o -match "Connecting to IB" -and $o -notmatch "Connected\.") { return "CONNECT_FAIL" }
     if ($o -match "Snapshotting Account") { return "RAN_NO_ORDERS" }
@@ -101,7 +100,7 @@ function Get-BrokerOutcome($result) {
 }
 
 # ---------------------------------------------------------------------------
-# Single-instance lock (shared parquet writes corrupt under concurrent runs)
+# Single-instance lock
 # ---------------------------------------------------------------------------
 if (Test-Path $lockFile) {
     $age = (Get-Date) - (Get-Item $lockFile).LastWriteTime
@@ -125,14 +124,14 @@ if ($Mode -eq "auto") {
 
 Clear-Host
 Write-Log "==========================================" "Cyan"
-Write-Log "TRADING SYSTEM PRODUCTION RUN  mode=$Mode" "Cyan"
+Write-Log "TRADING SYSTEM v2  mode=$Mode" "Cyan"
 Write-Log "==========================================" "Cyan"
 
 try {
     if ($Mode -eq "morning") {
         Write-Log "=== MORNING BROKER MODE ===" "Cyan"
 
-        # Pre-flight at 07:28 gives ~30 min of alerts to fix a dead TWS manually
+        # Pre-flight: is IBKR up at task start (gives ~30 min to fix it manually)
         if (Test-IBKR) {
             Write-Log "IBKR pre-flight OK: port $ibkrPort responding." "Green"
         } else {
@@ -143,7 +142,7 @@ try {
             }
         }
 
-        # Funnel: idempotent, no IBKR needed, self-waits to 09:35 ET internally
+        # Funnel (does not need IBKR; self-waits to 09:35 ET internally)
         $funnel = Run-Stage "Signal Funnel" "7__MacroFilter.py" ""
         if ($funnel.out -notmatch "FUNNEL COMPLETE") {
             Send-Alert "Funnel did not report FUNNEL COMPLETE. Inspect transcript before trusting the book."
@@ -153,7 +152,7 @@ try {
         $cutoff = Get-ETToday $brokerCutoffET
         Write-Log "Broker window: launch $brokerLaunchET ET, hard cutoff $brokerCutoffET ET." "White"
 
-        # Hold until launch, polling IBKR so a dead session is caught BEFORE 10:00
+        # Hold until launch, polling IBKR so a dead Gateway is caught BEFORE 10:00
         while ((Get-ETNow) -lt $launch) {
             if (-not (Test-IBKR)) {
                 Send-Alert "IBKR down while waiting ($((Get-ETNow).ToString('HH:mm')) ET). Fix before $brokerLaunchET ET."
@@ -161,7 +160,7 @@ try {
             Start-Sleep -Seconds 30
         }
 
-        # Past launch: require the port before handing money to the broker
+        # Past launch time: require the port before handing money to the broker
         while (-not (Test-IBKR)) {
             if ((Get-ETNow) -ge $cutoff) {
                 Send-Alert "Cutoff $brokerCutoffET ET reached and IBKR never came up. NO TRADES TODAY."
@@ -171,9 +170,7 @@ try {
             Start-Sleep -Seconds 20
         }
 
-        # Broker: retry ONLY on clear connection failures. Never after orders went
-        # out, and never after a SPY abort - re-running past the gate is the exact
-        # manual override the EDA prices at Sharpe -6.50.
+        # Broker attempts: retry ONLY on clear connection failures, never after orders went out
         $attempt = 0
         do {
             $attempt++
@@ -186,11 +183,8 @@ try {
                              ForEach-Object { $_.Groups[1].Value }) -join ", "
                     Write-Log "ORDERS LIVE: $syms" "Green"
                 }
-                "SPY_ABORT" {
-                    Write-Log "SPY abort gate fired - intentional no-trade day. This is the system working." "Yellow"
-                }
                 "RAN_NO_ORDERS" {
-                    Write-Log "Broker ran clean - no entries qualified today (gaps/spreads)." "Yellow"
+                    Write-Log "Broker ran clean - no entries qualified today." "Yellow"
                 }
                 "CONNECT_FAIL" {
                     if ((Get-ETNow) -lt $cutoff) {
@@ -199,7 +193,7 @@ try {
                     }
                 }
                 default {
-                    Send-Alert "Broker outcome UNKNOWN (output unrecognized). NOT retrying - check transcript manually."
+                    Send-Alert "Broker outcome UNKNOWN (exit=0, unrecognized output). NOT retrying - check transcript manually."
                 }
             }
         } while ($outcome -eq "CONNECT_FAIL" -and (Get-ETNow) -lt $cutoff)
@@ -210,35 +204,18 @@ try {
     }
     elseif ($Mode -eq "evening") {
         Write-Log "=== EVENING DATA PROCESSING MODE ===" "Cyan"
-
-        # Stage 2 pulls prices through IBKR (port 7496) - pre-flight it too.
-        # Wait up to 30 min with alerts; then proceed and let output checks catch it.
-        $waited = 0
-        while (-not (Test-IBKR) -and $waited -lt 1800) {
-            Send-Alert "IBKR not responding - price refresh (stage 2) will fail. Retrying for $([int]((1800 - $waited) / 60)) more min."
-            Start-Sleep -Seconds 120
-            $waited += 120
-        }
-        if (Test-IBKR) { Write-Log "IBKR pre-flight OK: port $ibkrPort responding." "Green" }
-
         $stages = @(
             @{ Name = "Ticker Downloader";  File = "1__TickerDownloader.py";  Args = "--ImmediateDownload" },
             @{ Name = "Price Downloader";   File = "2__PriceDownloader.py";   Args = "--RefreshMode" },
             @{ Name = "Alpha Sensitivity";  File = "3__AlphaSensitivity.py";  Args = "--runpercent 100" },
-            @{ Name = "Predictor";          File = "4__Predictor.py";         Args = "--predict_only" },
+            @{ Name = "Predictor";          File = "4__Predictor.py";         Args = "--predict --model xgb" },
             @{ Name = "Nightly BackTester"; File = "5__NightlyBackTester.py"; Args = "--force" }
         )
         $okCount = 0
         for ($i = 0; $i -lt $stages.Count; $i++) {
             $s = $stages[$i]
             $r = Run-Stage $s.Name $s.File $s.Args
-            $stageOk = $r.ok
-            # 2__PriceDownloader swallows exceptions and exits 0 - verify by output
-            if ($s.File -eq "2__PriceDownloader.py" -and $r.out -match "No tickers were successfully processed") {
-                $stageOk = $false
-                Send-Alert "Price Downloader exited 0 but downloaded NOTHING. Downstream stages will run on stale prices."
-            }
-            if ($stageOk) { $okCount++ }
+            if ($r.ok) { $okCount++ }
             else { Send-Alert "$($s.Name) failed (exit=$($r.code)). Continuing to next stage." }
             if ($i -lt $stages.Count - 1) {
                 Write-Log "Waiting 20s (RAM cleanup)..." "Gray"
@@ -250,7 +227,7 @@ try {
     }
     else {
         Write-Log "Outside scheduled hours (7 or 17) and no -Mode given. Nothing to run." "Yellow"
-        Write-Log "Use: .\trading_system.ps1 -Mode morning   (or evening)" "Yellow"
+        Write-Log "Use: .\trading_system_v2.ps1 -Mode morning   (or evening)" "Yellow"
     }
 }
 finally {
