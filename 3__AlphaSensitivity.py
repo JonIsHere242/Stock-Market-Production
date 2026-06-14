@@ -2324,6 +2324,9 @@ def create_gap_zscore_predictors(df):
 
     return result_df
 
+
+
+
 # Price and volume based indicators
 def calculate_price_volume_indicators(df):
     """Fixed version without data leakage"""
