@@ -56,6 +56,7 @@ Run:
     python 4__Predictor.py --inspect               # print cached report
     python 4__Predictor.py --n_trials 10           # quick diagnostic run
     python 4__Predictor.py --no_tune               # skip Optuna (match pre-Optuna baseline)
+    python 4__Predictor.py --tune_device cuda       # run the Optuna search on GPU (~2 hr -> ~20 min; see FAST TUNING below)
 
 BEST PRACTICE — STANDARD RETRAIN
 ==================================
@@ -70,6 +71,39 @@ Do NOT raise --runpercent beyond 75 for a standard retrain — the OOS validatio
 slice (Dec 2025+) is load-bearing for the backtester's reported metrics, and
 shrinking it makes the backtest mostly in-sample. After this script completes,
 run the backtester: `python 5__NightlyBackTester.py --force [--sample N]`.
+
+FAST TUNING — RUN THE OPTUNA SEARCH ON GPU (~2 hr -> ~20 min)
+==============================================================
+The Optuna search (Phase 9) is the long pole of a retrain. Each trial fits an
+XGB `hist` model on the inner-train slice (~232k rows x ~1,416 features after the
+xs-rank expansion); the cost is dominated by per-round histogram construction
+scaled by the trial's depth/colsample/subsample, repeated every trial. Measured
+CPU cost is ~80-130s per trial, so the canonical `n_trials=100` search is ~2.5-3
+hours. Tree count barely moves it — it is the per-round work on the wide feature
+matrix that hurts.
+
+The lever is the GPU. Add `--tune_device cuda`:
+
+    python 4__Predictor.py ... --tune_device cuda
+
+  - Scope: ONLY the Optuna search runs on the GPU. The final model (Phase 10)
+    still trains on CPU, so the saved model and all inference (Phase 12) are
+    completely unchanged — no GPU is needed at predict time.
+  - Speed: GPU `hist` on this feature width is roughly an order of magnitude
+    faster on the search, taking the 100-trial run from ~2-3 hr toward ~20 min.
+    (GPU is SLOWER on tiny data due to kernel-launch overhead — the win only
+    shows up at this row x feature scale.)
+  - Reproducibility: GPU `hist` chooses slightly different split points than CPU
+    `hist`, so the tuned hyperparameters will not be bit-identical to a CPU
+    search. They are equally good — tuning is a search, not a fixed computation —
+    but if you need to reproduce a specific saved model's params exactly, keep
+    the default `--tune_device cpu`.
+  - GPU memory: the inner-train + eval QuantileDMatrices are ~1.5-2 GB plus
+    per-node histograms (fine on an 8 GB+ card). If you OOM, lower
+    `--tune_subsample` (default 0.35) to shrink the inner-train matrix.
+
+The default is `--tune_device cpu`, so the canonical retrain above is unchanged
+unless you opt in.
 """
 
 import os
@@ -79,7 +113,7 @@ import time
 import argparse
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 import numpy as np
 import pandas as pd
@@ -166,6 +200,8 @@ parser.add_argument("--no_tune", action="store_true", help="Skip Optuna tuning �
 parser.add_argument("--n_trials", type=int, default=100)
 parser.add_argument("--tune_subsample", type=float, default=0.35, help="Row fraction for each Optuna trial (speeds up tuning). Final fit uses full training data.")
 parser.add_argument("--tune_objective", choices=["top1_prec", "top1_meanret", "aucpr"], default="top1_meanret", help="Optuna objective. top1_meanret = mean return of top-1%% picks per day (the objective used in the winning run).")
+parser.add_argument("--tune_device", default="cpu", help="XGB device for the Optuna SEARCH fits only: cpu or cuda (or cuda:0). Default cpu = identical to the canonical run. 'cuda' runs the search on GPU (5-20x faster on wide feature sets). The final model is still trained on CPU, so the saved model + inference are unchanged. NOTE: GPU hist picks slightly different split points, so the tuned params won't be bit-identical to a CPU search (but are equally good).")
+parser.add_argument("--tune_gpus", type=int, default=1, help="Spread the Optuna SEARCH across N GPUs (round-robins trials over cuda:0..cuda:N-1 with n_jobs=N). Only active with --tune_device cuda. WITHIN-search parallelism: one CPU copy of the data feeds both GPUs (RAM-safe), unlike launching N processes (~38GB each). 2x 3070 -> ~1.6x search throughput.")
 
 # Inference
 parser.add_argument("--top_frac_per_day", type=float, default=0.01, help="Per-day fraction mapped to UpProb in [0.45, 0.70]. 0.01 = top 1%% per day (~10-15 names with universe ~1400).")
@@ -316,13 +352,27 @@ def mem_gb(df):
 # Phase 1+2: Load tickers + label engineering                                #
 # -------------------------------------------------------------------------- #
 def load_and_label_tickers(input_dir, target_col, date_col, horizon_5d,
-                            max_files=None):
+                            max_files=None, usecols_fn=None):
     """Load every parquet in input_dir, shift target -1 (next-day return),
-    add ret_5d (5-day forward return), drop last rows that have no label."""
+    add ret_5d (5-day forward return), drop last rows that have no label.
+
+    usecols_fn: optional name->bool predicate. When given, only the columns it
+    keeps are read from each parquet (intersected per-file so a missing column
+    never errors). Used to skip feature families that are dropped in Phase 6
+    anyway — pure I/O + memory savings, identical surviving rows/columns.
+    """
     files = sorted(f for f in os.listdir(input_dir) if f.endswith(".parquet"))
     if max_files:
         files = files[:max_files]
         logging.info(f"  --max_files {max_files}: using {len(files)} tickers")
+
+    def _read(fn):
+        path = os.path.join(input_dir, fn)
+        if usecols_fn is None:
+            return pq.read_table(path)
+        pf = pq.ParquetFile(path)
+        cols = [c for c in pf.schema_arrow.names if usecols_fn(c)]
+        return pf.read(columns=cols)
 
     parts = []
     n_skip_short = n_drop_nan = n_drop_outlier = 0
@@ -350,10 +400,7 @@ def load_and_label_tickers(input_dir, target_col, date_col, horizon_5d,
         return downcast(df) if not df.empty else None
 
     with ThreadPoolExecutor(max_workers=16) as ex:
-        future_to_fn = {
-            ex.submit(pq.read_table, os.path.join(input_dir, fn)): fn
-            for fn in files
-        }
+        future_to_fn = {ex.submit(_read, fn): fn for fn in files}
         for future in tqdm(as_completed(future_to_fn), total=len(files),
                            desc="Loading tickers"):
             fn = future_to_fn[future]
@@ -618,7 +665,7 @@ def per_day_top_k_mean_return(scores, returns, dates, k_frac=0.01):
 
 
 def run_optuna_tuning(X_train, y_train, ret_train, dates_train, sw_train,
-                       n_trials, objective_name, tune_subsample=1.0):
+                       n_trials, objective_name, tune_subsample=1.0, device="cpu", n_gpus=1):
     """Optuna search on an 80/20 inner walk-forward split of train.
 
     Returns (best_params, best_value, best_iter).
@@ -648,9 +695,11 @@ def run_optuna_tuning(X_train, y_train, ret_train, dates_train, sw_train,
                      f"{len(X_it):,} rows (most recent)")
 
     logging.info(f"  inner split: tr={len(X_it):,}  val={len(X_iv):,}")
-    logging.info(f"  optuna objective: {objective_name}")
+    logging.info(f"  optuna objective: {objective_name}  device: {device}  n_gpus: {n_gpus}")
+    multi_gpu = device.startswith("cuda") and n_gpus > 1
 
     def objective(trial):
+        dev = f"cuda:{trial.number % n_gpus}" if multi_gpu else device
         params = dict(
             n_estimators      = trial.suggest_int("n_estimators", 300, 1200),
             max_depth         = trial.suggest_int("max_depth", 4, 9),
@@ -664,7 +713,7 @@ def run_optuna_tuning(X_train, y_train, ret_train, dates_train, sw_train,
         )
         m = XGBClassifier(
             objective="binary:logistic", eval_metric="aucpr",
-            tree_method="hist", n_jobs=-1, random_state=42,
+            tree_method="hist", device=dev, n_jobs=-1, random_state=42,
             early_stopping_rounds=30, verbosity=0, **params,
         )
         fk = dict(eval_set=[(X_iv, y_iv)], verbose=False)
@@ -694,8 +743,9 @@ def run_optuna_tuning(X_train, y_train, ret_train, dates_train, sw_train,
 
     study = optuna.create_study(direction="maximize",
                                 sampler=optuna.samplers.TPESampler(seed=42))
+    _n_jobs = n_gpus if (device.startswith("cuda") and n_gpus > 1) else 1
     study.optimize(objective, n_trials=n_trials, callbacks=[_log],
-                   show_progress_bar=False)
+                   show_progress_bar=False, n_jobs=_n_jobs)
 
     logging.info(f"  best trial #{study.best_trial.number}  "
                  f"value={study.best_value:.4f}")
@@ -968,10 +1018,22 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
         if max_files:
             files = files[:max_files]
 
+        # Read only the columns the model + universe filter + output need. The
+        # dropped feature families never appear in feat_names, so projecting them
+        # away at read time is identical downstream (missing model features are
+        # still backfilled to 0.0 below). Big I/O + memory cut on wide v2 data.
+        needed = {date_col, ticker_col, "Open", "High", "Low", "Close", "Volume",
+                  "dollar_volume_ma_10", "atr_percentage", "RSI",
+                  "VIX_Close", "vix_close", "Distance to Resistance (%)",
+                  "Distance to Support (%)", "volatility"}
+        needed |= set(raw_features) | set(xs_src)
+
         def _load_arrow_infer(fn):
-            tbl = pq.read_table(os.path.join(input_dir, fn))
-            if date_col not in tbl.schema.names or len(tbl) == 0:
+            pf = pq.ParquetFile(os.path.join(input_dir, fn))
+            names = pf.schema_arrow.names
+            if date_col not in names or pf.metadata.num_rows == 0:
                 return None
+            tbl = pf.read(columns=[c for c in names if c in needed])
             if ticker_col not in tbl.schema.names:
                 tbl = tbl.append_column(
                     ticker_col,
@@ -1002,6 +1064,11 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
         del arrow_tables
 
         combined[date_col] = pd.to_datetime(combined[date_col])
+        # v2 FeatureFramework emits lowercase 'vix_close'; the backtester and the
+        # RFpredictions output schema require uppercase 'VIX_Close'. Alias so
+        # inference carries it through (otherwise the backtester drops the universe).
+        if "VIX_Close" not in combined.columns and "vix_close" in combined.columns:
+            combined["VIX_Close"] = combined["vix_close"]
         combined = downcast(combined)
         combined = combined.sort_values(date_col).reset_index(drop=True)
         logging.info(f"  combined: {combined.shape}  "
@@ -1093,16 +1160,33 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
                     "Distance to Support (%)", "volatility"]
         out_cols = [c for c in base_out + optional if c in combined.columns]
 
+        def _write_one(tk, sub):
+            sub.to_parquet(os.path.join(output_dir, f"{tk}.parquet"), index=False)
+
         n_written = 0
         pbar = tqdm(total=combined[ticker_col].nunique(), desc="Writing")
-        for tk, grp in combined.groupby(ticker_col, sort=False):
-            try:
-                grp[out_cols].to_parquet(
-                    os.path.join(output_dir, f"{tk}.parquet"), index=False)
-                n_written += 1
-            except Exception as e:
-                logging.warning(f"  failed {tk}: {e}")
-            pbar.update(1)
+        inflight = set()
+
+        def _harvest(done):
+            nonlocal n_written
+            for f in done:
+                try:
+                    f.result()
+                    n_written += 1
+                except Exception as e:
+                    logging.warning(f"  write failed: {e}")
+                pbar.update(1)
+
+        # Bounded parallelism: parquet write/compression releases the GIL, so
+        # threads overlap I/O. Cap in-flight tasks (each holds one small
+        # per-ticker copy) to keep peak memory flat.
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for tk, grp in combined.groupby(ticker_col, sort=False):
+                inflight.add(ex.submit(_write_one, tk, grp[out_cols].copy()))
+                if len(inflight) >= 32:
+                    done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                    _harvest(done)
+            _harvest(as_completed(inflight))
         pbar.close()
         logging.info(f"  wrote {n_written:,} ticker parquets to {output_dir}")
 
@@ -1817,11 +1901,34 @@ def main():
                 logging.info(f"  train: {len(train_df):,} rows from {train_cache}")
                 logging.info(f"  calib: {len(calib_df):,} rows from {calib_cache}")
         else:
+            # Read-projection: skip columns that Phase 6 would drop anyway
+            # (drop_feature_patterns / drop_features_exact / drop_vol_features)
+            # so wide dropped families never enter memory. Applied per-file at
+            # parquet read time; the surviving feature set is identical.
+            _exact   = {n.strip() for n in (args.drop_features_exact or "").split(",") if n.strip()}
+            _pats    = [p.strip() for p in (args.drop_feature_patterns or "").split(",") if p.strip()]
+            _protect = {args.date_column, args.ticker_column, args.target_column,
+                        "Open", "High", "Low", "Close", "Volume", args.vol_col,
+                        "dollar_volume_ma_10", "atr_percentage", "RSI"}
+
+            def _keep_col(c):
+                if c in _protect:
+                    return True
+                if c in _exact:
+                    return False
+                if any(p in c for p in _pats):
+                    return False
+                if args.drop_vol_features and is_vol_feature(c):
+                    return False
+                return True
+
+            usecols_fn = _keep_col if (_exact or _pats or args.drop_vol_features) else None
+
             # Phase 1+2: Load tickers + label engineering
             with Phase("Phase 1+2: Load tickers + label engineering"):
                 parts = load_and_label_tickers(
                     args.input_dir, args.target_column, args.date_column,
-                    args.horizon_5d, max_files=args.max_files)
+                    args.horizon_5d, max_files=args.max_files, usecols_fn=usecols_fn)
                 logging.info(f"  loaded {len(parts)} tickers, "
                              f"{sum(len(p) for p in parts):,} rows total")
 
@@ -1928,6 +2035,8 @@ def main():
                     n_trials=args.n_trials,
                     objective_name=args.tune_objective,
                     tune_subsample=args.tune_subsample,
+                    device=args.tune_device,
+                    n_gpus=args.tune_gpus,
                 )
                 logging.info(f"  inner-val {args.tune_objective} = {best_val:.4f}")
         else:

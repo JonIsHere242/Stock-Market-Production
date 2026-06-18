@@ -62,6 +62,13 @@ PRICE_FLOOR = 5.00         # exclude if latest close < $5
 MICRO_CAP_MAX_M = 952.0    # exclude if market cap < $952M (micro)
 WEEKLY_VOL_MAX_PCT = 5.0   # exclude if weekly volatility > 5.0% (the sharp cliff)
 RSI_DEATH_LO, RSI_DEATH_HI = 30.0, 40.0   # exclude if RSI(14) in the death zone
+# Cross-sectional UpProbability floor. map_pct_rank_to_upprob puts the model's
+# non-top-fraction names in [0.30,0.44]; an EDA on 944 real backtest trades
+# (2026-06-18) found [0.30,0.38) is a stable money-loser (neg PnL in both 2025-H2
+# and 2026-H1, ~42% win) while [0.42,0.44) is the profitable workhorse. Flooring at
+# 0.40 cuts the junk band only: +$4.7k total PnL, per-trade Sharpe 0.19->0.32. A
+# 0.45 floor was REJECTED (would cut the workhorse band, -$9k / -67% of profit).
+UPPROB_FLOOR = 0.40        # exclude if entry-day UpProbability < 0.40
 
 # Hardcoded ideological quarantine (union'd with QUARANTINE_DIR contents at runtime).
 QUARANTINE_SEED = {"HIMS", "DJT", "ODD"}
@@ -218,6 +225,12 @@ def hard_exclude(symbol, row, price_df, quarantine):
 
     if symbol.upper() in quarantine:
         reasons.append("ideological quarantine")
+
+    # Cross-sectional UpProbability floor (see UPPROB_FLOOR note). Cuts the model's
+    # stable-negative low band before it can fill the book on thin days.
+    up = row.get("UpProbability")
+    if pd.notna(up) and float(up) < UPPROB_FLOOR:
+        reasons.append(f"UpProb {float(up):.3f} < floor {UPPROB_FLOOR:.2f}")
 
     # Market cap (from the pool's FinViz snapshot at signal-generation time)
     cap = row.get("CapMillions")

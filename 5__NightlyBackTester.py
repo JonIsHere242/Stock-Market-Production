@@ -1519,6 +1519,13 @@ class StockSniperStrategy(bt.Strategy):
         UP_PROB_MIN_BOUND = 0.2
         UP_PROB_MAX_BOUND = 0.8
 
+        # Cross-sectional UpProbability floor (added 2026-06-18). EDA on 944 real
+        # trades: [0.30,0.38) is a stable money-loser (neg PnL both halves, ~42% win);
+        # flooring at 0.40 cuts only the junk band (+$4.7k PnL, per-trade Sharpe
+        # 0.19->0.32). A 0.45 floor was rejected (would cut the profitable [0.42,0.44)
+        # workhorse, -$9k). Env-gated so the canbuy A/B harness can sweep it.
+        UP_PROB_FLOOR = float(os.environ.get('BT_UPPROB_FLOOR', 0.40))
+
         # Financial Thresholds
         MIN_CLOSE_PRICE = 2.00       # was 1.50 -- both runs preferred ~2.0
         MAX_CLOSE_PRICE = 1650.00    # was 1000.00 -- both runs preferred ~1650
@@ -1529,8 +1536,8 @@ class StockSniperStrategy(bt.Strategy):
         MAX_SINGLE_DAY_DROP = -0.15
         RECENT_DROP_LOOKBACK_DAYS = 10
 
-        # Risk Management - 52-Week Position (unchanged -- runs disagreed)
-        WEEK_52_HIGH_PROXIMITY_LIMIT = 0.85
+        # Risk Management - 52-Week Position (env-gated for the canbuy_optimizer A/B; default 0.85)
+        WEEK_52_HIGH_PROXIMITY_LIMIT = float(os.environ.get('BT_W52', 0.85))
         WEEK_52_LOOKBACK_DAYS = 252
 
         # Risk Management - Momentum
@@ -1541,7 +1548,7 @@ class StockSniperStrategy(bt.Strategy):
         # Risk Management - Volume & Volatility
         VOLUME_SPIKE_MULTIPLIER = 3.5      # unchanged -- runs disagreed
         VOLUME_AVG_LOOKBACK_DAYS = 20
-        MAX_VOLATILITY_THRESHOLD = 0.10    # was 0.04 -- both runs preferred ~0.08-0.11
+        MAX_VOLATILITY_THRESHOLD = float(os.environ.get('BT_MAXVOL', 0.10))  # env-gated for canbuy_optimizer A/B; default 0.10
         VOLATILITY_LOOKBACK_DAYS = 20
 
         # Percentile Thresholds (sufficient-data path)
@@ -1578,6 +1585,10 @@ class StockSniperStrategy(bt.Strategy):
             return False
 
         if current_prob < UP_PROB_MIN_BOUND or current_prob > UP_PROB_MAX_BOUND:
+            return False
+
+        # Cross-sectional UpProb floor: skip the model's stable-negative low band.
+        if current_prob < UP_PROB_FLOOR:
             return False
 
         try:
