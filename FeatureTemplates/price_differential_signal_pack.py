@@ -63,15 +63,15 @@ METADATA = {
         "price_differential_ratio_weightedsignalstrength",
 
         # information efficiency
-        "price_differential_ratio_informationratio",
+        "price_differential_ratio_pack_informationratio",
 
-        "price_differential_ratio_autocorr_1d",
-        "price_differential_ratio_autocorr_3d",
-        "price_differential_ratio_autocorr_5d",
+        "price_differential_ratio_pack_autocorr_1d",
+        "price_differential_ratio_pack_autocorr_3d",
+        "price_differential_ratio_pack_autocorr_5d",
 
-        "price_differential_ratio_infodecay_1d",
-        "price_differential_ratio_infodecay_3d",
-        "price_differential_ratio_infodecay_5d",
+        "price_differential_ratio_pack_infodecay_1d",
+        "price_differential_ratio_pack_infodecay_3d",
+        "price_differential_ratio_pack_infodecay_5d",
     ],
     "tags": [
         "experimental",
@@ -230,12 +230,21 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
     returns      = s.pct_change()
     rolling_mean = returns.rolling(20).mean()
     rolling_std  = returns.rolling(20).std().fillna(epsilon).replace(0, epsilon)
-    new_cols[f"{base}_informationratio"] = rolling_mean / rolling_std
+    new_cols[f"{base}_pack_informationratio"] = rolling_mean / rolling_std
 
     for lag in [1, 3, 5]:
         autocorr = s.shift(lag).rolling(20, min_periods=10).corr(s)
-        new_cols[f"{base}_autocorr_{lag}d"] = autocorr
+        new_cols[f"{base}_pack_autocorr_{lag}d"] = autocorr
         autocorr_clamped = autocorr.clip(0, 1).fillna(0)
-        new_cols[f"{base}_infodecay_{lag}d"] = 1 - autocorr_clamped
+        new_cols[f"{base}_pack_infodecay_{lag}d"] = 1 - autocorr_clamped
 
     return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+# [AUDIT-CULL 2026-06-13] redundant near-duplicates removed from the model feature set.
+# Reversible: DELETE this whole block to restore the columns. Original compute() above is
+# untouched; this only drops the listed OUTPUT columns (each >=0.999 rank-correlated with a
+# RETAINED feature -> tree-redundant). Rationale: Data/PaperFeed/cull_decision.md
+_CULL_2026_06_13 = ['price_differential_ratio_diff_10d', 'price_differential_ratio_diff_1d', 'price_differential_ratio_logdiff_3d', 'price_differential_ratio_logdiff_5d', 'price_differential_ratio_pctchange_1d', 'price_differential_ratio_pctchange_3d', 'price_differential_ratio_pctchange_5d', 'price_differential_ratio_pctchange_10d', 'price_differential_ratio_zscore']
+_compute_precull = compute
+def compute(df):
+    return _compute_precull(df).drop(columns=_CULL_2026_06_13, errors="ignore")

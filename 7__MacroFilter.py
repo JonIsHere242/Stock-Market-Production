@@ -10,16 +10,24 @@ mechanical screens:
 
   Stage 0  Load pool, align to the next NYSE trading day, attach price history.
   Stage 1  HARD mechanical exclusions (free, no API): price floor, micro-cap,
-           weekly-vol cliff, RSI death-zone, ideological quarantine. Dropped.
-  Stage 2  SOFT mechanical delisting / merger flags (free, no API): penny/illiquid,
-           and a big-gap-then-vol-collapse "deal-peg" signature. These DEPRIORITIZE
-           and hand the name to the LLM to confirm; they do not drop on their own.
+           weekly-vol cliff, UpProbability floor, ideological quarantine. Dropped.
+  Stage 2  SOFT mechanical flags (free, no API): penny/illiquid, a big-gap-then-vol-
+           collapse "deal-peg" signature, and overbought (RSI>80) overextension. These
+           DEPRIORITIZE (and hand the name to the LLM); they do not drop on their own.
   Stage 3  LLM summary judgement (paid, best model, max effort) on survivors ONLY:
            claude-opus-4-8 + web_search confirms active M&A target / material
            crisis. Auto-SKIPS cleanly if the API key is unfunded/invalid — the
            mechanical funnel alone still produces a book.
-  Stage 4  Rank survivors by UpProbability, take the top 4 (clean first, then relax
-           soft-flags to fill 4 so capital stays deployed), write the book.
+  Stage 4  Rank survivors by UpProbability and take the top TARGET_BOOK_SIZE, subject to
+           an industry/sector CONCENTRATION cap (clean first, then relax soft-flags AND
+           the cap to fill the book so capital stays deployed), write the book.
+
+  NOTE (2026-06-24): the old Stage-1 RSI "death-zone" [30,40] HARD exclusion was REMOVED.
+  A 17.6k-candidate study (analysis_output/analyze_macro_filter.py) showed [30,40] is the
+  BEST RSI band (oversold-bounce, +0.173% vs +0.060% kept) — the gate was dropping winners
+  and was the only screen net-negative at book level (-0.029%/day). Overextension risk
+  (RSI>80) is now a soft de-prioritization, and the user-requested concentration cap was
+  added in Stage 4. See analysis_output/MACRO_FILTER_FINDINGS.md.
 
 IDEMPOTENT: if _Buy_Signals.parquet already holds a narrowed book dated for the
 next trading day (e.g. you funneled by hand via the trade-signals skill), this
@@ -39,6 +47,17 @@ import numpy as np
 import pandas as pd
 
 from Util import get_logger, get_next_trading_day
+
+# Shared industry classifier (FinViz Industry -> fine group, + coarse sector rollup). Used
+# for the Stage-4 concentration cap. Degrades gracefully if the module is unavailable.
+try:
+    from build_data_panels import group_from_text, coarse_sector, COARSE_FROM_GROUP
+except Exception:
+    COARSE_FROM_GROUP = {}
+    def group_from_text(_):       # type: ignore
+        return None
+    def coarse_sector(_):         # type: ignore
+        return "Other"
 
 logger = get_logger(script_name="7__MacroFilter")
 
@@ -60,8 +79,12 @@ MAX_BOOK = 12          # mirrors the broker's fail-safe guard
 # ── Stage 1 hard-exclusion thresholds (FilterRubric Step-1) ──────────────────────
 PRICE_FLOOR = 5.00         # exclude if latest close < $5
 MICRO_CAP_MAX_M = 952.0    # exclude if market cap < $952M (micro)
-WEEKLY_VOL_MAX_PCT = 5.0   # exclude if weekly volatility > 5.0% (the sharp cliff)
-RSI_DEATH_LO, RSI_DEATH_HI = 30.0, 40.0   # exclude if RSI(14) in the death zone
+WEEKLY_VOL_MAX_PCT = 5.0   # exclude if weekly volatility > 5.0% (the sharp cliff). VALIDATED
+                           # both ways (2026-06-24): excluded names -0.08% net vs +0.32% kept
+                           # on real intraday fills; +candidate panel monotonic. Keep.
+# RSI(14) overbought de-prioritization (SOFT, see soft_flags). The old [30,40] HARD
+# "death-zone" exclusion was REMOVED 2026-06-24 — it was dropping the best RSI band.
+RSI_OVERBOUGHT_HI = 80.0   # soft-flag if RSI(14) > 80 (panel: RSI>80 = -0.43%, worst band)
 # Cross-sectional UpProbability floor. map_pct_rank_to_upprob puts the model's
 # non-top-fraction names in [0.30,0.44]; an EDA on 944 real backtest trades
 # (2026-06-18) found [0.30,0.38) is a stable money-loser (neg PnL in both 2025-H2
@@ -79,6 +102,18 @@ MERGER_GAP_PCT = 15.0      # a single-day move this big...
 MERGER_POSTVOL_MAX = 1.0   # ...followed by daily realized vol below this % => deal-peg
 DELIST_PRICE = 3.00        # penny-ish
 DELIST_DOLLAR_VOL = 1_000_000.0   # median 20d dollar volume below this => illiquid
+
+# ── Concentration risk (industry / sector crowding) ──────────────────────────────
+# The book is equal-weight (~1/TARGET_BOOK_SIZE per name, see 9_SuperFastBroker's
+# PositionSizer), so a 0.50 group cap == "don't let >50% of the portfolio sit in one
+# industry" — exactly the user's biotech / gold-miner example. A 17.6k-candidate study
+# (analysis_output/concentration_risk.py) found dangerous single-industry crowding in the
+# daily top-10 is RARE (fires on ~2% of book-days) and capping it costs ~0.00%/day of mean
+# return — near-free tail insurance against a correlated single-theme drawdown. The caps
+# are SOFT: if honoring them would leave the book unfilled, they relax (capital deployed).
+SECTOR_MAP_FILE = "Data/SectorMap.parquet"   # built by build_data_panels.py sector (SEC SIC codes)
+CONC_GROUP_CAP_FRAC  = 0.50   # max book fraction in one fine IndustryGroup (Biotech, GoldMiner, ...)
+CONC_SECTOR_CAP_FRAC = 0.70   # looser cap on the coarse Sector (Healthcare, Tech, Energy, ...)
 
 # ── Stage 3 LLM config (see claude-api skill) ────────────────────────────────────
 LLM_MODEL = "claude-opus-4-8"   # best model — real money
@@ -144,6 +179,103 @@ def load_quarantine():
         for p in glob.glob(os.path.join(QUARANTINE_DIR, "*.parquet")):
             q.add(os.path.splitext(os.path.basename(p))[0].upper())
     return q
+
+
+FINVIZ_CACHE_FILE = "Data/finviz_sector_cache.parquet"
+
+
+def load_sector_map():
+    """ticker -> (Sector, IndustryGroup) from Data/SectorMap.parquet (build_data_panels.py sector).
+    Returns {} (concentration cap silently DISABLED) if the map is missing/unreadable."""
+    if not os.path.exists(SECTOR_MAP_FILE):
+        logger.warning(f"No {SECTOR_MAP_FILE} — concentration cap DISABLED "
+                       f"(run: python build_data_panels.py sector to enable).")
+        return {}
+    try:
+        df = pd.read_parquet(SECTOR_MAP_FILE)
+        return {str(r.Ticker).upper(): (str(r.Sector), str(r.IndustryGroup))
+                for r in df.itertuples()}
+    except Exception as e:
+        logger.warning(f"Could not load sector map ({e}) — concentration cap DISABLED.")
+        return {}
+
+
+def load_finviz_cache():
+    """ticker -> (FvSector, FvIndustry) cached from prior FinViz pulls (build_data_panels.py
+    sector --finviz, and live top-ups below). FinViz Industry is the cleanest source — it tags
+    foreign gold miners (Barrick/Osisko/Triple Flag) that SEC SIC codes miss."""
+    if not os.path.exists(FINVIZ_CACHE_FILE):
+        return {}
+    try:
+        df = pd.read_parquet(FINVIZ_CACHE_FILE)
+        return {str(r.Ticker).upper(): (str(r.FvSector), str(r.FvIndustry)) for r in df.itertuples()}
+    except Exception:
+        return {}
+
+
+def _live_finviz(symbol, fv_cache):
+    """Best-effort single-ticker FinViz Sector/Industry; updates fv_cache. Never raises —
+    a FinViz outage must not block the broker's 10:00 ET lock-in. Returns (sec, industry)."""
+    try:
+        from finvizfinance.quote import finvizfinance
+        f = finvizfinance(symbol).ticker_fundament()
+        sec, ind = str(f.get("Sector", "") or ""), str(f.get("Industry", "") or "")
+        fv_cache[symbol.upper()] = (sec, ind)
+        return sec, ind
+    except Exception:
+        return "", ""
+
+
+def industry_group(symbol, row, sector_map, fv_cache):
+    """Resolve (coarse_sector, fine_group) for the concentration cap, in priority order:
+       1. pool-row FinViz columns (written by 5__NightlyBackTester's signal pull),
+       2. the FinViz cache, 3. a best-effort live FinViz call, 4. the SIC sector map.
+    'Unknown' names (ETFs/ADRs/unclassifiable) are a heterogeneous grab-bag, NOT a real
+    single-industry bet, so the caller gives them a unique key (they never pool to a cap)."""
+    sym = symbol.upper()
+    # The coarse sector is always rolled up from the fine group (coarse_sector) so the
+    # sector-level cap pools consistently regardless of which source named the group
+    # (FinViz says "Basic Materials", SIC says "Materials" — both must count as one sector).
+    # 1. pool row carries FinViz fields (fresh, no network)
+    for col in ("FinvizIndustry", "Industry"):
+        val = row.get(col) if hasattr(row, "get") else None
+        if val is not None and pd.notna(val):
+            g = group_from_text(str(val))
+            if g:
+                return coarse_sector(g), g
+    # 2. FinViz cache  /  3. live FinViz top-up
+    fv = fv_cache.get(sym) or (_live_finviz(sym, fv_cache) if fv_cache is not None else None)
+    if fv:
+        g = group_from_text(fv[1])
+        if g:
+            return coarse_sector(g), g
+    # 4. SIC sector map (its Sector is already a coarse_sector label)
+    sec, grp = sector_map.get(sym, ("Unknown", "Unknown"))
+    if grp not in ("", "Unknown", "nan", "None"):
+        return coarse_sector(grp) if grp in COARSE_FROM_GROUP else sec, grp
+    return "Unknown", "Unknown"
+
+
+def _conc_keys(symbol, row, sector_map, fv_cache):
+    """Concentration counting keys. Unknown/unmapped names get a unique key so they never
+    pool toward a cap."""
+    sec, grp = industry_group(symbol, row, sector_map, fv_cache)
+    if grp in ("", "Unknown", "nan", "None"):
+        grp = f"_uniq_{symbol.upper()}"
+    if sec in ("", "Unknown", "nan", "None"):
+        sec = f"_uniq_{symbol.upper()}"
+    return sec, grp
+
+
+def _save_finviz_cache(fv_cache):
+    """Persist FinViz top-ups gathered during the run (best-effort)."""
+    if not fv_cache:
+        return
+    try:
+        pd.DataFrame([{"Ticker": k, "FvSector": v[0], "FvIndustry": v[1]}
+                      for k, v in fv_cache.items()]).to_parquet(FINVIZ_CACHE_FILE, index=False)
+    except Exception:
+        pass
 
 
 def load_price_history(ticker):
@@ -246,17 +378,16 @@ def hard_exclude(symbol, row, price_df, quarantine):
     if price is not None and price < PRICE_FLOOR:
         reasons.append(f"price ${price:.2f} < ${PRICE_FLOOR:.2f}")
 
-    # Weekly volatility cliff + RSI death-zone (computed from price history)
+    # Weekly volatility cliff (computed from price history). The old RSI(14) [30,40]
+    # "death-zone" HARD exclusion was REMOVED here 2026-06-24 — the 17.6k-candidate study
+    # showed [30,40] is the BEST RSI band (oversold bounce), so the gate dropped winners
+    # (only net-negative screen at book level). Overextension (RSI>80) is now a SOFT flag.
     if price_df is not None and "Close" in price_df.columns:
-        close = price_df["Close"]
         wv = compute_weekly_vol_pct(price_df)
         if wv is not None and wv > WEEKLY_VOL_MAX_PCT:
             reasons.append(f"weekly vol {wv:.1f}% > {WEEKLY_VOL_MAX_PCT:.1f}%")
-        rsi = compute_rsi14(close)
-        if rsi is not None and RSI_DEATH_LO <= rsi <= RSI_DEATH_HI:
-            reasons.append(f"RSI {rsi:.0f} in death-zone [{RSI_DEATH_LO:.0f},{RSI_DEATH_HI:.0f}]")
     else:
-        logger.info(f"[{symbol}] no price history — vol/RSI checks skipped")
+        logger.info(f"[{symbol}] no price history — vol check skipped")
 
     return (len(reasons) > 0), reasons
 
@@ -286,6 +417,14 @@ def soft_flags(symbol, price_df):
         recent_vol = float(rets.tail(10).std() * 100.0)
         if max_move >= MERGER_GAP_PCT and recent_vol < MERGER_POSTVOL_MAX:
             flags.append(f"deal-peg signature (gap {max_move:.0f}%, vol {recent_vol:.1f}%)")
+
+    # Overextension: very overbought names mean-revert (panel RSI>80 = -0.43%, worst band).
+    # SOFT — deprioritizes the name but still lets it fill the book on a thin day. (Kept
+    # soft rather than a hard cut because the few RSI>80 names that were actually TAKEN
+    # historically did fine — a real-fill survivorship signal that argues against dropping.)
+    rsi = compute_rsi14(close)
+    if rsi is not None and rsi > RSI_OVERBOUGHT_HI:
+        flags.append(f"overbought (RSI {rsi:.0f} > {RSI_OVERBOUGHT_HI:.0f})")
     return flags
 
 
@@ -573,7 +712,20 @@ def main():
     judge = LLMJudge(skip=args.skip_llm)
     if judge.enabled:
         wait_for_research_window(args.no_wait)   # hold for post-open news before web-searching
-    chosen = []   # list of (survivor-dict, verdict, was_checked)
+
+    # Concentration cap setup (Stage 4). Caps are slot counts derived from the book size.
+    sector_map = load_sector_map()
+    fv_cache = load_finviz_cache()
+    conc_enabled = bool(sector_map) or bool(fv_cache)
+    grp_cap = max(1, int(TARGET_BOOK_SIZE * CONC_GROUP_CAP_FRAC))
+    sec_cap = max(1, int(TARGET_BOOK_SIZE * CONC_SECTOR_CAP_FRAC))
+    if conc_enabled:
+        logger.info(f"Concentration cap: <= {grp_cap}/{TARGET_BOOK_SIZE} per industry, "
+                    f"<= {sec_cap}/{TARGET_BOOK_SIZE} per sector (soft; relaxes to fill the book).")
+    grp_counts, sec_counts = {}, {}
+
+    chosen = []          # list of (survivor-dict, verdict, was_checked)
+    deferred_conc = []   # LLM-cleared names held back by a concentration cap (relax-fill later)
     checks = 0
     for cand in ordered:
         if len(chosen) >= TARGET_BOOK_SIZE:
@@ -588,8 +740,30 @@ def main():
                 continue
         else:
             verdict, checked = dict(NEUTRAL_VERDICT), False
+
+        # Concentration cap (soft): hold a name back if its industry/sector slot is full.
+        if conc_enabled:
+            sec, grp = _conc_keys(cand["symbol"], cand["row"], sector_map, fv_cache)
+            grp_full = grp_counts.get(grp, 0) >= grp_cap
+            sec_full = sec_counts.get(sec, 0) >= sec_cap
+            if grp_full or sec_full:
+                where = grp if grp_full else sec
+                logger.info(f"[{cand['symbol']}] held back: {('industry' if grp_full else 'sector')} "
+                            f"concentration cap ({where}) already at limit")
+                deferred_conc.append((cand, verdict, checked))
+                continue
+            grp_counts[grp] = grp_counts.get(grp, 0) + 1
+            sec_counts[sec] = sec_counts.get(sec, 0) + 1
         chosen.append((cand, verdict, checked))
 
+    # Relax the concentration cap ONLY if needed to keep capital deployed (thin-book days).
+    if len(chosen) < TARGET_BOOK_SIZE and deferred_conc:
+        need = TARGET_BOOK_SIZE - len(chosen)
+        for cand, verdict, checked in deferred_conc[:need]:
+            logger.info(f"[{cand['symbol']}] added back (relaxing concentration cap to fill book)")
+            chosen.append((cand, verdict, checked))
+
+    _save_finviz_cache(fv_cache)   # persist any live FinViz top-ups gathered this run
     selected = [c["symbol"] for c, _, _ in chosen]
     if not selected:
         logger.warning("Nothing survived to selection — leaving the existing book UNTOUCHED "

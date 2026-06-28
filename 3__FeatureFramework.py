@@ -63,11 +63,19 @@ OHLCV_COLS = ["Date", "Ticker", "Open", "High", "Low", "Close", "Volume"]
 # SECTION 1 -- Block discovery
 # ===========================================================================
 
-def discover_blocks() -> dict:
+def discover_blocks(include_candidates: bool = False) -> dict:
     """
     Import every .py file in FeatureTemplates/ whose name does NOT start with
     an underscore.  Files starting with _ or __ are skipped (they are
     templates, helpers, or documentation).
+
+    Parameters
+    ----------
+    include_candidates : if True, ALSO import single-underscore CANDIDATE blocks
+        (e.g. ``_paper_*``) so tooling can check them. Pure helpers (``_marketcap``,
+        ``_indexes``, ...) lack METADATA/compute and are still skipped by the check
+        below; double-underscore tooling files are never imported. Default False
+        keeps the production build to promoted blocks only.
 
     Returns
     -------
@@ -77,8 +85,11 @@ def discover_blocks() -> dict:
     blocks: dict = {}
 
     for path in sorted(TEMPLATES_DIR.glob("*.py")):
-        if path.stem.startswith("_"):
-            continue
+        stem = path.stem
+        if stem.startswith("__"):
+            continue                                  # tooling/templates -- never blocks
+        if stem.startswith("_") and not include_candidates:
+            continue                                  # single-_ candidates/helpers: opt-in only
 
         spec = importlib.util.spec_from_file_location(path.stem, path)
         mod  = importlib.util.module_from_spec(spec)
@@ -166,6 +177,7 @@ def run_pipeline_timed(
     df:      pd.DataFrame,
     exclude: list[str] | None = None,
     verbose: bool = False,
+    include_candidates: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Run all active feature blocks on df, timing each block individually.
@@ -193,7 +205,7 @@ def run_pipeline_timed(
     }
     """
     exclude_set = set(exclude or [])
-    all_blocks  = discover_blocks()
+    all_blocks  = discover_blocks(include_candidates=include_candidates)
     blocks      = {k: v for k, v in all_blocks.items() if k not in exclude_set}
     order       = resolve_order(blocks)
 

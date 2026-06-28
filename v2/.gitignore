@@ -1,0 +1,14 @@
+# generated artifacts
+_demo_work/
+_beyond_work/
+_alpha_work/
+_catalog/
+_real_catalog/
+_ctmp/
+_viz/
+_viztmp/
+*.tmp
+
+# python
+__pycache__/
+*.pyc

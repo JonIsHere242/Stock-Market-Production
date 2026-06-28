@@ -1,14 +1,71 @@
-﻿
-# --- added by setup.ps1: never commit secrets, venv, data, or caches ---
-stock_env/
-Data/
-__pycache__/
-*.pyc
+# =====================================================================
+#  Stock-Market — push CODE, never data / secrets / scratch.
+#  Philosophy: track the running system (main whole-number pipeline +
+#  FeatureFramework + FeatureDiscovery + fetchers + libs). Everything
+#  regenerable, machine-local, or experimental stays off GitHub.
+# =====================================================================
+
+# --- secrets / credentials (NEVER commit; .example templates are kept) ---
 .fred_api_key
 Claud-API-KEY.txt
 .alpaca_keys
 .env
-*.log
+*.pem
+*.key
 
-# large analysis artifact — exceeds GitHub's 100MB hard limit (kept on disk, just not pushed)
-analysis_output/interaction_search/interactions_all.csv
+# --- python env / caches ---
+stock_env/
+__pycache__/
+*.pyc
+
+# --- the 400GB+ data lake & all data/model artifacts (regenerable) ---
+Data/
+*.parquet
+# ...but keep these small "flex" snapshots at the repo root:
+!Correlations.parquet
+!_Buy_Signals.parquet
+!trade_history.parquet
+*.feather
+*.csv
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+*.h5
+
+# --- logs / profiles / runtime state ---
+*.log
+*.prof
+*.jsonl
+.claude/scheduled_tasks.lock
+
+# --- editor / scratch backups ---
+*.bak
+
+# --- research scratch & backups (not the running system) ---
+analysis_output/
+_backups/
+_archive/
+experimental/
+FeatureTemplates/_audit_backups/
+
+# --- pipeline VARIANTS / experiments (keep only whole-number main stages) ---
+# dotted stages (e.g. 5.1__, 4.1__) and sub-numbered (8_1__, 8_2__)
+[0-9].[0-9]*__*.py
+[0-9]_[0-9]__*.py
+# alternate predictor / backtester implementations
+4__Predictorv*.py
+5__NightlyBackTester_*.py
+
+# --- one-off research scripts at repo root ---
+breadth_sweep.py
+sizer_ab.py
+wait_then_breadth.py
+wait_then_sizer.py
+
+# --- claude code machine-local settings + internal research notes ---
+.claude/settings.local.json
+.claude/docs/
+
+# Note: showcase/*.pdf and showcase/*.html are intentionally tracked (portfolio).

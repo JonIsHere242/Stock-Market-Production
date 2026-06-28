@@ -12,7 +12,9 @@ METADATA = {
 
 
 def compute(df: pd.DataFrame) -> pd.DataFrame:
-    epsilon = 1e-6
+    # PARITY: live pipeline calls add_price_differential_ratio(df, epsilon=1e-10)
+    # at 3__AlphaSensitivity.py:3569 -- match that, not the function default (1e-6).
+    epsilon = 1e-10
 
     df["price_differential_ratio"] = (
         (0.1673 / (df["High"] + epsilon) - df["Low"])

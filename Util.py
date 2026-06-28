@@ -3408,9 +3408,159 @@ def create_ib_connection(host='127.0.0.1', port=7497, max_attempts=3, timeout=20
 
 
 
+def count_lines_of_code(root="."):
+    """LOC + on-disk data tally for the project. Run via `python Util.py --loc`.
+
+    For Python it splits each file into code / docstrings / comments / blank using the
+    `tokenize` module, so heavy structured docstrings (e.g. the FeatureTemplates blocks)
+    don't inflate the code count. Other code languages get a code/comment/blank split by
+    comment prefix; Markdown/Text are reported as prose. Skips venv/cache/.git for code;
+    Data/ & backups are size-only (never line-counted).
+    """
+    import io
+    import token
+    import tokenize
+    from collections import defaultdict
+
+    SKIP = {".git", "__pycache__", "stock_env", ".vscode", ".idea",
+            ".mypy_cache", ".pytest_cache", ".ipynb_checkpoints", "node_modules"}
+    NO_LOC = {"Data", "_backups", "_old_versions"}  # size-only, never line-counted
+    # ext -> (label, mode): "PY" = tokenize split, "PROSE" = non-blank only,
+    # a string prefix = comment marker, None = no comment syntax.
+    LANG = {".py": ("Python", "PY"), ".ps1": ("PowerShell", "#"), ".psm1": ("PowerShell", "#"),
+            ".sh": ("Shell", "#"), ".bash": ("Shell", "#"), ".sql": ("SQL", "--"),
+            ".js": ("JS", "//"), ".ts": ("TS", "//"), ".toml": ("Config", "#"),
+            ".yaml": ("Config", "#"), ".yml": ("Config", "#"), ".ini": ("Config", "#"),
+            ".cfg": ("Config", "#"), ".json": ("Config", None), ".ipynb": ("Notebook", None),
+            ".md": ("Markdown", "PROSE"), ".txt": ("Text", "PROSE")}
+    RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
+                *(f"lpt{i}" for i in range(1, 10))}  # stray Windows device-name files
+    SKIP_TOK = {token.NEWLINE, token.NL, token.INDENT, token.DEDENT,
+                token.ENCODING, token.ENDMARKER}
+
+    def classify_python(src):
+        """(code, doc, comment, blank). doc = lines belonging to a standalone string
+        (docstrings). A line with any real token counts as code even if it also has an
+        inline comment; a #-only line is a comment."""
+        lines = src.splitlines()
+        code_ln, str_ln, com_ln = set(), set(), set()
+        try:
+            for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+                t, _, (srow, _), (erow, _), _ = tok
+                if t == token.COMMENT:
+                    com_ln.add(srow)
+                elif t == token.STRING:
+                    str_ln.update(range(srow, erow + 1))  # all lines a multi-line string spans
+                elif t not in SKIP_TOK:
+                    code_ln.add(srow)
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            pass  # classify whatever was collected before the error
+        code = doc = comment = blank = 0
+        for i, ln in enumerate(lines, 1):
+            if not ln.strip():
+                blank += 1
+            elif i in code_ln:
+                code += 1
+            elif i in str_ln:
+                doc += 1
+            elif i in com_ln:
+                comment += 1
+            else:
+                code += 1  # safety net for anything unclassified
+        return code, doc, comment, blank
+
+    def classify_prefix(src, prefix):
+        """(code, comment, blank) for non-Python code by single-line comment prefix."""
+        code = comment = blank = 0
+        for ln in src.splitlines():
+            s = ln.strip()
+            if not s:
+                blank += 1
+            elif prefix and s.startswith(prefix):
+                comment += 1
+            else:
+                code += 1
+        return code, comment, blank
+
+    root = os.path.abspath(root)
+    agg = defaultdict(lambda: [0, 0, 0, 0, 0])  # label -> [files, code, doc, comment, blank]
+    prose = defaultdict(lambda: [0, 0])         # label -> [files, non-blank lines]
+    top_py = []                                 # (code, doc, relpath)
+    data_bytes = parquet_n = 0
+
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in SKIP]
+        top = "." if dp == root else os.path.relpath(dp, root).split(os.sep)[0]
+        for f in fn:
+            if os.path.splitext(f)[0].lower() in RESERVED:
+                continue
+            p = os.path.join(dp, f)
+            try:
+                data_bytes += os.path.getsize(p)
+            except OSError:
+                continue
+            ext = os.path.splitext(f)[1].lower()
+            parquet_n += ext == ".parquet"
+            if ext not in LANG or top in NO_LOC:
+                continue
+            try:
+                with open(p, encoding="utf-8", errors="ignore") as fh:
+                    src = fh.read()
+            except OSError:
+                continue
+            label, mode = LANG[ext]
+            rp = os.path.relpath(p, root)
+            if mode == "PROSE":
+                prose[label][0] += 1
+                prose[label][1] += sum(1 for ln in src.splitlines() if ln.strip())
+            elif mode == "PY":
+                c, d, cm, bl = classify_python(src)
+                a = agg[label]; a[0] += 1; a[1] += c; a[2] += d; a[3] += cm; a[4] += bl
+                top_py.append((c, d, rp))
+            else:
+                c, cm, bl = classify_prefix(src, mode)
+                a = agg[label]; a[0] += 1; a[1] += c; a[3] += cm; a[4] += bl
+
+    def human(b):
+        for u in ("B", "KB", "MB", "GB", "TB"):
+            if b < 1024 or u == "TB":
+                return f"{int(b)} {u}" if u == "B" else f"{b:,.1f} {u}"
+            b /= 1024
+
+    def cell(v):
+        return f"{v:>10,}" if v else f"{'-':>10}"
+
+    print(f"\n=== LINES OF CODE -- {root} ===")
+    print(f"  {'Language':<11}{'Files':>6}{'Code':>10}{'Docstr':>10}{'Comment':>10}{'Blank':>10}{'Total':>10}")
+    print("  " + "-" * 67)
+    tot = [0, 0, 0, 0, 0]
+    for label in sorted(agg, key=lambda k: sum(agg[k][1:4]), reverse=True):
+        a = agg[label]
+        print(f"  {label:<11}{a[0]:>6}{cell(a[1])}{cell(a[2])}{cell(a[3])}{cell(a[4])}{sum(a[1:]):>10,}")
+        tot = [tot[i] + a[i] for i in range(5)]
+    print("  " + "-" * 67)
+    print(f"  {'TOTAL':<11}{tot[0]:>6}{cell(tot[1])}{cell(tot[2])}{cell(tot[3])}{cell(tot[4])}{sum(tot[1:]):>10,}")
+
+    py = agg.get("Python")
+    if py and (py[1] + py[2] + py[3]):
+        nb = py[1] + py[2] + py[3]
+        print(f"  Python non-blank = {nb:,}:  {100*py[1]/nb:.0f}% code, "
+              f"{100*py[2]/nb:.0f}% docstrings, {100*py[3]/nb:.0f}% comments")
+    if prose:
+        print("  prose: " + ",  ".join(f"{lab} {v[0]}f {v[1]:,} ln"
+              for lab, v in sorted(prose.items(), key=lambda kv: kv[1][1], reverse=True)))
+    if top_py:
+        print("  biggest Python (code / docstr lines):")
+        for c, d, rp in sorted(top_py, reverse=True)[:5]:
+            print(f"     {c:>6,} / {d:>5,}   {rp}")
+    print(f"=== DATA ON DISK: {human(data_bytes)} total, {parquet_n:,} parquet files ===\n")
+
+
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Consolidated trading system utilities")
+    parser.add_argument("--loc", action="store_true",
+                        help="Count lines of code + on-disk data size for the project, then exit")
     
     # Main commands (subparsers for different functions)
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -3453,6 +3603,9 @@ def parse_args():
     metrics_parser.add_argument("--count", type=int, default=5,
                                help="Number of metrics to show")
     
+    # Lines-of-code / data-size report command
+    subparsers.add_parser("loc", help="Count lines of code + on-disk data size for the project")
+
     # Migration command
     subparsers.add_parser("migrate", help="Migrate from legacy data files")
     
@@ -3492,7 +3645,12 @@ def main():
     """Main command line interface function"""
     args = parse_args()
     logger = get_logger()
-    
+
+    # --loc flag (or `loc` subcommand) runs the code/data report and exits
+    if getattr(args, "loc", False) or args.command == "loc":
+        count_lines_of_code()
+        return
+
     # If no command provided, show help
     if not args.command:
         parse_args.__globals__['parser'].print_help()

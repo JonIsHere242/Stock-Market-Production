@@ -10,7 +10,6 @@ METADATA = {
         "new_high",
         "days_since_high",
         "percent_range",
-        "high_close_ratio",
         "high_close_ratio_norm",
     ],
     "tags": [
@@ -58,16 +57,19 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
         * 100.0
     )
 
-    df["high_close_ratio"] = (
+    # NOTE: high_close_ratio is no longer emitted as an output column (the
+    # faithful version is produced by orig_orig_canbuy_volume_priceaction). It
+    # is retained here only as a local intermediate for high_close_ratio_norm.
+    _high_close_ratio = (
         (high - close)
         / (close + 1e-10)
     )
 
-    shifted_ratio = df["high_close_ratio"].shift(1)
+    shifted_ratio = _high_close_ratio.shift(1)
 
     norm = (
         (
-            df["high_close_ratio"]
+            _high_close_ratio
             - shifted_ratio.rolling(50).mean()
         )
         /
@@ -77,3 +79,14 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
     df["high_close_ratio_norm"] = norm.clip(-3, 3)
 
     return df
+
+# [AUDIT-CULL 2026-06-13] redundant near-duplicates removed from the model feature set.
+# Reversible: DELETE this whole block to restore the columns. Original compute() above is
+# untouched; this only drops the listed OUTPUT columns (each >=0.999 rank-correlated with a
+# RETAINED feature -> tree-redundant). Rationale: Data/PaperFeed/cull_decision.md
+# high_close_ratio is no longer produced by this block (ownership ceded to
+# orig_orig_canbuy_volume_priceaction); only high_close_ratio_norm remains culled.
+_CULL_2026_06_13 = ['high_close_ratio_norm']
+_compute_precull = compute
+def compute(df):
+    return _compute_precull(df).drop(columns=_CULL_2026_06_13, errors="ignore")

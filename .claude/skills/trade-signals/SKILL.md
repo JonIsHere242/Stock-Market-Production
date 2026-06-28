@@ -9,14 +9,34 @@ This is the morning workflow for the Stock-Market project. It cleans the signals
 
 **Treat the live file as production.** Always back up before modifying. Always confirm before launching the broker.
 
+## The two signal files — READ THIS FIRST
+
+The pipeline uses **two** parquet files and they are NOT interchangeable:
+
+- **`Data/0__signals.parquet`** — the wide **candidate pool** (≈12 names) the nightly
+  pipeline refreshes. This is the file you READ and run the rubric against.
+- **`_Buy_Signals.parquet`** (repo root) — the **narrowed book** (≤ `MAX_BOOK`, target 4)
+  the broker ACTUALLY trades. `9_SuperFastBroker.py` hard-codes
+  `BUY_SIGNALS_FILE = _Buy_Signals.parquet` and reads **nothing else**. Editing the pool
+  has **zero** effect on what the broker trades until you write your picks into this file.
+
+So the whole point of the workflow is: read the pool → pick the 4 → **write them to
+`_Buy_Signals.parquet`** → verify that file → launch. A stale `_Buy_Signals.parquet` left
+over from a previous day gets traded as-is if you don't overwrite it — this exact bug
+shipped a 4-day-old book on 2026-06-26 (broker filled NEM/B/EL/OR/GPK off 06-22 signals
+while the day's real picks sat unused in the pool). The Step 6 write + Step 7 guardrail
+below exist specifically to prevent that.
+
 ## Inputs and outputs
 
-- **Read:** `Data/0__signals.parquet`, `FilterRubric.txt`
-- **Write:** `Data/0__signals.parquet` (in place, after backup), `Data/0__signals_backup_<TIMESTAMP>.parquet`
-- **Run:** `python 9_SuperFastBroker.py` (live IBKR, port 7496)
+- **Read:** `Data/0__signals.parquet` (candidate pool), `FilterRubric.txt`
+- **Write:** `_Buy_Signals.parquet` (the broker's book — your selected ≤4), plus
+  timestamped backups of **both** files before any change.
+- **Run:** `python 9_SuperFastBroker.py` (live IBKR, port 7496) — reads `_Buy_Signals.parquet`.
 
-## Step 1 — Inspect and relabel the signals file
+## Step 1 — Inspect and relabel the candidate pool
 
+This operates on the **candidate pool** `Data/0__signals.parquet` (not the broker book).
 Use a single Python one-liner via Bash. Always timestamp the backup so old runs aren't clobbered.
 
 ```python
@@ -37,7 +57,9 @@ df_fresh['LastUpdate']  = now
 df_fresh.to_parquet('Data/0__signals.parquet', index=False)
 ```
 
-Report: backup path, rows dropped as stale (with symbols), rows kept.
+Report: backup path, rows dropped as stale (with symbols), rows kept. **If EVERY row is
+stale (all `CreatedDate < today`), the nightly pipeline did not run — stop and tell the
+user; do not run the rubric or trade on a stale pool.**
 
 ## Step 2 — Research each remaining ticker
 
@@ -60,14 +82,19 @@ Walk every ticker through the rubric **in order**:
    - Weekly volatility > 5.0% — **the sharpest cliff edge; non-negotiable** — *auto-computed*
    - RSI between 30 and 40 (the death zone) — *auto-computed*
 
-   **The four *auto-computed* checks are already baked into the signals file.** The
-   nightly backtester runs `signal_filter.prefilter_signals_file()` as its last step,
-   adding columns `MechRSI14`, `MechWeeklyVolPct`, `MechExclude` (bool), `MechReasons`
-   (str) to `Data/0__Signals.parquet`. Rows are **kept, not dropped** — just flagged.
-   Read these columns first; for any row with `MechExclude == True`, the price / cap /
-   weekly-vol / RSI verdict is done — only confirm the two web-research exclusions
-   (M&A, crisis) and the soft flags. If the file is missing the `Mech*` columns (e.g.
-   hand-edited mid-cycle), re-run `python signal_filter.py` to regenerate them.
+   **The four *auto-computed* checks were historically baked into the signals file** as
+   columns `MechRSI14`, `MechWeeklyVolPct`, `MechExclude` (bool), `MechReasons` (str),
+   written by `signal_filter.prefilter_signals_file()`. **As of 2026-06-26 `signal_filter.py`
+   has been removed and the `Mech*` columns are usually ABSENT** — the import in `Util.py`
+   fails silently, so don't count on them being there. Check for the columns first; if they
+   exist and `MechExclude == True`, record the reason and move on. **If they're missing (the
+   normal case now), compute the four checks yourself from the FinViz data you already pulled
+   in Step 2:**
+   - Price < $2.00
+   - Market cap < $952M (micro-cap)
+   - Weekly Vol (Volatility W) > 5.0%
+   - RSI(14) between 30 and 40
+   Any one true ⇒ the same hard exclusion. Don't try to re-run `signal_filter.py`; it's gone.
 
 2. **Step 2 risk flags** — count them: A Beta>1.25, B small-cap with negative Perf Quarter, C below SMA200, D Recom<1.5, E D/E>3.0, F Real Estate or Consumer Cyclical sector, G Perf Quarter<-5%.
 
@@ -124,27 +151,68 @@ KEY REASON: [1–2 sentences — the most important factor]
 
 End with the **selection table** (the deliverable): rank | ticker | UpProb | tier | flags | positives | size | key reason — the top 4 first, then 2 alternates below a `-- alternates --` divider, then a `SELECTED FOR THE BOOK:` line listing the 4 symbols (or fewer on a thin day).
 
-## Step 6 — Trim the file to the selected 4
+## Step 6 — Write the selected 4 to the broker's book (`_Buy_Signals.parquet`)
 
-**Confirm with the user before modifying the file.** They are the final authority on the final 4 — including whether a Tier-3 (50% size) name ships or a slot is left empty on a thin day.
+**This is the step that actually matters — it's the only file the broker reads.** Pull the
+selected rows from the pool (they carry the full rich schema the broker wants: `StopPrice`,
+`TargetPrice`, `ATR`, etc.) and **overwrite** `_Buy_Signals.parquet`. Always overwrite, never
+append — a leftover stale book is exactly the failure mode this prevents.
 
-After confirmation, keep the selected symbols (the 4, ranked; alternates only ship if the user swaps one in):
+**Confirm with the user before writing.** They are the final authority on the final 4 —
+including whether a Tier-3 (50% size) name ships or a slot is left empty on a thin day.
 
 ```python
-import pandas as pd, shutil
+import pandas as pd, shutil, os
 from datetime import datetime
-ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+ts    = datetime.now().strftime('%Y%m%d_%H%M%S')
+today = pd.Timestamp(datetime.now().strftime('%Y-%m-%d'))
+now   = pd.Timestamp.now()
+
+# Back up BOTH files before touching anything.
 shutil.copy('Data/0__signals.parquet', f'Data/0__signals_backup_pretrim_{ts}.parquet')
-df = pd.read_parquet('Data/0__signals.parquet')
-keep = [<the selected symbols, in rank order>]
-df[df['Symbol'].isin(keep)].to_parquet('Data/0__signals.parquet', index=False)
+if os.path.exists('_Buy_Signals.parquet'):
+    shutil.copy('_Buy_Signals.parquet', f'Data/_Buy_Signals_backup_{ts}.parquet')
+
+pool = pd.read_parquet('Data/0__signals.parquet')
+keep = [<the selected symbols, in rank order>]          # e.g. ['CMBT','RHI','AEO','TOST']
+
+book = pool[pool['Symbol'].isin(keep)].copy()
+book['_o'] = book['Symbol'].map({s: i for i, s in enumerate(keep)})
+book = book.sort_values('_o').drop(columns='_o').reset_index(drop=True)
+book['Status']      = 'Pending'
+book['TargetDate']  = today
+book['SignalDate']  = today
+book['LastUpdated'] = now
+book['LastUpdate']  = now
+book.to_parquet('_Buy_Signals.parquet', index=False)    # <-- the file the broker reads
+print('Wrote', len(book), 'to _Buy_Signals.parquet:', list(book['Symbol']))
 ```
 
-Then run a final QC: row count, no nulls in `Symbol/UpProbability/CurrentPrice/StopPrice/TargetPrice`, all `Status == 'Pending'`, all dated today, `StopPrice < CurrentPrice < TargetPrice`.
+Then run a final QC **against `_Buy_Signals.parquet`** (not the pool): row count == number
+selected, no nulls in `Symbol/UpProbability/CurrentPrice/StopPrice/TargetPrice`, all
+`Status == 'Pending'`, all dated today, `StopPrice < CurrentPrice < TargetPrice`.
 
-## Step 7 — Launch the live broker
+## Step 7 — Verify the broker's input, then launch
 
-`9_SuperFastBroker.py` defaults to **port 7496 (LIVE IBKR)**. It waits until 10:00 ET, then gates on SPY direction (abort if SPY ≤ −0.5%) and per-stock gap (skip if gapped > +2% at open — the script has its own intraday filter that can veto a rubric-Include).
+`9_SuperFastBroker.py` defaults to **port 7496 (LIVE IBKR)**. It waits until 10:00 ET, then gates on SPY direction (abort if SPY ≤ −0.5%) and per-stock gap (skip if gapped > +2% at open — the script has its own intraday filter that can veto a rubric-Include). It reads **`_Buy_Signals.parquet`**, filters to `Status == 'Pending'`, and **aborts if more than `MAX_BOOK` (12) pending rows are present**.
+
+**Guardrail — run this BEFORE launch.** It reads the broker's actual input and confirms it is today's book and nothing stale. This is the check that would have caught the 2026-06-26 incident:
+
+```python
+import pandas as pd
+from datetime import datetime
+EXPECTED = [<the selected symbols>]          # same list you wrote in Step 6
+b = pd.read_parquet('_Buy_Signals.parquet')
+today = pd.Timestamp(datetime.now().strftime('%Y-%m-%d'))
+assert set(b['Symbol']) == set(EXPECTED), f"book {sorted(b['Symbol'])} != selected {sorted(EXPECTED)}"
+assert (b['Status'] == 'Pending').all(), "non-Pending rows present"
+assert (pd.to_datetime(b['TargetDate']).dt.normalize() == today).all(), "STALE rows — _Buy_Signals.parquet not refreshed today"
+assert len(b) <= 12, "exceeds MAX_BOOK — broker will abort"
+print('OK to launch:', list(b['Symbol']))
+```
+
+If any assertion fails, **do not launch** — go back to Step 6. A stale or mismatched
+`_Buy_Signals.parquet` is the one failure mode that silently trades the wrong names.
 
 **Confirm with the user one more time before launch.** This is real money.
 
@@ -162,6 +230,18 @@ When the background task completes, read the log and report:
 
 ## Notes on common surprises
 
+- **The broker reads `_Buy_Signals.parquet`, NOT `Data/0__signals.parquet`.** This is the
+  single most important thing in this skill. The pool is for picking; the book is for
+  trading. If you only edit the pool, the broker trades whatever stale book is already on
+  disk. Always write Step 6 and run the Step 7 guardrail.
+- **`_Buy_Signals.parquet` can be a stale leftover.** The nightly narrowing step (in
+  `7__MacroFilter.py`) does not reliably refresh it — on 2026-06-26 the pool was fresh but
+  `_Buy_Signals.parquet` was 4 days old, and the broker traded the old names. Overwrite it
+  every run; never trust its existing contents.
+- **The broker also writes its own log** to `Data/logging/FastExecutor.log` regardless of
+  the tee'd `broker_run_*.log`. If the tee file is missing or empty, read
+  `Data/logging/FastExecutor.log` to confirm what the broker actually did (it records the
+  exact symbol batch it read, so it's the ground truth for which file/book was traded).
 - **The signals file may be empty or pre-filled with stale rows.** If empty, say so and stop — don't fabricate signals.
 - **The rubric's RSI death zone is 30-40, not <30.** RSI just above 40 (e.g. 42) is close-but-allowed; flag it as a watch.
 - **Strong Buy consensus (Recom < 1.5) is a flag, not a positive.** Counterintuitive — historical worst-WR band.

@@ -54,6 +54,18 @@ BUY_SIGNALS_FILE = os.path.join(os.path.dirname(__file__), "_Buy_Signals.parquet
 # narrowed), the broker refuses to place any orders.
 MAX_BOOK = 12
 
+# Fail-safe: STALENESS of the narrowed book. The book's TargetDate is the trading day it
+# was built FOR; the broker runs on that day, so a fresh book is dated today. Staleness is
+# measured in TRADING days (np.busday_count, so weekends don't count against it):
+#   0 trading days   → fresh, trade normally
+#   1 trading day    → WARN (yellow) but proceed (e.g. a late/manual run)
+#   >= STALE_ABORT_TDAYS → ABORT: place NO orders, print a big red banner
+# 2026-06-26 incident: the broker filled a 4-trading-day-old book (TargetDate 06-22)
+# because the morning narrowing left a stale _Buy_Signals.parquet in place and nothing
+# checked the date. Bump STALE_ABORT_TDAYS if you ever want to tolerate older books.
+STALE_WARN_TDAYS  = 1
+STALE_ABORT_TDAYS = 2
+
 ET = ZoneInfo('America/New_York')
 
 
@@ -275,6 +287,81 @@ class AsyncFastExecutor:
 
     # ── Step 3 + 4: Execute with entry filters ─────────────────────────────────
 
+    def _check_book_freshness(self, signals_df) -> bool:
+        """Reject a STALE narrowed book before any orders are placed.
+
+        Returns True if the book is fresh enough to trade, False if the broker should
+        ABORT (place no orders). Staleness = trading days between the book's TargetDate
+        and today (ET): 0 fine, 1 warn-and-proceed, >= STALE_ABORT_TDAYS loud banner +
+        abort. Guards against the 2026-06-26 stale-book incident.
+        """
+        date_col = next(
+            (c for c in ('TargetDate', 'SignalDate', 'CreatedDate', 'LastUpdated')
+             if c in signals_df.columns),
+            None,
+        )
+        dates = (pd.to_datetime(signals_df[date_col], errors='coerce').dropna()
+                 if date_col else pd.Series([], dtype='datetime64[ns]'))
+        if dates.empty:
+            self.logger.warning(
+                f"STALE CHECK SKIPPED: {os.path.basename(BUY_SIGNALS_FILE)} has no usable "
+                f"date column (looked for TargetDate/SignalDate/CreatedDate/LastUpdated) -- "
+                f"cannot verify freshness. Proceeding, but confirm the book was built today."
+            )
+            return True
+
+        book_date   = dates.max().date()
+        today_et    = datetime.now(ET).date()
+        stale_tdays = int(np.busday_count(book_date, today_et))
+        symbols     = signals_df['Symbol'].unique().tolist()
+
+        if stale_tdays <= 0:
+            self.logger.info(
+                f"Book freshness OK: TargetDate {book_date:%Y-%m-%d} (today {today_et:%Y-%m-%d})."
+            )
+            return True
+
+        if stale_tdays < STALE_ABORT_TDAYS:   # exactly 1 trading day old (with default config)
+            self.logger.warning(
+                f"STALE BOOK ({stale_tdays} trading day old): {os.path.basename(BUY_SIGNALS_FILE)} "
+                f"is dated {book_date:%Y-%m-%d (%a)} but today is {today_et:%Y-%m-%d (%a)}. "
+                f"Proceeding, but verify these are still today's intended names: {symbols}."
+            )
+            return True
+
+        # >= STALE_ABORT_TDAYS — refuse and scream.
+        self._scream_stale_book(book_date, today_et, stale_tdays, symbols)
+        return False
+
+    def _scream_stale_book(self, book_date, today_et, stale_tdays, symbols):
+        """Emit an unmissable ~25-line red banner explaining the stale-book abort.
+
+        ASCII-only on purpose: a Windows cp1252 console raises UnicodeEncodeError on box-
+        drawing/emoji glyphs, which would turn a safety abort into a crash.
+        """
+        bar  = "#" * 64
+        yell = "  ERROR ERROR ERROR ERROR ERROR ERROR ERROR ERROR ERROR  "
+        lines = [
+            "", bar, bar, yell, yell, bar, "",
+            "        STALE SIGNAL BOOK  --  REFUSING TO TRADE",
+            "",
+            f"   {os.path.basename(BUY_SIGNALS_FILE)} is {stale_tdays} TRADING DAYS OLD.",
+            f"   Book TargetDate : {book_date:%Y-%m-%d (%a)}",
+            f"   Today (ET)      : {today_et:%Y-%m-%d (%a)}",
+            f"   Stale symbols   : {', '.join(symbols)}",
+            "",
+            "   The morning narrowing step (7__MacroFilter.py / the trade-signals",
+            "   funnel) did NOT refresh the book, so the broker was about to fill a",
+            "   days-old shortlist as if it were today's signals.",
+            "",
+            "   >>>  NO ORDERS PLACED.  <<<",
+            "   Regenerate _Buy_Signals.parquet for today, then relaunch the broker.",
+            "",
+            yell, yell, bar, bar, "",
+        ]
+        for ln in lines:
+            self.logger.error(ln)
+
     async def execute_batch(self, market_conds: dict):
         """
         Execute pending signals, applying three EDA-derived entry filters:
@@ -321,6 +408,10 @@ class AsyncFastExecutor:
             return
         if signals_df.empty:
             self.logger.info("No pending signals found in _Buy_Signals.parquet.")
+            return
+
+        # ── Fail-safe: reject a STALE book before placing any orders ───────────────
+        if not self._check_book_freshness(signals_df):
             return
 
         symbols = signals_df['Symbol'].unique().tolist()

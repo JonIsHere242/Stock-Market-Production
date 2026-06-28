@@ -303,7 +303,7 @@ class AlphaDiscoverySystem:
         
         sorted_results = sorted(self.results, key=lambda x: x['alpha_score'], reverse=True)
         
-        print(f"\n🔍 ALPHA DISCOVERY RESULTS (Top {min(limit, len(sorted_results))})")
+        print(f"\n ALPHA DISCOVERY RESULTS (Top {min(limit, len(sorted_results))})")
         print("=" * 80)
         
         for i, result in enumerate(sorted_results[:limit], 1):
@@ -379,7 +379,7 @@ def main():
     system = AlphaDiscoverySystem(delay=args.delay)
     
     # Run analysis
-    print("🚀 Trading Alpha Discovery System")
+    print(" Trading Alpha Discovery System")
     print(f"Seed terms: {', '.join(args.terms)}")
     
     try:

@@ -231,6 +231,13 @@ parser.add_argument("--wf_seeds", type=int, default=4, help="Seeds per (config,a
 parser.add_argument("--wf_workers", type=int, default=4, help="Concurrent fits (threads; XGB releases the GIL during fit). Total cores ~= wf_workers * wf_threads.")
 parser.add_argument("--wf_threads", type=int, default=8, help="n_jobs per fit. Default 8; with wf_workers=4 that's 32 cores.")
 parser.add_argument("--wf_device", default="cpu", help="XGB device for walk-forward fits: cpu or cuda (or cuda:0/cuda:1).")
+# --- BAG-EVAL mode (additive, flag-gated; measures bagging, does NOT ship it) ---
+parser.add_argument("--wf_bag", action="store_true", help="BAG-EVAL mode: for each (config,anchor) fit S seeds ONCE, then measure whether BAGGING the predictions (averaging probs OR per-day ranks across K seeds) preserves top1_net while shrinking the per-seed noise floor. Sweeps bag size K. Writes walkforward_bag_report.txt + walkforward_bag_results.parquet. Touches NO live model/predictions.")
+parser.add_argument("--wf_bag_configs", default="prod_optuna", help="Comma list of SWEEP_CONFIGS to bag-eval (default the live production config).")
+parser.add_argument("--wf_bag_seeds", type=int, default=12, help="S = seeds fit per (config,anchor). Larger S = tighter variance estimate (and more fits). Bags are drawn from these S.")
+parser.add_argument("--wf_bag_ks", default="1,3,5,8", help="Comma list of bag sizes K to evaluate (K=1 = single-seed noise floor baseline).")
+parser.add_argument("--wf_bag_bags", type=int, default=10, help="B = random K-seed bags sampled (without replacement within a bag) to estimate across-bag std. K=1 uses all S singles instead.")
+parser.add_argument("--wf_bag_mode", default="both", choices=["prob", "rank", "both"], help="Bag-combine method: 'prob' (avg probabilities), 'rank' (avg per-day percentile ranks), or 'both'.")
 
 args = parser.parse_args()
 
@@ -761,7 +768,7 @@ def run_optuna_tuning(X_train, y_train, ret_train, dates_train, sw_train,
 def train_model(X_train, y_train, tuned_params, sw_train, scale_pos_weight,
                 n_estimators, max_depth, learning_rate, min_child_weight,
                 reg_alpha, reg_lambda, subsample, colsample_bytree,
-                early_stopping_rounds):
+                early_stopping_rounds, seed=42):
     """Fit final XGBClassifier on full training data.
 
     Uses last 20% of train as internal val for early stopping.
@@ -784,7 +791,7 @@ def train_model(X_train, y_train, tuned_params, sw_train, scale_pos_weight,
     clf = XGBClassifier(
         scale_pos_weight=spw,
         objective="binary:logistic", eval_metric="aucpr",
-        tree_method="hist", n_jobs=-1, random_state=42,
+        tree_method="hist", n_jobs=-1, random_state=seed,
         early_stopping_rounds=early_stopping_rounds, verbosity=1,
         **xgb_params,
     )
@@ -1089,23 +1096,40 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
             if c not in combined.columns:
                 combined[c] = 0.0
 
-    with Phase("Compute cross-sectional ranks (universe rows only)"):
-        if xs_features:
-            available_xs_src = [c for c in xs_src if c in combined.columns]
-            xs_present = [c + "_xs" for c in available_xs_src]
-            filtered = combined.loc[quality_mask, available_xs_src]
-            grouped  = filtered.groupby(combined.loc[quality_mask, date_col], sort=False)
-            ranks    = grouped.rank(pct=True, method="average", na_option="keep")
-            ranks.columns = xs_present
-            xs_arr = np.full((len(combined), len(xs_present)), np.float32(0.5), dtype=np.float32)
-            xs_arr[quality_mask.values] = ranks[xs_present].values.astype(np.float32)
-            xs_df = pd.DataFrame(xs_arr, columns=xs_present, index=combined.index)
-            combined = pd.concat([combined, xs_df], axis=1)
-            del xs_arr, xs_df
-            logging.info(f"  computed xs ranks for {len(xs_present)} features")
+    with Phase("Build prediction matrix X (mem-efficient: batched f32 xs-rank, no concat)"):
+        # Build X directly as ONE float32 array in feat_names order: raw features copy from
+        # `combined`; xs features get the per-day percentile rank of their source column
+        # (quality rows only, 0.5 elsewhere), ranked in COLUMN BATCHES so the float64 rank
+        # intermediate is capped to one batch. Replaces the old float64 full-rank + the
+        # pd.concat frame-doubling + the .astype/.replace copies that spiked RAM at inference.
+        # BIT-IDENTICAL output (verified: 0 mismatched cells, predict matches) at ~60% lower peak.
+        qmask = quality_mask.values
+        qidx  = np.where(qmask)[0]
+        X = np.empty((len(combined), len(feat_names)), dtype=np.float32)
+        dvals = combined.loc[quality_mask, date_col]
+        xs_idx = []
+        for j, col in enumerate(feat_names):
+            if col.endswith("_xs"):
+                X[:, j] = np.float32(0.5)
+                xs_idx.append((j, col[:-3]))
+            else:
+                X[:, j] = combined[col].to_numpy(np.float32, copy=False)
+        if xs_idx:
+            BATCH = 50
+            for i in range(0, len(xs_idx), BATCH):
+                chunk = xs_idx[i:i + BATCH]
+                srcs  = [s for _, s in chunk]
+                rv = (combined.loc[quality_mask, srcs]
+                      .groupby(dvals, sort=False)
+                      .rank(pct=True, method="average", na_option="keep")
+                      .to_numpy(np.float32))     # cast f64->f32 immediately, drop the f64 frame
+                for bi, (j, s) in enumerate(chunk):
+                    X[qidx, j] = rv[:, bi]
+                del rv
+        np.putmask(X, ~np.isfinite(X), np.nan)    # inf -> nan (XGBoost missing)
+        logging.info(f"  built X {X.shape} ({len(xs_idx)} xs cols, mem-efficient)")
 
     with Phase("Predict"):
-        X = combined[feat_names].astype(np.float32).replace([np.inf, -np.inf], np.nan)
         scores = clf.predict_proba(X)[:, 1].astype(np.float32)
         logging.info(f"  raw scores: min={scores.min():.4f} p50={np.median(scores):.4f} "
                      f"p95={np.percentile(scores, 95):.4f} max={scores.max():.4f}")
@@ -1641,6 +1665,11 @@ SWEEP_CONFIGS = {
     "prod_optuna":  dict(n_estimators=304, max_depth=8, learning_rate=0.0509,
                          min_child_weight=15, subsample=0.886, colsample_bytree=0.444,
                          reg_alpha=0.0048, reg_lambda=0.0223, gamma=0.283),
+    # Faithful proxy for the LIVE shipped untuned-v2 model (Data/_ship_v2/model:
+    # tuned_params=null -> argparse defaults; early-stopped ~114 trees -> fix 120).
+    "ship_v2_untuned": dict(n_estimators=120, max_depth=5, learning_rate=0.05,
+                         min_child_weight=5, subsample=0.8, colsample_bytree=0.6,
+                         reg_alpha=0.5, reg_lambda=2.0, gamma=0.0),
     "d3":           dict(_SWEEP_BASE, n_estimators=300, max_depth=3),
     "d4":           dict(_SWEEP_BASE, n_estimators=300, max_depth=4),
     "d5":           dict(_SWEEP_BASE, n_estimators=300, max_depth=5),
@@ -1844,6 +1873,245 @@ def run_walkforward_sweep():
 
 
 # -------------------------------------------------------------------------- #
+# Walk-forward BAG-EVAL — does averaging K seeds' PREDICTIONS kill the per-seed #
+# noise floor without killing top1_net? Fits S seeds per (config,anchor) ONCE,  #
+# then evaluates prob-averaged and rank-averaged bags of size K (sweeping K).   #
+# Read-only: writes only walkforward_bag_* reports, never the live model.       #
+# -------------------------------------------------------------------------- #
+def _perday_pctrank(vec, dvec):
+    """Per-day percentile rank (pct=True) of `vec`, grouped by date vector `dvec`."""
+    return (pd.DataFrame({"s": vec, "d": dvec})
+            .groupby("d", sort=False)["s"]
+            .rank(pct=True, method="average")
+            .to_numpy(np.float64))
+
+
+def run_walkforward_bag():
+    date_col, target_col = args.date_column, args.target_column
+    out_report  = os.path.join(args.model_dir, "walkforward_bag_report.txt")
+    out_parquet = os.path.join(args.model_dir, "walkforward_bag_results.parquet")
+
+    configs = [c.strip() for c in args.wf_bag_configs.split(",") if c.strip()]
+    for c in configs:
+        if c not in SWEEP_CONFIGS:
+            raise ValueError(f"unknown bag config '{c}'. Known: {list(SWEEP_CONFIGS)}")
+    ks = sorted({int(k) for k in args.wf_bag_ks.split(",") if k.strip()})
+    S  = args.wf_bag_seeds
+    B  = args.wf_bag_bags
+    if max(ks) > S:
+        raise ValueError(f"max bag K={max(ks)} exceeds --wf_bag_seeds S={S}")
+    do_prob = args.wf_bag_mode in ("prob", "both")
+    do_rank = args.wf_bag_mode in ("rank", "both")
+
+    # ---- load + filter + feature matrix + label (ONCE) — mirrors run_walkforward_sweep ----
+    with Phase("BAG: load + label all tickers"):
+        parts = load_and_label_tickers(args.input_dir, target_col, date_col,
+                                       args.horizon_5d, max_files=args.wf_max_tickers)
+        if not parts:
+            logging.error("No data loaded.")
+            return
+        df = pd.concat(parts, ignore_index=True)
+        del parts
+        df[date_col] = pd.to_datetime(df[date_col])
+
+    with Phase("BAG: universe filter"):
+        df, _ = apply_quality_filter(df)
+        df = df.sort_values(date_col, kind="stable").reset_index(drop=True)
+
+    with Phase("BAG: build feature matrix (base + xs ranks)"):
+        base_cols = select_base_features(df)
+        if USE_XS:
+            df = add_xs_rank_features(df, base_cols, date_col)
+            feat_names = base_cols + [c + "_xs" for c in base_cols]
+        else:
+            feat_names = base_cols
+        logging.info(f"  features: {len(feat_names)}")
+
+    with Phase("BAG: arrays (one-time float32 cast)"):
+        Xall = df[feat_names].to_numpy(np.float32)
+        Xall[~np.isfinite(Xall)] = np.nan
+        y_all = topq_label(df[target_col].values, df[date_col].values,
+                           top_frac=args.topq_frac).astype(np.int8)
+        ret_all   = df[target_col].to_numpy(np.float32)
+        dates_all = df[date_col].values.astype("datetime64[ns]")
+        ym_all    = df[date_col].dt.to_period("M").astype(str).to_numpy()
+        # CRITICAL: free the wide source df (base + xs cols, ~2700 cols x 1M rows ~= tens of GB)
+        # BEFORE the fit phase. Everything downstream uses only the numpy arrays above; holding df
+        # alongside Xall + concurrent DMatrices thrashed RAM (51GB + swap) and stalled the fits.
+        del df
+        import gc; gc.collect()
+        logging.info(f"  Xall {Xall.shape} ~{Xall.nbytes/1e9:.1f}GB  (source df freed)")
+
+    # anchors: month m -> train<=last date of m, OOS = month m+1
+    months = sorted(pd.unique(ym_all))
+    min_anchor = str(pd.Period(args.wf_min_anchor, freq="M"))
+    anchors = []
+    for i in range(len(months) - 1):
+        m, nxt = months[i], months[i + 1]
+        if m < min_anchor:
+            continue
+        if (ym_all == nxt).sum() == 0:
+            continue
+        if len(np.unique(dates_all[ym_all == nxt])) < 5:
+            continue
+        anchors.append((m, dates_all[ym_all == m].max(), nxt))
+    if not anchors:
+        logging.error("  no anchors — lower --wf_min_anchor or add data.")
+        return
+    logging.info(f"  anchors: {len(anchors)} ({anchors[0][0]}->{anchors[-1][0]})  "
+                 f"configs={configs}  S={S} seeds  Ks={ks}  B={B}  mode={args.wf_bag_mode}")
+
+    # per-anchor precompute: train prefix length k, recency weights, OOS range
+    anchor_info = {}
+    for (m, anchor_date, nxt) in anchors:
+        k = int(np.searchsorted(dates_all, anchor_date, side="right"))
+        sw = recency_weights(pd.Series(dates_all[:k]), 720.0)
+        oi = np.where(ym_all == nxt)[0]
+        anchor_info[m] = (k, sw, int(oi[0]), int(oi[-1]) + 1, nxt)
+
+    # ---- fit all (config, anchor, seed) ONCE; keep each seed's OOS prob vector ----
+    jobs = [(cfg, m, seed) for cfg in configs
+            for (m, _ad, _nxt) in anchors for seed in range(S)]
+    logging.info(f"  total fits: {len(jobs)}  "
+                 f"({len(configs)} cfg x {len(anchors)} anchor x {S} seed)")
+
+    def _fit_one(job):
+        cfg, m, seed = job
+        k, sw, olo, ohi, _oos = anchor_info[m]
+        params = dict(SWEEP_CONFIGS[cfg])
+        n_est = params.pop("n_estimators", 300)
+        clf = XGBClassifier(n_estimators=n_est, tree_method="hist",
+                            objective="binary:logistic", eval_metric="aucpr",
+                            device=args.wf_device, n_jobs=args.wf_threads,
+                            random_state=1000 + seed, **params)
+        clf.fit(Xall[:k], y_all[:k], sample_weight=sw)        # views, zero-copy
+        prob = clf.predict_proba(Xall[olo:ohi])[:, 1].astype(np.float64)
+        return (cfg, m, seed, prob)
+
+    probs = {(cfg, m): [None] * S for cfg in configs for (m, _a, _n) in anchors}
+    done = 0
+    with Phase(f"BAG: {len(jobs)} fits ({args.wf_workers} concurrent)"):
+        with ThreadPoolExecutor(max_workers=args.wf_workers) as ex:
+            futs = {ex.submit(_fit_one, j): j for j in jobs}
+            for fut in as_completed(futs):
+                done += 1
+                try:
+                    cfg, m, seed, prob = fut.result()
+                    probs[(cfg, m)][seed] = prob
+                    if done % max(1, len(jobs) // 20) == 0 or done == len(jobs):
+                        logging.info(f"  [{done}/{len(jobs)}] fit {cfg} {m} s{seed}")
+                except Exception as e:
+                    j = futs[fut]
+                    logging.warning(f"  job {j} failed: {repr(e)[:120]}")
+
+    # ---- evaluate bags (reproducible composition) ----
+    rng = np.random.RandomState(12345)
+    def _bag_sets(K):
+        if K == 1:
+            return [[s] for s in range(S)]            # all singles = clean noise floor
+        return [sorted(rng.choice(S, size=K, replace=False).tolist()) for _ in range(B)]
+
+    rows = []
+    for cfg in configs:
+        for (m, _a, _n) in anchors:
+            k, sw, olo, ohi, oos_period = anchor_info[m]
+            seed_probs = probs[(cfg, m)]
+            if any(p is None for p in seed_probs):
+                logging.warning(f"  {cfg}@{m}: some seeds missing, skipping anchor")
+                continue
+            dvec = dates_all[olo:ohi]
+            seed_ranks = [_perday_pctrank(p, dvec) for p in seed_probs] if do_rank else None
+            for K in ks:
+                for bag_id, bag in enumerate(_bag_sets(K)):
+                    if do_prob:
+                        avg_p = np.mean([seed_probs[s] for s in bag], axis=0)
+                        t1, sh = _sweep_band_nets(avg_p, olo, ohi, dates_all, ret_all)
+                        rows.append({"config": cfg, "oos_month": oos_period, "K": K,
+                                     "bag_id": bag_id, "method": "prob",
+                                     "top1_net": t1, "shoulder_net": sh})
+                    if do_rank:
+                        avg_r = np.mean([seed_ranks[s] for s in bag], axis=0)
+                        t1, sh = _sweep_band_nets(avg_r, olo, ohi, dates_all, ret_all)
+                        rows.append({"config": cfg, "oos_month": oos_period, "K": K,
+                                     "bag_id": bag_id, "method": "rank",
+                                     "top1_net": t1, "shoulder_net": sh})
+
+    res = pd.DataFrame(rows)
+    if res.empty:
+        logging.error("  no bag results — every fit failed (see warnings above). Nothing "
+                      "written. Most likely GPU OOM (use --wf_device cpu, or subsample with "
+                      "--wf_max_tickers / --no_xs_features) or a data/config/target_column error.")
+        return
+    n_expected = len(configs) * len(anchors) * S
+    n_ok = res.groupby(["config", "oos_month"]).ngroups
+    if n_ok < len(configs) * len(anchors):
+        logging.warning(f"  PARTIAL: {n_ok}/{len(configs)*len(anchors)} (config,anchor) cells "
+                        f"produced results — some fits failed. Reporting on what completed.")
+    res.to_parquet(out_parquet, index=False)
+
+    # ---- aggregate: per (config,method,K,anchor) bag mean/std, then pool ----
+    per_anchor = (res.groupby(["config", "method", "K", "oos_month"])
+                     .agg(bag_mean=("top1_net", "mean"),
+                          bag_std=("top1_net", "std"),
+                          shoulder=("shoulder_net", "mean"))
+                     .reset_index())
+    pooled = (per_anchor.groupby(["config", "method", "K"])
+                        .agg(top1_net=("bag_mean", "mean"),
+                             seed_std=("bag_std", "mean"),
+                             anchor_std=("bag_mean", "std"),
+                             win=("bag_mean", lambda x: (x > 0).mean()),
+                             shoulder=("shoulder", "mean"))
+                        .reset_index())
+
+    lines = ["=" * 104,
+             "WALK-FORWARD BAG-EVAL -- does averaging K seeds' predictions kill seed-variance",
+             "without killing top1_net?  (top-1% per-day mean ret, NET of bot-50% baseline)",
+             "=" * 104,
+             f"configs={configs}  anchors={len(anchors)}  S={S} seeds/anchor  Ks={ks}  "
+             f"B={B} bags  mode={args.wf_bag_mode}",
+             "K=1 row = single-seed baseline: top1_net = mean over seeds, seed_std = the +/- noise floor.",
+             ""]
+    methods = [mm for mm, on in (("prob", do_prob), ("rank", do_rank)) if on]
+    for cfg in configs:
+        for method in methods:
+            sub = pooled[(pooled["config"] == cfg) & (pooled["method"] == method)].sort_values("K")
+            if len(sub) == 0:
+                continue
+            has1 = (sub["K"] == 1).any()
+            base_std = sub[sub["K"] == 1]["seed_std"].iloc[0] if has1 else float("nan")
+            base_ret = sub[sub["K"] == 1]["top1_net"].iloc[0] if has1 else float("nan")
+            lines.append(f"### {cfg}  /  {method}-averaged bag ###")
+            lines.append(f"  {'K':>3} {'top1_net':>10} {'seed_std':>9} {'std_vs_K1':>10} "
+                         f"{'anchor_std':>11} {'win%':>6} {'shoulder':>9}")
+            for _, r in sub.iterrows():
+                ratio = (r["seed_std"] / base_std) if (base_std and not np.isnan(base_std)) else float("nan")
+                lines.append(f"  {int(r['K']):>3} {r['top1_net']:>10.4f} {r['seed_std']:>9.4f} "
+                             f"{ratio:>9.2f}x {r['anchor_std']:>11.4f} {r['win']*100:>5.0f}% "
+                             f"{r['shoulder']:>9.4f}")
+            lines.append(f"  read: GOOD = top1_net holds near K=1 ({base_ret:+.4f}) while std_vs_K1 "
+                         f"drops below 1.0 as K grows.")
+            lines.append("")
+
+    lines += ["=" * 104,
+              "seed_std = avg across anchors of [std of top1_net across the B bags at that K]",
+              "         = the run-to-run noise you'd feel at bag size K. Want it SMALL.",
+              "top1_net = avg across anchors of the bag-mean. Want it to STAY near the K=1 value.",
+              "SANITY: prob/K=1 and rank/K=1 top1_net must match (ranking a prob == ranking its rank).",
+              "CAVEATS: (1) K>1 bags are sampled without replacement but may overlap across draws, so",
+              "  seed_std is a slight LOWER bound on true independent-bag std -- raise --wf_bag_seeds to",
+              "  tighten. (2) top1_net is the WF proxy; final ship call still needs a multi-seed strategy",
+              "  backtest. (3) This run wrote NO live model/predictions.",
+              "=" * 104]
+
+    report = "\n".join(lines)
+    with open(out_report, "w") as f:
+        f.write(report)
+    logging.info("\n" + report)
+    logging.info(f"\n  BAG report  -> {out_report}")
+    logging.info(f"  BAG results -> {out_parquet}")
+
+
+# -------------------------------------------------------------------------- #
 # Main                                                                       #
 # -------------------------------------------------------------------------- #
 def main():
@@ -1877,6 +2145,12 @@ def main():
     # --wf_sweep: parallel multi-seed hyperparameter sweep (isolate overfit lever)
     if args.wf_sweep:
         run_walkforward_sweep()
+        return
+
+    # --wf_bag: measure whether bagging predictions kills seed-variance without
+    # killing top1_net. Read-only: writes only walkforward_bag_* reports.
+    if args.wf_bag:
+        run_walkforward_bag()
         return
 
     run_t0 = time.time()
@@ -2056,6 +2330,7 @@ def main():
                 subsample=args.subsample,
                 colsample_bytree=args.colsample_bytree,
                 early_stopping_rounds=args.early_stopping_rounds,
+                seed=args.seed,
             )
 
         # Phase 11: Evaluate + save

@@ -224,8 +224,17 @@ try {
         $stages = @(
             @{ Name = "Ticker Downloader";  File = "1__TickerDownloader.py";  Args = "--ImmediateDownload" },
             @{ Name = "Price Downloader";   File = "2__PriceDownloader.py";   Args = "--RefreshMode" },
-            @{ Name = "Alpha Sensitivity";  File = "3__AlphaSensitivity.py";  Args = "--runpercent 100" },
-            @{ Name = "Predictor";          File = "4__Predictor.py";         Args = "--predict_only" },
+            # Non-OHLCV data panels (SEC fundamentals + Form 4 insider + sector map) the feature
+            # framework & macro filter consume. --refresh-all re-pulls every raw SEC source first
+            # (fetchers self-skip files <20h old). Runs AFTER prices (needs the PriceData universe)
+            # and BEFORE the feature framework (which reads Data/Fundamentals + Data/Insider).
+            @{ Name = "Data Panels";        File = "build_data_panels.py";    Args = "all --refresh-all" },
+            # --exclude: 4 graph/spectral blocks (vvg/vaq_vg/rvg_wl/volume_spectral_splatter)
+            # whose 29 cols the ship predictor drops anyway (--drop_feature_patterns) -- they
+            # were ~16% of framework compute for ZERO model effect (benchmark 2026-06-19, no
+            # dependents). Computing-then-dropping was pure waste.
+            @{ Name = "Feature Framework";  File = "3__FeatureFramework.py";  Args = "--all --exclude vvg vaq_vg rvg_wl volume_spectral_splatter" },
+            @{ Name = "Predictor";          File = "4__Predictor.py";         Args = "--predict_only --input_dir Data/ProcessedData_v2 --target_column percent_change_close --drop_features_exact percent_change_close,VIX_Close --drop_feature_patterns tda_embed,mp3_,vvg_,vaq_,rvg_wl,volume_spectral_splatter,vg_ --model_dir Data/_ship_v2/model" },
             @{ Name = "Nightly BackTester"; File = "5__NightlyBackTester.py"; Args = "--force" }
         )
         $okCount = 0
