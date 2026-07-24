@@ -393,6 +393,13 @@ def load_and_label_tickers(input_dir, target_col, date_col, horizon_5d,
             n_skip_short += df.shape[0]
             return None
         df = df.sort_values(date_col).reset_index(drop=True)
+        # Stash TODAY's return as an explicit feature BEFORE the in-place label shift.
+        # LEAK GUARD (2026-07-01): the v2 panels name the target in lowercase
+        # ('percent_change_close') but NON_FEATURES only excluded the capital-C name,
+        # so a fresh full-feature train (no --match_model_features) put TOMORROW's
+        # return (raw + _xs rank) into the feature set. The ship model dodged this only
+        # because its curated 708-feature list predates the v2 lowercase naming.
+        df["ret_today"] = df[target_col]
         df[target_col] = df[target_col].shift(-1)
         df["ret_5d"] = (df["Close"].shift(-horizon_5d) / df["Close"] - 1.0
                         if "Close" in df.columns else np.nan)
@@ -528,6 +535,10 @@ def time_split_with_embargo(df, train_pct, calib_pct, embargo_days, date_col,
 # -------------------------------------------------------------------------- #
 NON_FEATURES = {
     "percent_change_Close", "ret_5d",
+    # LEAK GUARD (2026-07-01): v2 panels use the LOWERCASE target name; without this
+    # entry the in-place-shifted label (tomorrow's return) becomes a feature in any
+    # fresh full-feature train. Today's return survives as 'ret_today' instead.
+    "percent_change_close",
     "Date", "Ticker",
     "Open", "High", "Low", "Close", "Volume",
 }
@@ -634,12 +645,15 @@ def build_labels(train_df, calib_df, label_mode, target_col, date_col,
 # -------------------------------------------------------------------------- #
 # Phase 8: Recency weights                                                   #
 # -------------------------------------------------------------------------- #
+
 def recency_weights(dates, half_life_days):
+    
     """Exponential-decay weights so recent samples count more.
 
     Most-recent sample weight = 1. A sample `half_life_days` older → 0.5.
     Mean-normalised so loss scale stays comparable to unweighted training.
     """
+
     dates = pd.to_datetime(pd.Series(dates).reset_index(drop=True))
     age = (dates.max() - dates).dt.days.values.astype(np.float64)
     w = np.power(0.5, age / max(half_life_days, 1.0))
@@ -1032,7 +1046,9 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
         needed = {date_col, ticker_col, "Open", "High", "Low", "Close", "Volume",
                   "dollar_volume_ma_10", "atr_percentage", "RSI",
                   "VIX_Close", "vix_close", "Distance to Resistance (%)",
-                  "Distance to Support (%)", "volatility"}
+                  "Distance to Support (%)", "volatility",
+                  # source for the ret_today alias below (models trained post-leak-guard)
+                  "percent_change_close", "percent_change_Close"}
         needed |= set(raw_features) | set(xs_src)
 
         def _load_arrow_infer(fn):
@@ -1076,6 +1092,14 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
         # inference carries it through (otherwise the backtester drops the universe).
         if "VIX_Close" not in combined.columns and "vix_close" in combined.columns:
             combined["VIX_Close"] = combined["vix_close"]
+        # ret_today feature alias: at train time this was TODAY's return (stashed before
+        # the label shift); at inference the raw panel target column IS today's return.
+        # No-op for models (like the current ship) that don't have this feature.
+        if "ret_today" not in combined.columns:
+            for _src in ("percent_change_close", "percent_change_Close"):
+                if _src in combined.columns:
+                    combined["ret_today"] = combined[_src]
+                    break
         combined = downcast(combined)
         combined = combined.sort_values(date_col).reset_index(drop=True)
         logging.info(f"  combined: {combined.shape}  "

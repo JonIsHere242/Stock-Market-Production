@@ -51,7 +51,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 ROOT          = Path(__file__).parent
 TEMPLATES_DIR = ROOT / "FeatureTemplates"
-PRICE_DATA_DIR = ROOT / "Data" / "PriceData"
+PRICE_DATA_DIR = Path(os.environ.get("FF_PRICE_DIR", str(ROOT / "Data" / "PriceData")))
 OUT_DIR       = ROOT / "Data" / "ProcessedData_v2"
 
 # These columns are always placed first in the output, in this fixed order.

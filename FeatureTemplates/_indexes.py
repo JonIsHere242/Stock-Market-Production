@@ -34,12 +34,18 @@ vix_daily_close return an empty/typed structure so a block can degrade gracefull
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
 
 # Data/Indexes lives at repo root; this file is repo_root/FeatureTemplates/_indexes.py
-INDEXES_DIR = Path(__file__).resolve().parent.parent / "Data" / "Indexes"
+# FF_INDEXES_DIR env override lets a deep-history rebuild point at Data/IndexesFull
+# without touching the production default.
+INDEXES_DIR = Path(os.environ.get(
+    "FF_INDEXES_DIR",
+    str(Path(__file__).resolve().parent.parent / "Data" / "Indexes"),
+))
 
 # Module-level caches (one load per process).
 _FRAME_CACHE: dict[str, pd.DataFrame] = {}

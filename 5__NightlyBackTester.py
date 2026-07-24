@@ -1119,9 +1119,15 @@ class StockSniperStrategy(bt.Strategy):
         self.trade_pct_returns = []  # For rolling Sharpe calculation
         
         self.trade_recorder = TradeRecorder('Data/TradeHistory.parquet')
-        
+
         self.open_positions = 0
-        
+
+        # Per-day capital-efficiency tracking: how many of the max_positions
+        # slots are filled, and how much of the book is actually deployed vs
+        # sitting in cash. Sampled once per trading day at end of next().
+        self.daily_positions = []     # open-position count at end of each day
+        self.daily_deployment = []    # invested capital / total equity (%) each day
+
         self.correlation_df = pd.read_parquet('Correlations.parquet')
         logging.info(f"Loaded correlation dataframe with columns: {list(self.correlation_df.columns)}")
 
@@ -1219,6 +1225,23 @@ class StockSniperStrategy(bt.Strategy):
         if self.last_logged_date != current_date:
             logging.info(f"Processing date: {current_date}")
             self.last_logged_date = current_date
+
+        # Capital-efficiency snapshot on the SETTLED book, taken at the TOP of the
+        # bar (before today's sell/buy rotation). Counts positions actually held
+        # via getposition -- ground truth, NOT the open_positions counter, which
+        # increments at buy SUBMISSION (so it also counts a just-submitted buy
+        # that fills next bar -> reads max even when one slot is mid-rotation).
+        # Deployment uses held market value / equity here; sampling at END of
+        # next() instead caught the mid-cycle trough (intraday exits done, next-
+        # day entries not yet filled) and understated deployment badly.
+        _held = [d for d in self.datas if self.getposition(d).size != 0]
+        self.daily_positions.append(len(_held))
+        _eq = self.broker.getvalue()
+        if _eq > 0:
+            _invested = sum(self.getposition(d).size * d.close[0] for d in _held)
+            self.daily_deployment.append(max(0.0, _invested / _eq * 100))
+        else:
+            self.daily_deployment.append(0.0)
 
         # Continue with normal position management
         sell_data = [d for d in self.datas if self.getposition(d).size > 0]
@@ -1484,6 +1507,16 @@ class StockSniperStrategy(bt.Strategy):
 
 
 
+
+
+
+
+
+
+
+
+
+
     def can_buy(self, data, current_date):
         """=
 
@@ -1732,731 +1765,27 @@ class StockSniperStrategy(bt.Strategy):
 
 
 
-    def can_buy_may_17th_eda_attempt_FAILED(self, data, current_date):
-        """ARCHIVED -- DO NOT USE.  Tuned 2026-05-17 from eda_prob_distribution.py
-        findings.  Backtest result was a regression vs can_buy_may_17th:
 
-          can_buy_may_17th : 73.7% ann ret  Sharpe 1.85  win 53.25%  (n=323)
-          THIS VERSION    : 23.5% ann ret  Sharpe 0.56  win 45.48%  (n=299)
 
-        Why it failed: the EDA looked at which percentile bands of the
-        EXISTING gate's 323 trades had the best per-trade quality and saw
-        [p65, p90) doing well on n=16.  But tightening P_HIGH 98 -> 90 does
-        NOT retain those 16 trades -- it RESHAPES the trade distribution.
-        The new gate fired 299 different trades, and they were worse.
 
-        Lesson: when tuning filters from EDA on backtest outcomes, validate
-        with a full backtest BEFORE deploying.  The selection bias is real.
-        Original docstring follows.
 
-        ----
-        Tuned 2026-05-17 from eda_prob_distribution.py findings.
 
-        Run that script against Data/TradeHistory.parquet + Data/RFpredictions/ and
-        you'll see three things this version acts on:
 
-          1. The current [p65, p98) per-stock percentile gate fires 167 trades
-             in the EDA sample, but [p95, p98) alone is 119 of them with
-             mean +0.25% / win 0.43.  Tightening P_HIGH to 90 keeps only the
-             zone where the EDA shows mean +1.26% / sharpe 7.55.  Trade count
-             drops ~10x but per-trade quality jumps.
-          2. SUFFICIENT_DATA_P_LOW=65 was a no-op: no trades fired below p80
-             anyway, since the other filters (price, volume, momentum, RSI)
-             gate that out.  Dropping it to 0 has zero effect and is cleaner.
-          3. UP_PROB_MIN/MAX_BOUND in [0.2, 0.8] passes 100% of universe rows
-             because predict_to_rf maps everything into [0.30, 0.70].  Dead
-             code.  Replaced with a real UpProb floor of 0.40: trades in
-             [0.30, 0.40) won 42% with mean +0.14% (n=90) in the EDA --
-             barely above breakeven, can_buy fired them only because the
-             percentile gate said yes.
 
-        Single-line rollback: swap can_buy <-> can_buy_may_17th in
-        get_buy_candidates.
 
-        Caveat: the [p65, p90) decision is supported by n=16 in the EDA.
-        Direction is consistent with the wider bands ([p85, p90) n=12 mean
-        +1.17%, [p90, p95) n=32 mean +0.31%) so I trust the shape, but the
-        exact p90 cut-off is a judgment call that should be validated by a
-        full backtest before live deployment.
-        """
 
-        # Strategy Timing
-        MIN_DAYS_BEFORE_TRADING = 30
-        TARGET_HISTORIC_PROB_COUNT = 45
-        MAX_HISTORIC_LOOKBACK = 100
-        MIN_HISTORIC_PROB_THRESHOLD = 30
-        MIN_VIABLE_DATA_POINTS = 5
 
-        # Absolute UpProbability floor (NEW).  predict_to_rf squashes universe
-        # into [0.30, 0.70]; the [0.30, 0.40) band is the low-confidence tail
-        # that produced 90 trades with mean +0.14% in the EDA.
-        UP_PROB_FIRE_FLOOR = 0.40
 
-        # Financial Thresholds (unchanged from May 17th tune)
-        MIN_CLOSE_PRICE = 2.00
-        MAX_CLOSE_PRICE = 1650.00
-        MIN_VOLUME_SHARES = 10_000
-        MIN_DOLLAR_VOLUME = 1_000_000
 
-        # Risk Management - Drop Protection
-        MAX_SINGLE_DAY_DROP = -0.15
-        RECENT_DROP_LOOKBACK_DAYS = 10
 
-        # Risk Management - 52-Week Position
-        WEEK_52_HIGH_PROXIMITY_LIMIT = 0.85
-        WEEK_52_LOOKBACK_DAYS = 252
 
-        # Risk Management - Momentum
-        MOMENTUM_LOOKBACK_DAYS = 5
-        MAX_MOMENTUM_GAIN = 0.15
-        MAX_MOMENTUM_LOSS = -0.18
 
-        # Risk Management - Volume & Volatility
-        VOLUME_SPIKE_MULTIPLIER = 3.5
-        VOLUME_AVG_LOOKBACK_DAYS = 20
-        MAX_VOLATILITY_THRESHOLD = 0.10
-        VOLATILITY_LOOKBACK_DAYS = 20
 
-        # Percentile Thresholds -- THE CHANGE
-        # P_LOW kept as a safety net (still effectively a no-op given other
-        # filters, but cheap and self-documenting).  P_HIGH = 90 is the EDA-
-        # backed choice that captures the high-edge zone and excludes the
-        # large, low-quality [p95, p98) cluster.
-        SUFFICIENT_DATA_P_LOW = 65.0
-        SUFFICIENT_DATA_P_HIGH = 90.0   # was 98.0 -- main change
 
-        # Limited-data path (kept strict because sample is small)
-        LIMITED_DATA_P_LOW = 90
-        LIMITED_DATA_P_HIGH = 99
 
-        RSI_PERIOD = 14
-        MIN_RSI_THRESHOLD = 20
 
-        # ============ END CONFIGURATION ============
 
-        symbol = data._name
 
-        if not hasattr(self, 'strategy_start_date'):
-            self.strategy_start_date = current_date
-
-        days_since_start = (current_date - self.strategy_start_date).days
-        if days_since_start < MIN_DAYS_BEFORE_TRADING:
-            return False
-
-        try:
-            current_close = data.close[0]
-            current_prob = data.UpProbability[0]
-            current_volume = data.volume[0]
-        except (IndexError, AttributeError, TypeError):
-            return False
-
-        if self.rule_201_monitor.is_restricted(symbol) or self.open_positions >= self.p.max_positions:
-            return False
-
-        # NEW: absolute fire floor in place of the dead [0.2, 0.8] bound.
-        if current_prob is None or current_prob < UP_PROB_FIRE_FLOOR:
-            return False
-
-        if current_close is None or current_close < MIN_CLOSE_PRICE:
-            return False
-        if current_close > MAX_CLOSE_PRICE:
-            return False
-        if current_volume is None or current_volume < MIN_VOLUME_SHARES:
-            return False
-
-        dollar_volume = current_close * current_volume
-        if dollar_volume < MIN_DOLLAR_VOLUME:
-            return False
-
-        historic_probs = []
-        i = 1
-        while len(historic_probs) < TARGET_HISTORIC_PROB_COUNT and i < MAX_HISTORIC_LOOKBACK:
-            try:
-                prob_val = data.UpProbability[-i]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (was reading future bars into the percentile baseline)
-                if prob_val is not None:
-                    historic_probs.append(float(prob_val))
-                i += 1
-            except (IndexError, AttributeError, TypeError):
-                break
-
-        if len(historic_probs) < MIN_HISTORIC_PROB_THRESHOLD:
-            try:
-                for lookback in range(1, min(RECENT_DROP_LOOKBACK_DAYS + 1, 100)):
-                    try:
-                        prev_close = data.close[-lookback]
-                        next_close = data.close[-(lookback-1)] if lookback > 1 else data.close[0]
-                        if prev_close is not None and next_close is not None and prev_close > 0:
-                            daily_return = (next_close / prev_close) - 1
-                            if daily_return < MAX_SINGLE_DAY_DROP:
-                                return False
-                    except (IndexError, AttributeError, TypeError):
-                        break
-            except Exception:
-                return False
-
-            if len(historic_probs) < MIN_VIABLE_DATA_POINTS:
-                return False
-
-            if len(historic_probs) > 1:
-                p_low = np.percentile(historic_probs, LIMITED_DATA_P_LOW)
-                p_high = np.percentile(historic_probs, LIMITED_DATA_P_HIGH)
-            else:
-                return False
-        else:
-            if len(historic_probs) > 1:
-                p_low = np.percentile(historic_probs, SUFFICIENT_DATA_P_LOW)
-                p_high = np.percentile(historic_probs, SUFFICIENT_DATA_P_HIGH)
-            else:
-                return False
-
-        # 1. 52-week high filter
-        try:
-            closes_252 = data.close.get(size=WEEK_52_LOOKBACK_DAYS)
-            if closes_252 and len(closes_252) > 0:
-                highest_52w = max(closes_252)
-                if highest_52w and highest_52w > 0:
-                    if (current_close / highest_52w) > WEEK_52_HIGH_PROXIMITY_LIMIT:
-                        return False
-        except Exception:
-            pass
-
-        # 2. Momentum filter
-        try:
-            prev_close_5 = data.close[-MOMENTUM_LOOKBACK_DAYS]
-            if prev_close_5 and prev_close_5 > 0:
-                ret_5d = (current_close / prev_close_5) - 1
-                if ret_5d > MAX_MOMENTUM_GAIN:
-                    return False
-                if ret_5d < MAX_MOMENTUM_LOSS:
-                    return False
-        except Exception:
-            pass
-
-        # 3. Volume spike filter
-        try:
-            vols = data.volume.get(size=VOLUME_AVG_LOOKBACK_DAYS)
-            if vols is not None and len(vols) > 0:
-                avg_vol_20 = np.mean(vols)
-                if avg_vol_20 and current_volume / avg_vol_20 > VOLUME_SPIKE_MULTIPLIER:
-                    return False
-        except Exception:
-            pass
-
-        # 4. Volatility filter
-        try:
-            closes = data.close.get(size=VOLATILITY_LOOKBACK_DAYS)
-            if closes is not None and len(closes) > 1:
-                returns_20d = np.diff(np.log(closes))
-                if len(returns_20d) > 0:
-                    vol_20d = np.std(returns_20d)
-                    if vol_20d > MAX_VOLATILITY_THRESHOLD:
-                        return False
-        except Exception:
-            pass
-
-        # 5. RSI filter
-        try:
-            closes_for_rsi = data.close.get(size=RSI_PERIOD + 1)
-            if closes_for_rsi is not None and len(closes_for_rsi) >= RSI_PERIOD + 1:
-                deltas = np.diff(closes_for_rsi)
-                gains = np.where(deltas > 0, deltas, 0)
-                losses = np.where(deltas < 0, -deltas, 0)
-                avg_gain = np.mean(gains[-RSI_PERIOD:])
-                avg_loss = np.mean(losses[-RSI_PERIOD:])
-                if avg_loss == 0:
-                    rsi = 100.0
-                else:
-                    rs = avg_gain / avg_loss
-                    rsi = 100 - (100 / (1 + rs))
-                if rsi < MIN_RSI_THRESHOLD:
-                    return False
-        except Exception:
-            pass
-
-        # --- Core Buy Condition: per-stock percentile in [p65, p90) ---
-        if current_prob >= p_low and current_prob < p_high:
-            return True
-
-        return False
-
-
-
-    def can_buy_may15th(self, data, current_date):
-        """Pre-optimization snapshot (2026-05-15). Kept for one-line rollback:
-        swap can_buy <-> can_buy_may15th in get_buy_candidates if the optimized
-        version misbehaves. This is the configuration that ran before the
-        can_buy_optimizer.py Optuna sweep on 2026-05-15.
-        """
-
-        # Strategy Timing
-        MIN_DAYS_BEFORE_TRADING = 30
-        TARGET_HISTORIC_PROB_COUNT = 45
-        MAX_HISTORIC_LOOKBACK = 100
-        MIN_HISTORIC_PROB_THRESHOLD = 30
-        MIN_VIABLE_DATA_POINTS = 5
-
-        # Probability Bounds
-        UP_PROB_MIN_BOUND = 0.2
-        UP_PROB_MAX_BOUND = 0.8
-
-        # Financial Thresholds  
-        MIN_CLOSE_PRICE = 1.50
-        MAX_CLOSE_PRICE = 1000.00
-        MIN_VOLUME_SHARES = 10_000 ## at least 10k shares traded 
-        MIN_DOLLAR_VOLUME = 1_000_000 ## at least a mill traded so that i will be 1/1000 of the volume
-
-        # Risk Management - Drop Protection
-        MAX_SINGLE_DAY_DROP = -0.15  # -5%
-        RECENT_DROP_LOOKBACK_DAYS = 10
-
-        # Risk Management - 52-Week Position
-        WEEK_52_HIGH_PROXIMITY_LIMIT = 0.85  # Within 90% of 52-week high
-        WEEK_52_LOOKBACK_DAYS = 252
-
-        # Risk Management - Momentum
-        MOMENTUM_LOOKBACK_DAYS = 5
-        MAX_MOMENTUM_GAIN = 0.15   # +15%
-        MAX_MOMENTUM_LOSS = -0.075 # -7.5%
-
-        # Risk Management - Volume & Volatility
-
-        VOLUME_SPIKE_MULTIPLIER = 3.5
-        VOLUME_AVG_LOOKBACK_DAYS = 20
-        MAX_VOLATILITY_THRESHOLD = 0.04  # 4% daily volatility
-        VOLATILITY_LOOKBACK_DAYS = 20
-
-        # Percentile Thresholds
-        # For sufficient data
-        SUFFICIENT_DATA_P_LOW = 90.0   # p96 equivalent 
-        SUFFICIENT_DATA_P_HIGH = 95.0   # p97_5 equivalent
-
-        # For limited data  
-        LIMITED_DATA_P_LOW = 90
-        LIMITED_DATA_P_HIGH = 99
-
-        # ============ END CONFIGURATION ============
-
-        symbol = data._name
-
-        # HARD FILTER: No trading in first X days
-        if not hasattr(self, 'strategy_start_date'):
-            self.strategy_start_date = current_date
-
-        days_since_start = (current_date - self.strategy_start_date).days
-        if days_since_start < MIN_DAYS_BEFORE_TRADING:
-            return False
-
-        try:
-            current_close = data.close[0]
-            current_prob = data.UpProbability[0]
-            current_volume = data.volume[0]
-        except (IndexError, AttributeError, TypeError):
-            return False
-        
-        # Basic gates #if it dropped by more than 10% yesterday the trail limit orders will not work as in a child parent order group
-        if self.rule_201_monitor.is_restricted(symbol) or self.open_positions >= self.p.max_positions:
-            return False
-
-        # Restrict based on UpProbability raw bounds
-        # 3. Basic probability bounds HARD REJECT
-        if current_prob < UP_PROB_MIN_BOUND or current_prob > UP_PROB_MAX_BOUND:
-            return False
-
-        try:
-            #make sure up prob is within the range that shows the best results and not some weird values like 0.1 or 0.9
-            if len(data.UpProbability) < 6:
-                return False
-            recent_probs = [data.UpProbability[-i] for i in range(1, 6) if data.UpProbability[-i] is not None]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (positive index read FUTURE bars)
-        
-            if recent_probs and min(recent_probs) < UP_PROB_MIN_BOUND:
-                return False
-            if recent_probs and max(recent_probs) > UP_PROB_MAX_BOUND:
-                return False
-        except Exception:
-            pass
-
-        # Hard rejects
-        if current_close is None or current_close < MIN_CLOSE_PRICE:
-            return False
-        if current_close is None or current_close > MAX_CLOSE_PRICE:
-            return False
-        if current_volume is None or current_volume < MIN_VOLUME_SHARES:
-            return False
-        if current_prob is None:
-            return False
-
-        # Liquidity check
-        dollar_volume = current_close * current_volume
-        if dollar_volume < MIN_DOLLAR_VOLUME:
-            return False
-
-        # Build historical UpProbability series
-        historic_probs = []
-        i = 1
-        while len(historic_probs) < TARGET_HISTORIC_PROB_COUNT and i < MAX_HISTORIC_LOOKBACK:
-            try:
-                prob_val = data.UpProbability[-i]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (was reading future bars into the percentile baseline)
-                if prob_val is not None:
-                    historic_probs.append(float(prob_val))
-                i += 1
-            except (IndexError, AttributeError, TypeError):
-                break
-
-        # Limited data sanity check
-        if len(historic_probs) < MIN_HISTORIC_PROB_THRESHOLD:
-            # Reject symbols with recent drops when data is limited
-            try:
-                for lookback in range(1, min(RECENT_DROP_LOOKBACK_DAYS + 1, 100)):
-                    try:
-                        prev_close = data.close[-lookback]
-                        next_close = data.close[-(lookback-1)] if lookback > 1 else data.close[0]
-
-                        if prev_close is not None and next_close is not None and prev_close > 0:
-                            daily_return = (next_close / prev_close) - 1
-                            if daily_return < MAX_SINGLE_DAY_DROP:
-                                return False
-                    except (IndexError, AttributeError, TypeError):
-                        break
-            except Exception:
-                return False
-
-            # Need minimum viable data even with sanity check
-            if len(historic_probs) < MIN_VIABLE_DATA_POINTS:
-                return False
-
-            # For limited data, use simplified thresholds
-            if len(historic_probs) > 1:
-                p96 = np.percentile(historic_probs, LIMITED_DATA_P_LOW)
-                p97_5 = np.percentile(historic_probs, LIMITED_DATA_P_HIGH)
-            else:
-                return False
-        else:
-            # Standard percentile thresholds for sufficient data
-            if len(historic_probs) > 1:
-                p96 = np.percentile(historic_probs, SUFFICIENT_DATA_P_LOW)
-                p97_5 = np.percentile(historic_probs, SUFFICIENT_DATA_P_HIGH)
-            else:
-                return False
-
-        # --- Extra Failure Filters ---
-
-        # 1. 52-week high filter
-        try:
-            closes_252 = data.close.get(size=WEEK_52_LOOKBACK_DAYS)
-            if closes_252 and len(closes_252) > 0:
-                highest_52w = max(closes_252)
-                lowest_52w = min(closes_252)
-                if highest_52w and lowest_52w and highest_52w > 0:
-                    if (current_close / highest_52w) > WEEK_52_HIGH_PROXIMITY_LIMIT:
-                        return False
-        except Exception:
-            pass
-
-        # 2. Momentum filter
-        try:
-            prev_close_5 = data.close[-MOMENTUM_LOOKBACK_DAYS]
-            if prev_close_5 and prev_close_5 > 0:
-                ret_5d = (current_close / prev_close_5) - 1
-                if ret_5d > MAX_MOMENTUM_GAIN:
-                    return False
-                if ret_5d < MAX_MOMENTUM_LOSS:
-                    return False
-        except Exception:
-            pass
-
-        # 3. Volume spike filter
-        try:
-            vols = data.volume.get(size=VOLUME_AVG_LOOKBACK_DAYS)
-            if vols is not None and len(vols) > 0:
-                avg_vol_20 = np.mean(vols)
-                if avg_vol_20 and current_volume / avg_vol_20 > VOLUME_SPIKE_MULTIPLIER:
-                    return False
-        except Exception:
-            pass
-
-        # 4. Volatility filter
-        try:
-            closes = data.close.get(size=VOLATILITY_LOOKBACK_DAYS)
-            if closes is not None and len(closes) > 1:
-                returns_20d = np.diff(np.log(closes))
-                if len(returns_20d) > 0:
-                    vol_20d = np.std(returns_20d)
-                    if vol_20d > MAX_VOLATILITY_THRESHOLD:
-                        return False
-        except Exception:
-            pass
-
-
-
-        RSI_PERIOD = 14
-        MIN_RSI_THRESHOLD = 30
-
-        # 5. RSI filter
-        try:
-            closes_for_rsi = data.close.get(size=RSI_PERIOD + 1)
-            if closes_for_rsi is not None and len(closes_for_rsi) >= RSI_PERIOD + 1:
-                # Calculate price changes
-                deltas = np.diff(closes_for_rsi)
-
-                # Separate gains and losses
-                gains = np.where(deltas > 0, deltas, 0)
-                losses = np.where(deltas < 0, -deltas, 0)
-
-                # Calculate average gain and loss
-                avg_gain = np.mean(gains[-RSI_PERIOD:])
-                avg_loss = np.mean(losses[-RSI_PERIOD:])
-
-                # Calculate RSI
-                if avg_loss == 0:
-                    rsi = 100.0
-                else:
-                    rs = avg_gain / avg_loss
-                    rsi = 100 - (100 / (1 + rs))
-
-                if rsi < MIN_RSI_THRESHOLD:
-                    return False
-        except Exception:
-            pass
-
- 
-
-        # --- Core Buy Condition ---
-        if current_prob >= p96 and current_prob < p97_5:
-            return True
-
-        return False
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def can_buy222(self, data, current_date):
-        # Data-driven update 2026-05-15. Conservative tweaks vs can_buy_15May2026:
-        #   MAX_VOLATILITY_THRESHOLD: 0.04 -> 0.05   (EDA: CAGR +16pts, DD improves)
-        #   MIN_RSI_THRESHOLD:        30   -> 20    (EDA: small consistent win)
-        # Companion change outside this function: sort_buy_candidates reverse=False -> True.
-
-        # Strategy Timing
-        MIN_DAYS_BEFORE_TRADING = 30
-        TARGET_HISTORIC_PROB_COUNT = 45
-        MAX_HISTORIC_LOOKBACK = 100
-        MIN_HISTORIC_PROB_THRESHOLD = 30
-        MIN_VIABLE_DATA_POINTS = 5
-
-        # Probability Bounds
-        UP_PROB_MIN_BOUND = 0.2
-        UP_PROB_MAX_BOUND = 0.8
-
-        # Financial Thresholds
-        MIN_CLOSE_PRICE = 1.50
-        MAX_CLOSE_PRICE = 1000.00
-        MIN_VOLUME_SHARES = 10_000
-        MIN_DOLLAR_VOLUME = 1_000_000
-
-        # Risk Management - Drop Protection
-        MAX_SINGLE_DAY_DROP = -0.15
-        RECENT_DROP_LOOKBACK_DAYS = 10
-
-        # Risk Management - 52-Week Position
-        WEEK_52_HIGH_PROXIMITY_LIMIT = 0.85
-        WEEK_52_LOOKBACK_DAYS = 252
-
-        # Risk Management - Momentum
-        MOMENTUM_LOOKBACK_DAYS = 5
-        MAX_MOMENTUM_GAIN = 0.15
-        MAX_MOMENTUM_LOSS = -0.075
-
-        # Risk Management - Volume & Volatility
-        VOLUME_SPIKE_MULTIPLIER = 3.5
-        VOLUME_AVG_LOOKBACK_DAYS = 20
-        MAX_VOLATILITY_THRESHOLD = 0.05  # was 0.04 - EDA shows 5% cap raises CAGR and lowers DD
-        VOLATILITY_LOOKBACK_DAYS = 20
-
-        # Percentile Thresholds (sufficient data)
-        SUFFICIENT_DATA_P_LOW = 90.0
-        SUFFICIENT_DATA_P_HIGH = 95.0
-
-        # Percentile Thresholds (limited data)
-        LIMITED_DATA_P_LOW = 90
-        LIMITED_DATA_P_HIGH = 99
-
-        # RSI
-        RSI_PERIOD = 14
-        MIN_RSI_THRESHOLD = 20  # was 30 - EDA shows softening adds trades without quality loss
-
-        # ============ END CONFIGURATION ============
-
-        symbol = data._name
-
-        if not hasattr(self, 'strategy_start_date'):
-            self.strategy_start_date = current_date
-
-        days_since_start = (current_date - self.strategy_start_date).days
-        if days_since_start < MIN_DAYS_BEFORE_TRADING:
-            return False
-
-        try:
-            current_close = data.close[0]
-            current_prob = data.UpProbability[0]
-            current_volume = data.volume[0]
-        except (IndexError, AttributeError, TypeError):
-            return False
-
-        if self.rule_201_monitor.is_restricted(symbol) or self.open_positions >= self.p.max_positions:
-            return False
-
-        if current_prob < UP_PROB_MIN_BOUND or current_prob > UP_PROB_MAX_BOUND:
-            return False
-
-        try:
-            if len(data.UpProbability) < 6:
-                return False
-            recent_probs = [data.UpProbability[-i] for i in range(1, 6) if data.UpProbability[-i] is not None]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (positive index read FUTURE bars)
-
-            if recent_probs and min(recent_probs) < UP_PROB_MIN_BOUND:
-                return False
-            if recent_probs and max(recent_probs) > UP_PROB_MAX_BOUND:
-                return False
-        except Exception:
-            pass
-
-        if current_close is None or current_close < MIN_CLOSE_PRICE:
-            return False
-        if current_close is None or current_close > MAX_CLOSE_PRICE:
-            return False
-        if current_volume is None or current_volume < MIN_VOLUME_SHARES:
-            return False
-        if current_prob is None:
-            return False
-
-        dollar_volume = current_close * current_volume
-        if dollar_volume < MIN_DOLLAR_VOLUME:
-            return False
-
-        historic_probs = []
-        i = 1
-        while len(historic_probs) < TARGET_HISTORIC_PROB_COUNT and i < MAX_HISTORIC_LOOKBACK:
-            try:
-                prob_val = data.UpProbability[-i]  # LOOKAHEAD FIX 2026-06-10: [i]->[-i] (was reading future bars into the percentile baseline)
-                if prob_val is not None:
-                    historic_probs.append(float(prob_val))
-                i += 1
-            except (IndexError, AttributeError, TypeError):
-                break
-
-        if len(historic_probs) < MIN_HISTORIC_PROB_THRESHOLD:
-            try:
-                for lookback in range(1, min(RECENT_DROP_LOOKBACK_DAYS + 1, 100)):
-                    try:
-                        prev_close = data.close[-lookback]
-                        next_close = data.close[-(lookback-1)] if lookback > 1 else data.close[0]
-
-                        if prev_close is not None and next_close is not None and prev_close > 0:
-                            daily_return = (next_close / prev_close) - 1
-                            if daily_return < MAX_SINGLE_DAY_DROP:
-                                return False
-                    except (IndexError, AttributeError, TypeError):
-                        break
-            except Exception:
-                return False
-
-            if len(historic_probs) < MIN_VIABLE_DATA_POINTS:
-                return False
-
-            if len(historic_probs) > 1:
-                p96 = np.percentile(historic_probs, LIMITED_DATA_P_LOW)
-                p97_5 = np.percentile(historic_probs, LIMITED_DATA_P_HIGH)
-            else:
-                return False
-        else:
-            if len(historic_probs) > 1:
-                p96 = np.percentile(historic_probs, SUFFICIENT_DATA_P_LOW)
-                p97_5 = np.percentile(historic_probs, SUFFICIENT_DATA_P_HIGH)
-            else:
-                return False
-
-        # 52-week high filter
-        try:
-            closes_252 = data.close.get(size=WEEK_52_LOOKBACK_DAYS)
-            if closes_252 and len(closes_252) > 0:
-                highest_52w = max(closes_252)
-                lowest_52w = min(closes_252)
-                if highest_52w and lowest_52w and highest_52w > 0:
-                    if (current_close / highest_52w) > WEEK_52_HIGH_PROXIMITY_LIMIT:
-                        return False
-        except Exception:
-            pass
-
-        # Momentum filter
-        try:
-            prev_close_5 = data.close[-MOMENTUM_LOOKBACK_DAYS]
-            if prev_close_5 and prev_close_5 > 0:
-                ret_5d = (current_close / prev_close_5) - 1
-                if ret_5d > MAX_MOMENTUM_GAIN:
-                    return False
-                if ret_5d < MAX_MOMENTUM_LOSS:
-                    return False
-        except Exception:
-            pass
-
-        # Volume spike filter
-        try:
-            vols = data.volume.get(size=VOLUME_AVG_LOOKBACK_DAYS)
-            if vols is not None and len(vols) > 0:
-                avg_vol_20 = np.mean(vols)
-                if avg_vol_20 and current_volume / avg_vol_20 > VOLUME_SPIKE_MULTIPLIER:
-                    return False
-        except Exception:
-            pass
-
-        # Volatility filter (cap raised from 0.04 to 0.05)
-        try:
-            closes = data.close.get(size=VOLATILITY_LOOKBACK_DAYS)
-            if closes is not None and len(closes) > 1:
-                returns_20d = np.diff(np.log(closes))
-                if len(returns_20d) > 0:
-                    vol_20d = np.std(returns_20d)
-                    if vol_20d > MAX_VOLATILITY_THRESHOLD:
-                        return False
-        except Exception:
-            pass
-
-        # RSI filter (hard-reject threshold lowered from 30 to 20)
-        try:
-            closes_for_rsi = data.close.get(size=RSI_PERIOD + 1)
-            if closes_for_rsi is not None and len(closes_for_rsi) >= RSI_PERIOD + 1:
-                deltas = np.diff(closes_for_rsi)
-                gains = np.where(deltas > 0, deltas, 0)
-                losses = np.where(deltas < 0, -deltas, 0)
-                avg_gain = np.mean(gains[-RSI_PERIOD:])
-                avg_loss = np.mean(losses[-RSI_PERIOD:])
-
-                if avg_loss == 0:
-                    rsi = 100.0
-                else:
-                    rs = avg_gain / avg_loss
-                    rsi = 100 - (100 / (1 + rs))
-
-                if rsi < MIN_RSI_THRESHOLD:
-                    return False
-        except Exception:
-            pass
-
-        # --- Core Buy Condition ---
-        if current_prob >= p96 and current_prob < p97_5:
-            return True
-
-        return False
 
 
 
@@ -2766,8 +2095,13 @@ class StockSniperStrategy(bt.Strategy):
                 dprint("Converting candidates to new signal format", "INFO")
             signals = []
             
-            # Get real-world current date for live trading
-            real_current_date = datetime.now().date()
+            # Anchor the signal date to the DATA's last bar, not the wall clock.
+            # This block only fires when current_date == self.last_trading_date, so
+            # last_trading_date IS the last processed data bar. Using datetime.now()
+            # here mis-stamped signals when the pipeline ran after midnight (e.g. a
+            # 01:39 AM run gave now=07-01 -> next=07-02 for 06-30 data). Deriving from
+            # the data keeps the target correct regardless of run time.
+            real_current_date = self.last_trading_date
             next_trading_day = get_next_trading_day(real_current_date)
             if verbose:
                 dprint(f"Real current date: {real_current_date}", "INFO")
@@ -4441,7 +3775,17 @@ def extract_backtest_results(strategy, cerebro, logger):
         
         if hasattr(strategy, 'yearly_performance'):
             results['yearly_performance'] = strategy.yearly_performance
-        
+
+        # Per-trade detail + capital-efficiency inputs. The backtrader analyzer
+        # only exposes aggregate dollar P&L, so we pull the strategy's own
+        # per-trade records (real per-trade % return) and the daily slot /
+        # deployment samples for the strategy-level efficiency metrics.
+        if hasattr(strategy, 'trade_history'):
+            results['trade_history'] = strategy.trade_history
+        results['max_positions'] = getattr(strategy.p, 'max_positions', None)
+        results['daily_positions'] = list(getattr(strategy, 'daily_positions', []))
+        results['daily_deployment'] = list(getattr(strategy, 'daily_deployment', []))
+
         # Process analyzer data into results
         process_trade_statistics(results, analyzer_data, logger)
         process_drawdown_statistics(results, analyzer_data, logger)
@@ -4539,7 +3883,11 @@ def initialize_results_dict(cerebro):
         
         # Strategy specific
         'monthly_performance': {},
-        'yearly_performance': {}
+        'yearly_performance': {},
+        'trade_history': [],
+        'max_positions': None,
+        'daily_positions': [],
+        'daily_deployment': [],
     }
 
 
@@ -4703,10 +4051,31 @@ def process_trade_statistics(results, analyzer_data, logger):
             results['avg_profit_per_trade'] = results['net_total'] / results['total_closed']
         
         # Percentage metrics
-        results['avg_win_pct'] = results['won_avg'] / results['initial_value'] * 100
-        results['avg_loss_pct'] = results['lost_avg'] / results['initial_value'] * 100
-        results['largest_win_pct'] = results['won_max'] / results['initial_value'] * 100
-        results['largest_loss_pct'] = results['lost_max'] / results['initial_value'] * 100
+        # ------------------------------------------------------------------
+        # Portfolio-relative avg loss (P&L as a fraction of the whole book).
+        # Kept ONLY to scale the daily VaR/CVaR thresholds, which are daily
+        # portfolio percentages. NOT displayed -- it understates per-trade moves.
+        _iv = results['initial_value']
+        results['avg_loss_pct_portfolio'] = (results['lost_avg'] / _iv * 100) if _iv else 0
+
+        # REAL per-trade % returns: each trade's price move on the capital
+        # actually deployed in THAT trade, independent of book size. A +43% move
+        # on a quarter-size position reads +43% here, not ~+10%. This matches the
+        # live per-trade log (profit_pct). Win/loss split by the price move sign.
+        trade_hist = results.get('trade_history') or []
+        win_pcts = [t['PnLPct'] for t in trade_hist if t.get('PnLPct', 0) > 0]
+        loss_pcts = [t['PnLPct'] for t in trade_hist if t.get('PnLPct', 0) < 0]
+        if trade_hist and (win_pcts or loss_pcts):
+            results['avg_win_pct'] = (sum(win_pcts) / len(win_pcts)) if win_pcts else 0
+            results['avg_loss_pct'] = abs(sum(loss_pcts) / len(loss_pcts)) if loss_pcts else 0
+            results['largest_win_pct'] = max(win_pcts) if win_pcts else 0
+            results['largest_loss_pct'] = abs(min(loss_pcts)) if loss_pcts else 0
+        else:
+            # Legacy fallback (portfolio-relative) when no per-trade history exists
+            results['avg_win_pct'] = (results['won_avg'] / _iv * 100) if _iv else 0
+            results['avg_loss_pct'] = results['avg_loss_pct_portfolio']
+            results['largest_win_pct'] = (results['won_max'] / _iv * 100) if _iv else 0
+            results['largest_loss_pct'] = (results['lost_max'] / _iv * 100) if _iv else 0
         
         if results['lost_total'] > 0:
             results['win_loss_count_ratio'] = results['won_total'] / results['lost_total']
@@ -5241,6 +4610,9 @@ def print_detailed_results(results, execution_time):
     # Trade statistics
     print_trade_statistics(results)
 
+    # Capital efficiency / book utilization (strategy-level)
+    print_capital_efficiency(results)
+
     # Statistical quality metrics (PSR, Serenity, Tail Ratio)
     print_signal_quality_metrics(results)
 
@@ -5249,6 +4621,10 @@ def print_detailed_results(results, execution_time):
 
     # Advanced trade quality metrics
     print_advanced_trade_metrics(results)
+
+    # NET-NEW edge diagnostics: exit-path attribution, signal-conditional edge,
+    # distribution/tail (Cornish-Fisher VaR/ES, CDaR), concentration, deflated Sharpe.
+    print_edge_diagnostics(results)
 
     # Best/worst day-week-month + how far those extremes deviate from normal
     print_trade_history_extremes(results)
@@ -5371,7 +4747,10 @@ def print_risk_metrics(results):
     sortino = results.get('sortino_ratio', 0)
     calmar = results.get('calmar_ratio', 0)
     annual_return = results.get('annualized_return', 0)
-    avg_loss_pct = results.get('avg_loss_pct', 0)
+    # Use the PORTFOLIO-relative avg loss here (VaR/CVaR are daily portfolio %).
+    # The displayed avg_loss_pct is now a real per-trade move and is a different
+    # (larger) scale, so it must not drive these thresholds.
+    avg_loss_pct = results.get('avg_loss_pct_portfolio', results.get('avg_loss_pct', 0))
 
     # ===== Dynamic Threshold Logic =====
     # Annualized Volatility Thresholds
@@ -5434,6 +4813,160 @@ def print_risk_metrics(results):
                               good_threshold=50.0, bad_threshold=100.0,
                               lower_is_better=True, unicorn_multiplier=10000.0))
 
+def _cornish_fisher_tail(returns, alpha=0.05):
+    """Modified VaR + modified ES via the Cornish-Fisher (Zangari 1996 / Boudt et al.)
+    quantile expansion - corrects the Gaussian tail for skewness and excess kurtosis.
+
+    Returns (mVaR, mES, gaussian_VaR, in_valid_domain) as FRACTIONAL daily returns
+    (negative = loss). mES is the tail-average of the modified quantile, integrated
+    numerically over (0, alpha] to avoid a fragile closed form. Returns Nones on too
+    little data. `in_valid_domain` flags whether |skew| is inside the range where the
+    CF quantile stays monotonic (|S| <~ 0.83); outside it the estimate is unreliable.
+    """
+    r = np.asarray(returns, dtype=float)
+    r = r[~np.isnan(r)]
+    if r.size < 20:
+        return None, None, None, True
+    mu = float(r.mean()); sigma = float(r.std(ddof=1))
+    if sigma == 0:
+        return None, None, None, True
+    S = float(stats.skew(r)); K = float(stats.kurtosis(r))  # K = EXCESS kurtosis
+
+    def _cf_q(a):
+        z = stats.norm.ppf(a)
+        zcf = (z + (z**2 - 1) * S / 6.0
+                 + (z**3 - 3*z) * K / 24.0
+                 - (2*z**3 - 5*z) * S**2 / 36.0)
+        return mu + sigma * zcf
+
+    mvar = _cf_q(alpha)
+    grid = np.linspace(max(alpha / 200.0, 1e-4), alpha, 64)
+    mes = float(np.mean([_cf_q(a) for a in grid]))
+    gaussian_var = mu + sigma * stats.norm.ppf(alpha)
+    in_domain = abs(S) <= 6 * (np.sqrt(2) - 1)  # ~0.828
+    return mvar, mes, gaussian_var, in_domain
+
+
+def _conditional_drawdown_at_risk(daily_returns, initial_value=10000.0, alpha=0.95):
+    """CDaR(alpha): the CVaR of the drawdown distribution - average of the worst
+    (1-alpha) fraction of drawdowns along the equity path. A tail-of-drawdowns
+    measure that is far more robust than the single-event Max Drawdown.
+    Returns a positive percentage (drawdown depth)."""
+    r = np.asarray(daily_returns, dtype=float)
+    r = r[~np.isnan(r)]
+    if r.size < 10:
+        return None
+    eq = initial_value * np.cumprod(1 + r)
+    peak = np.maximum.accumulate(eq)
+    dd = (peak - eq) / peak  # fractional drawdown at each point, >= 0
+    thresh = np.percentile(dd, alpha * 100)
+    worst = dd[dd >= thresh]
+    if worst.size == 0:
+        return float(dd.max() * 100)
+    return float(worst.mean() * 100)
+
+
+def _load_trade_table():
+    """Read the just-saved trade table for trade-level diagnostics. Decoupled and
+    fully guarded so a missing/locked file never breaks the report."""
+    try:
+        df = pd.read_parquet('Data/TradeHistory.parquet')
+        return df if len(df) else None
+    except Exception:
+        return None
+
+
+def print_edge_diagnostics(results):
+    """Edge diagnostics: signal quality, exit-path P&L, tail/distribution, robustness.
+    Flat colorized metric lines matching the rest of the report. Each block guarded so
+    a failure cannot abort the report. See
+    analysis_output/BACKTEST_METRICS_RESEARCH_2026_06_30.md for definitions."""
+    trades = _load_trade_table()
+
+    # ---------- Signal & exit path ----------
+    try:
+        if trades is not None:
+            print("\nEdge Diagnostics - Signal & Exit:")
+            if 'UpProbability' in trades.columns:
+                up = trades['UpProbability'].astype(float)
+                pl = trades['PnLPct'].astype(float)
+                ic, _ = spearmanr(up, pl)
+                print(colorize_output(ic, "Signal Rank-IC (Spearman):", 0.05, 0.0))
+                try:
+                    buckets = pd.qcut(up, 5, duplicates='drop')
+                    gb = trades.assign(_b=buckets).groupby('_b', observed=True)['PnLPct'].mean()
+                    for i, avgp in enumerate(gb.values, 1):
+                        print(colorize_output(float(avgp), f"UpProb Q{i} Avg Return %:", 1.0, -0.5))
+                except Exception:
+                    pass
+            if 'ExitReason' in trades.columns:
+                ex = trades.groupby('ExitReason')['PnL'].sum().sort_values(ascending=False)
+                for reason, net in ex.items():
+                    print(colorize_output(float(net), f"Exit {str(reason)[:16]} P&L ($):", 1000.0, -500.0))
+    except Exception as e:
+        print(f"[edge signal/exit skipped: {e}]")
+
+    # ---------- Tail & risk ----------
+    try:
+        print("\nEdge Diagnostics - Tail & Risk:")
+        dser = results.get('daily_return_series')
+        daily = np.asarray(dser.values, dtype=float) if dser is not None else None
+        if daily is not None and daily.size > 20:
+            print(colorize_output(float(stats.skew(daily)), "Daily Return Skew:", 0.3, -0.3))
+            print(colorize_output(float(stats.kurtosis(daily)), "Daily Excess Kurtosis:", 1.0, 5.0,
+                                  lower_is_better=True))
+            mvar, mes, gvar, ok = _cornish_fisher_tail(daily, 0.05)
+            if mvar is not None:
+                print(colorize_output(abs(mvar * 100), "Modified VaR 95% loss %:", 2.0, 4.0,
+                                      lower_is_better=True))
+                print(colorize_output(abs(mes * 100), "Modified ES 95% loss %:", 3.0, 5.0,
+                                      lower_is_better=True))
+            cdar = _conditional_drawdown_at_risk(daily, results.get('initial_value', 10000.0), 0.95)
+            if cdar is not None:
+                print(colorize_output(cdar, "CDaR 95% loss %:", results.get('max_dd', 14) * 0.6,
+                                      results.get('max_dd', 14), lower_is_better=True))
+        if trades is not None:
+            r = trades['PnLPct'].astype(float).values
+            print(colorize_output(float(stats.skew(r)), "Per-Trade Return Skew:", 0.3, -0.3))
+            aw = r[r > 0].mean() if (r > 0).any() else 0.0
+            al = r[r < 0].mean() if (r < 0).any() else 0.0
+            wr = (r > 0).mean() * 100
+            if (aw - al) != 0:
+                be = -al / (aw - al) * 100
+                print(colorize_output(be, "Break-Even Win Rate %:", 45.0, 55.0, lower_is_better=True))
+                print(colorize_output(wr - be, "Win Rate Margin (pp):", 5.0, 0.0))
+            tot = trades['PnL'].sum()
+            ps = np.sort(trades['PnL'].values)[::-1]
+            k = max(1, int(0.1 * len(trades)))
+            share = ps[:k].sum() / tot * 100 if tot != 0 else float('nan')
+            print(colorize_output(share, "Top 10% Trade P&L Share %:", 90.0, 150.0, lower_is_better=True))
+    except Exception as e:
+        print(f"[edge tail/risk skipped: {e}]")
+
+    # ---------- Robustness (opt-in: needs BT_DSR_TRIALS = number of configs searched) ----------
+    try:
+        n_trials = os.environ.get('BT_DSR_TRIALS')
+        dser = results.get('daily_return_series')
+        if n_trials and dser is not None:
+            N = float(n_trials)
+            daily = np.asarray(dser.values, dtype=float)
+            daily = daily[~np.isnan(daily)]
+            n = daily.size
+            sr = (results.get('sharpe_ratio', 0) or 0) / np.sqrt(252)
+            g3 = float(stats.skew(daily)); g4 = float(stats.kurtosis(daily, fisher=False))
+            denom = np.sqrt(max(1e-9, 1 - g3 * sr + ((g4 - 1) / 4.0) * sr**2))
+            sr_std_env = os.environ.get('BT_DSR_TRIAL_SR_STD')
+            v = (float(sr_std_env)) ** 2 if sr_std_env else (denom / np.sqrt(n - 1)) ** 2
+            euler = 0.5772156649
+            sr0 = np.sqrt(v) * ((1 - euler) * stats.norm.ppf(1 - 1.0 / N)
+                                + euler * stats.norm.ppf(1 - 1.0 / (N * np.e)))
+            dsr = float(stats.norm.cdf((sr - sr0) * np.sqrt(n - 1) / denom)) * 100
+            print("\nEdge Diagnostics - Robustness:")
+            print(colorize_output(dsr, f"Deflated Sharpe (N={int(N)}) %:", 95.0, 90.0))
+    except Exception as e:
+        print(f"[edge robustness skipped: {e}]")
+
+
 def print_trade_statistics(results):
     """Print trade statistics with colorized output."""
     print("\nTrade Statistics:")
@@ -5455,15 +4988,17 @@ def print_trade_statistics(results):
     print(colorize_output(results['won_avg'], "Avg. Winning Trade ($):", avg_win_good, avg_win_bad))
     # Losing trade up to 85% of winning trade is fine at 60%+ win rate
     print(colorize_output(results['lost_avg'], "Avg. Losing Trade ($):", results['won_avg'] * 0.75, results['won_avg'] * 1.0, lower_is_better=True))
-    # For 1-day hold: 0.4%+ avg win per trade is strong
-    print(colorize_output(results['avg_win_pct'], "Avg. Winning Trade (%):", 0.4, 0.15))
-    print(colorize_output(results['avg_loss_pct'], "Avg. Losing Trade (%):", results['avg_win_pct'] * 0.8, results['avg_win_pct'] * 1.1, lower_is_better=True))
+    # Per-trade % move on capital deployed (size-independent). Thresholds are a
+    # first pass for a ~1-day-hold strategy and easy to retune once the real
+    # per-trade distribution is observed.
+    print(colorize_output(results['avg_win_pct'], "Avg. Winning Trade (% move):", 3.0, 1.0))
+    print(colorize_output(results['avg_loss_pct'], "Avg. Losing Trade (% move):", results['avg_win_pct'] * 0.8, results['avg_win_pct'] * 1.1, lower_is_better=True))
     # Largest win: good = 5% of account, bad = 0.5% of account
     print(colorize_output(results['won_max'], "Largest Win ($):", _iv / 20, _iv / 200))
     # Largest loss: good ≤ 50% of largest win, bad ≥ 90%
     print(colorize_output(results['lost_max'], "Largest Loss ($):", results['won_max'] * 0.5, results['won_max'] * 0.9, lower_is_better=True))
-    print(colorize_output(results['largest_win_pct'], "Largest Win (%):", 5.0, 2.0))
-    print(colorize_output(results['largest_loss_pct'], "Largest Loss (%):", results['largest_win_pct'] * 0.5, results['largest_win_pct'] * 2.0, lower_is_better=True))
+    print(colorize_output(results['largest_win_pct'], "Largest Win (% move):", 15.0, 5.0))
+    print(colorize_output(results['largest_loss_pct'], "Largest Loss (% move):", results['largest_win_pct'] * 0.5, results['largest_win_pct'] * 2.0, lower_is_better=True))
     print(colorize_output(results['avg_profit_per_trade'], "Avg. Trade P&L:", 50, 0))
     print(colorize_output(results['profit_factor'], "Profit Factor:", 2.5, 1.0))
 
@@ -5475,6 +5010,49 @@ def print_trade_statistics(results):
     print(colorize_output(results['Expected_Value_PerTrade'], "EV Per Trade ($):", ev_good, ev_bad))
 
     print(colorize_output(results['net_profit_drawdown_ratio'], "Net Profit / Drawdown Ratio:", 3.0, 1.0))
+
+
+def print_capital_efficiency(results):
+    """Print strategy-level capital-efficiency / book-utilization metrics.
+
+    These surface things the per-trade stats hide: how full the book runs day
+    to day and how much capital is actually deployed vs sitting in cash
+    (reserves + sub-full sizing). Averages are over the ACTIVE window -- from
+    the first day a position is held onward -- so the leading warm-up period,
+    when lagged signals are still accumulating and nothing trades, doesn't drag
+    the numbers down.
+    """
+    daily_positions = results.get('daily_positions') or []
+    daily_deployment = results.get('daily_deployment') or []
+    max_pos = results.get('max_positions')
+
+    if not daily_positions or not max_pos:
+        return  # nothing to report (older run or no tracking data)
+
+    # Active window starts the first day we actually hold something.
+    first_active = next((i for i, n in enumerate(daily_positions) if n > 0), None)
+    if first_active is None:
+        return  # never took a position
+
+    active_positions = daily_positions[first_active:]
+    active_deployment = daily_deployment[first_active:] if daily_deployment else []
+    n_active = len(active_positions)
+
+    avg_positions = sum(active_positions) / n_active
+    slot_util = avg_positions / max_pos * 100
+    peak_positions = max(active_positions)
+    pct_full_book = sum(1 for n in active_positions if n >= max_pos) / n_active * 100
+    pct_flat = sum(1 for n in active_positions if n == 0) / n_active * 100
+    avg_deployment = (sum(active_deployment) / len(active_deployment)) if active_deployment else 0.0
+
+    print("\nCapital Efficiency (active trading window):")
+    print(f"{'Max Position Slots:':<30}{max_pos}")
+    print(colorize_output(avg_positions, "Avg. Positions Held:", max_pos * 0.8, max_pos * 0.4))
+    print(colorize_output(slot_util, "Slot Utilization %:", 80, 50))
+    print(colorize_output(avg_deployment, "Avg. Capital Deployed %:", 80, 50))
+    print(colorize_output(pct_full_book, "Days at Full Book %:", 50, 15))
+    print(colorize_output(pct_flat, "Days Flat (in cash) %:", 5, 20, lower_is_better=True))
+    print(f"{'Peak Concurrent Positions:':<30}{peak_positions} / {max_pos}")
 
 
 def print_trade_management_metrics(results):
@@ -5764,35 +5342,70 @@ def print_period_performance(results, start_date=None, end_date=None):
     except Exception as e:
         market_results = None
     
+    # ------------------------------------------------------------------
+    # Warm-up detection: leading months where the strategy held flat (no
+    # trades) because lagged can_buy signals were still accumulating. The
+    # strategy did nothing in these months, so a 0.00% return and any
+    # "alpha gap" vs the market are NOT indicative of the system -- the gap
+    # is just the market drifting while we sit in cash. Tag them instead of
+    # scoring them, and drop them from the alpha view.
+    # ------------------------------------------------------------------
+    WARMUP_EPS = 1e-6  # a no-trade month returns exactly 0.0 (equity == cash)
+    GRAY = "\033[38;2;150;150;150m"
+    RESET = "\033[0m"
+
+    def _warmup_line(label, value, note):
+        return f"{label:<30}{GRAY}{value:<10.2f}{RESET}[{GRAY}{note}{RESET}]"
+
+    warmup_months = set()
+    if results['monthly_performance']:
+        for _m in sorted(results['monthly_performance'].keys()):
+            if abs(results['monthly_performance'][_m]) < WARMUP_EPS:
+                warmup_months.add(_m)
+            else:
+                break  # only the leading flat run is warm-up; stop at first traded month
+
     # REALISTIC MONTHLY PERFORMANCE THRESHOLDS
     print("\nStrategy Monthly Performance (%) - Market-Beating Expectations:")
     print("Target: Consistently outperform S&P 500's ~1% monthly average")
-    
+    if warmup_months:
+        print(f"Note: {len(warmup_months)} leading warm-up month(s) (no trades, signals accumulating) shown but not scored.")
+
     if results['monthly_performance']:
         months = sorted(results['monthly_performance'].keys())
-        
+
         for month in months:
             perf = results['monthly_performance'][month]
             month_label = datetime.strptime(month, '%Y-%m').strftime('%Y %B')
+
+            if month in warmup_months:
+                print(_warmup_line(f"{month_label}:", perf, "Warm-up - no trades"))
+                continue
 
             print(colorize_output(perf, f"{month_label}:",
                                 good_threshold=1.8,      # 1.8%+ is good (20%+ annualized)
                                 bad_threshold=0.6,       # <0.6% is poor (7% annualized)
                                 lower_is_better=False))
-    
+
     # MARKET COMPARISON - Only show if we have market data
     if market_results and market_results['monthly_performance']:
         print("\nMonthly Excess Performance vs S&P 500 (%) - Alpha Generation:")
         print("Target: Consistent positive alpha (outperformance)")
-        
+        if warmup_months:
+            print("Note: warm-up month(s) excluded from alpha -- strategy was flat, not under-performing.")
+
         market_months = sorted(market_results['monthly_performance'].keys())
-        
+
         for month in months:
             if month in market_results['monthly_performance']:
                 strategy_perf = results['monthly_performance'][month]
                 market_perf = market_results['monthly_performance'][month]
                 relative_perf = strategy_perf - market_perf
                 month_label = datetime.strptime(month, '%Y-%m').strftime('%Y %B')
+
+                if month in warmup_months:
+                    print(_warmup_line(f"{month_label}:", relative_perf, "Warm-up - excluded"))
+                    continue
 
                 print(colorize_output(relative_perf, f"{month_label}:",
                                     good_threshold=1.0,      # 1%+ monthly alpha is good

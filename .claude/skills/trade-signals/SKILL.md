@@ -184,13 +184,21 @@ book['TargetDate']  = today
 book['SignalDate']  = today
 book['LastUpdated'] = now
 book['LastUpdate']  = now
+book['VetSource']   = 'manual'   # REQUIRED: marks the book hand-vetted; 7__MacroFilter.py
+book['VetTime']     = now        # will never auto-overwrite a same-session 'manual' book
 book.to_parquet('_Buy_Signals.parquet', index=False)    # <-- the file the broker reads
 print('Wrote', len(book), 'to _Buy_Signals.parquet:', list(book['Symbol']))
 ```
 
+**Do not omit the `VetSource='manual'` stamp.** It is what stops the automated funnel
+(`7__MacroFilter.py`, launched by `trading_system.ps1` every morning and by the overnight
+pipeline) from clobbering your hand-vetted book with its mechanical fallback — that exact
+clobber happened at 07:35 on 2026-07-02 and the broker traded the unvetted 8-name book.
+
 Then run a final QC **against `_Buy_Signals.parquet`** (not the pool): row count == number
 selected, no nulls in `Symbol/UpProbability/CurrentPrice/StopPrice/TargetPrice`, all
-`Status == 'Pending'`, all dated today, `StopPrice < CurrentPrice < TargetPrice`.
+`Status == 'Pending'`, all dated today, `StopPrice < CurrentPrice < TargetPrice`, all
+`VetSource == 'manual'`.
 
 ## Step 7 — Verify the broker's input, then launch
 
@@ -208,6 +216,7 @@ assert set(b['Symbol']) == set(EXPECTED), f"book {sorted(b['Symbol'])} != select
 assert (b['Status'] == 'Pending').all(), "non-Pending rows present"
 assert (pd.to_datetime(b['TargetDate']).dt.normalize() == today).all(), "STALE rows — _Buy_Signals.parquet not refreshed today"
 assert len(b) <= 12, "exceeds MAX_BOOK — broker will abort"
+assert 'VetSource' in b.columns and (b['VetSource'] == 'manual').all(), "book not stamped manual — the automated funnel may overwrite it"
 print('OK to launch:', list(b['Symbol']))
 ```
 
@@ -238,6 +247,14 @@ When the background task completes, read the log and report:
   `7__MacroFilter.py`) does not reliably refresh it — on 2026-06-26 the pool was fresh but
   `_Buy_Signals.parquet` was 4 days old, and the broker traded the old names. Overwrite it
   every run; never trust its existing contents.
+- **The automated funnel can also overwrite YOUR book — unless it is stamped.** On
+  2026-07-02 a hand-vetted 3-name book was clobbered at 07:35 by the morning
+  `7__MacroFilter.py` run (its session-date guard was broken and its LLM stage silently
+  degraded to mechanical-only on an unfunded API key); the broker then traded the unvetted
+  8-name mechanical book. Both bugs are fixed (session now derived from the pool's
+  TargetDate; provenance guard added), but the protection **only recognizes books with
+  `VetSource == 'manual'`** — always write the stamp in Step 6. Overriding a manual book
+  requires running `7__MacroFilter.py --force` by hand.
 - **The broker also writes its own log** to `Data/logging/FastExecutor.log` regardless of
   the tee'd `broker_run_*.log`. If the tee file is missing or empty, read
   `Data/logging/FastExecutor.log` to confirm what the broker actually did (it records the

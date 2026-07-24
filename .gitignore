@@ -50,6 +50,18 @@ _archive/
 experimental/
 FeatureTemplates/_audit_backups/
 
+# --- ungated candidate feature blocks (~200k LOC of machine-generated churn) ---
+# The factory emits FeatureTemplates/_cand_*.py by the hundred; the vast majority
+# are WEAK/FAIL and get deleted. Only blocks the gate marked PASS are tracked, and
+# those were `git add -f`'d once -- already-tracked files ignore this rule.
+FeatureTemplates/_cand_*.py
+
+# --- feature-factory machine state (regenerable; ledger + report ARE tracked) ---
+.claude/skills/feature-factory/queue/pending/
+.claude/skills/feature-factory/queue/claimed/
+.claude/skills/feature-factory/queue/done/
+.claude/skills/feature-factory/specs/
+
 # --- pipeline VARIANTS / experiments (keep only whole-number main stages) ---
 # dotted stages (e.g. 5.1__, 4.1__) and sub-numbered (8_1__, 8_2__)
 [0-9].[0-9]*__*.py
