@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neutralization sweep — dose grid + adaptive verdict</title>
+<style>
+  :root {
+    --surface: #f6f7f8; --card: #ffffff; --ink: #191c20; --ink-2: #555c66;
+    --ink-3: #8a919b; --rule: #e2e5e9; --accent: #37516e;
+    --fixed: #2a78d6; --adaptive: #1baf7a; --hole: #c94b4b;
+    --good-bg: #e7f2e7; --good-ink: #1d5c1d; --bad-bg: #f9e7e7; --bad-ink: #8c2323;
+    --warn-bg: #f7edd8; --warn-ink: #7a5310; --chip-bg: #eef1f4;
+    --tt-bg: #22262b; --tt-ink: #f0f2f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface: #17191c; --card: #1e2126; --ink: #e8eaed; --ink-2: #a6adb6;
+      --ink-3: #767d87; --rule: #33383f; --accent: #92aecb;
+      --fixed: #3987e5; --adaptive: #199e70; --hole: #e66767;
+      --good-bg: #1e3320; --good-ink: #9fd6a0; --bad-bg: #3b2020; --bad-ink: #e8a1a1;
+      --warn-bg: #3a2f17; --warn-ink: #e3c37c; --chip-bg: #282d33;
+      --tt-bg: #f0f2f4; --tt-ink: #22262b;
+    }
+  }
+  body { background: var(--surface); color: var(--ink);
+         font: 16px/1.55 "Segoe UI", system-ui, sans-serif; margin: 0; padding: 0 20px 80px; }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header { padding: 42px 0 6px; border-bottom: 3px solid var(--accent); }
+  .eyebrow { text-transform: uppercase; letter-spacing: .14em; font-size: 11.5px; color: var(--ink-3); font-weight: 600; }
+  h1 { font-family: Cambria, Georgia, serif; font-size: clamp(25px, 4vw, 36px); line-height: 1.16; margin: 8px 0 10px; text-wrap: balance; }
+  .dek { color: var(--ink-2); max-width: 70ch; margin: 0 0 22px; font-family: Cambria, Georgia, serif; }
+  h2 { font-family: Cambria, Georgia, serif; font-size: 21px; margin: 0 0 4px; }
+  h2 .sub { font-family: "Segoe UI", system-ui, sans-serif; font-size: 13px; color: var(--ink-3); font-weight: 400; }
+  section { margin-top: 42px; }
+  .sechead { border-bottom: 1px solid var(--rule); padding-bottom: 10px; margin-bottom: 18px; }
+  p { max-width: 74ch; }
+  .foot { font-size: 12.5px; color: var(--ink-3); margin-top: 8px; max-width: 88ch; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-top: 22px; }
+  .tile { background: var(--card); border: 1px solid var(--rule); border-radius: 6px; padding: 16px 18px 14px; }
+  .tile .k { font-size: 12px; text-transform: uppercase; letter-spacing: .1em; color: var(--ink-3); font-weight: 600; }
+  .tile .v { font-family: Consolas, Menlo, monospace; font-variant-numeric: tabular-nums; font-size: 28px; font-weight: 600; margin: 6px 0 2px; }
+  .tile .d { font-size: 13px; color: var(--ink-2); }
+  .chartbox { background: var(--card); border: 1px solid var(--rule); border-radius: 6px; padding: 18px 18px 8px; overflow-x: auto; }
+  .legend { display: flex; gap: 18px; align-items: center; font-size: 13px; color: var(--ink-2); margin: 4px 0 10px; flex-wrap: wrap; }
+  .legend .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .tblbox { overflow-x: auto; background: var(--card); border: 1px solid var(--rule); border-radius: 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { padding: 8px 12px; text-align: right; white-space: nowrap; }
+  th { font-size: 11.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-3); border-bottom: 2px solid var(--rule); }
+  td { border-bottom: 1px solid var(--rule); font-family: Consolas, Menlo, monospace; font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  th:first-child, td:first-child { text-align: left; font-family: "Segoe UI", system-ui, sans-serif; }
+  td.pos { color: var(--good-ink); font-weight: 600; } td.neg { color: var(--bad-ink); font-weight: 600; }
+  tr.hl td { background: color-mix(in srgb, var(--adaptive) 10%, transparent); }
+  tr.hl2 td { background: color-mix(in srgb, var(--fixed) 8%, transparent); }
+  .chip { display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; padding: 3px 9px; border-radius: 99px; }
+  .chip.good { background: var(--good-bg); color: var(--good-ink); }
+  .chip.warn { background: var(--warn-bg); color: var(--warn-ink); }
+  .chip.info { background: var(--chip-bg); color: var(--ink-2); }
+  ul.plain, ol.plain { padding-left: 20px; max-width: 80ch; } ul.plain li, ol.plain li { margin-bottom: 7px; }
+  code { font-family: Consolas, Menlo, monospace; font-size: 13px; background: var(--chip-bg); padding: 1px 5px; border-radius: 3px; }
+  #tt { position: fixed; pointer-events: none; background: var(--tt-bg); color: var(--tt-ink);
+        font-size: 12.5px; line-height: 1.45; padding: 9px 11px; border-radius: 5px; max-width: 280px;
+        opacity: 0; transition: opacity .12s; z-index: 10; }
+  @media (prefers-reduced-motion: reduce) { #tt { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="eyebrow">Stock-Market · neutralization dose sweep + adaptive test · 2026-07-03</div>
+  <h1>The dose curve is jagged, 0.30 keeps the crown on the live window — and the adaptive rule wins across regimes.</h1>
+  <p class="dek">32 live-window backtests (16 arms × 2 seeds) plus 32 deep-regime slice backtests (8 arms × 2019/2020/2023/2025),
+  all pinned-seed, factor parity gated bit-exact. No smooth optimum exists: adjacent doses swing ±15pp with seeds in tight
+  agreement, so the answer is a robust zone and a per-regime overlay, not a magic number.</p>
+</header>
+
+<section>
+  <div class="tiles">
+    <div class="tile">
+      <div class="k">Live window best</div>
+      <div class="v">0.30</div>
+      <div class="d">82.7% mean (4 seeds) — current promoted default. Next best: 0.20 (77.9), 0.15 (76.3).</div>
+    </div>
+    <div class="tile">
+      <div class="k">Cross-regime best (2019–25)</div>
+      <div class="v">SPY-EMA</div>
+      <div class="d">Binary adaptive (0.15 above 200-EMA / 0.45 below): sum +110 vs 0.15 → +105, 0.30 → +97, raw +63.</div>
+    </div>
+    <div class="tile">
+      <div class="k">Over-neutralization</div>
+      <div class="v">collapses</div>
+      <div class="d">Dose 1.00 looked fine on the live window (73.9%) but craters across regimes (sum +23). 0.45 is a hole (45.0%).</div>
+    </div>
+    <div class="tile">
+      <div class="k">Doses &gt; 1.0 (inversion)</div>
+      <div class="v">running</div>
+      <div class="d">1.05 / 1.10 / 1.20 / 1.30 arms auto-running now — refresh this page later; section updates when done.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sechead"><h2>Live-window dose response <span class="sub">· total return, window ≈ Jun 2025 → Jul 2026 · bars = 2-seed mean (0.30 = 4 seeds) · hover for detail</span></h2></div>
+  <div class="legend">
+    <span><span class="sw" style="background:var(--fixed)"></span>fixed dose</span>
+    <span><span class="sw" style="background:var(--adaptive)"></span>SPY-200EMA adaptive</span>
+    <span><span class="sw" style="background:var(--hole)"></span>below raw baseline</span>
+    <span>― dashed line = raw (60.3%)</span>
+  </div>
+  <div class="chartbox"><svg id="curve" width="1040" height="360" role="img" aria-label="Dose response bar chart"></svg></div>
+  <p class="foot">Seeds agree tightly at each dose (many arms bit-identical), yet adjacent doses swing ±15pp — the surface is
+  genuinely jagged because small ranking nudges discretely change which names cross the book's selection thresholds. Reading any
+  single point as "the optimum" is noise-fitting; the robust zone is ~0.10–0.30. Bonus micro-dose points from the (disclosed) 10×
+  dose-encoding bug: 0.015 → 72.1, 0.020 → 75.6, 0.025 → 78.1, 0.035 → 83.0 — even homeopathic doses reorder the near-degenerate
+  top of book most of the way.</p>
+</section>
+
+<section>
+  <div class="sechead"><h2>Deep-regime matrix <span class="sub">· total return per pinned slice, BT_SAMPLE_SEED 42 (deterministic) · model never saw pre-Nov-2023 data</span></h2></div>
+  <div class="tblbox">
+  <table>
+    <thead><tr><th>Arm</th><th>2019</th><th>2020 · COVID</th><th>2023 · failure yr</th><th>2025 · tariff</th><th>Σ 4 slices</th><th>Live window</th></tr></thead>
+    <tbody>
+      <tr><td>raw (dose 0)</td><td class="pos">+7.8</td><td class="pos">+43.8</td><td class="neg">−21.2</td><td class="pos">+32.8</td><td>+63.2</td><td>60.3</td></tr>
+      <tr class="hl2"><td>0.15</td><td class="pos">+23.7</td><td class="pos">+42.7</td><td class="neg">−19.9</td><td class="pos">+58.4</td><td><b>+105.0</b></td><td>76.3</td></tr>
+      <tr><td>0.20</td><td class="pos">+18.8</td><td class="pos">+43.1</td><td class="neg">−25.2</td><td class="pos">+33.6</td><td>+70.3</td><td>77.9</td></tr>
+      <tr class="hl2"><td>0.30 — promoted default</td><td class="pos">+29.1</td><td class="pos">+36.3</td><td class="neg">−19.6</td><td class="pos">+51.6</td><td><b>+97.4</b></td><td><b>82.7</b></td></tr>
+      <tr><td>0.40</td><td class="pos">+20.1</td><td class="pos">+53.5</td><td class="neg">−26.9</td><td class="pos">+45.6</td><td>+92.3</td><td>64.2</td></tr>
+      <tr><td>0.50</td><td class="pos">+25.1</td><td class="pos">+41.9</td><td class="neg">−24.9</td><td class="pos">+31.1</td><td>+73.1</td><td>70.1</td></tr>
+      <tr><td>1.00 — full neutralization</td><td class="pos">+22.5</td><td class="pos">+18.1</td><td class="neg">−22.6</td><td class="pos">+4.7</td><td>+22.7</td><td>73.9</td></tr>
+      <tr class="hl"><td>spy200 — binary adaptive</td><td class="pos">+27.7</td><td class="pos">+43.7</td><td class="neg">−19.6</td><td class="pos">+58.5</td><td><b>+110.3</b></td><td>71.8</td></tr>
+      <tr><td>spy200c — continuous adaptive</td><td class="pos">+25.9</td><td class="pos">+46.4</td><td class="neg">−27.9</td><td class="pos">+42.7</td><td>+87.0</td><td>67.1</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="foot">spy200 = dose 0.15 when SPY ≥ its 200-day EMA, 0.45 below; spy200c = continuous 0.30 − 1.5·clip(SPY/EMA−1, ±0.1).
+  The binary adaptive is the only arm that is at-or-near best in EVERY regime: it keeps raw's melt-up upside in 2020 (43.7 vs 0.30's 36.3),
+  ties the best 2023, and posts the best 2025 — exactly the regime-switching behavior it was designed for. Its live-window shortfall
+  (71.8 vs 82.7) traces largely to its defensive constant being 0.45 — the one destructive dose on the live curve. Slice totals are
+  survivor-biased in level (zero delisted names in the deep lake); arm-vs-arm spreads are the meaningful comparison. Sums weight the
+  four slices equally.</p>
+</section>
+
+<section>
+  <div class="sechead"><h2>Doses above 1.0 — factor inversion <span class="sub">· dose &gt; 1 actively flips the model's factor tilt</span></h2></div>
+  <p id="over-status"><b>Complete (both seeds bit-identical per dose):</b> 1.05 → <b>51.2%</b> · 1.10 → <b>82.3%</b> ·
+  1.20 → <b>66.1%</b> · 1.30 → <b>61.5%</b>. The 0.85→1.00 uptick did <b>not</b> continue — the inversion region shows the same
+  jagged signature as the rest of the curve, with 1.10 an isolated spike that ties the champion on one window while its neighbors
+  sit at 51 and 66. Verdict: <span class="chip warn">closed</span> — no robust structure past 1.0; dose 0.30's advantage rests on
+  two independent windows plus regime breadth, 1.10's on nothing. Mechanically the probe still taught something: even a fully
+  inverted factor tilt stays comfortably above a coin flip, re-confirming that the edge is mostly idiosyncratic.</p>
+</section>
+
+<section>
+  <div class="sechead"><h2>Adaptive campaign — evening extension <span class="sub">· 2 signals × 2 orientations + extremes · coarse live screen, deep gate for survivors</span></h2></div>
+  <div class="tblbox">
+  <table>
+    <thead><tr><th>Arm (dose above EMA / below)</th><th>Live window</th><th>2019</th><th>2020</th><th>2023</th><th>2025</th><th>Σ 4 slices</th><th>Gate (≥112, live ≥79.7)</th></tr></thead>
+    <tbody>
+      <tr class="hl2"><td>fixed 0.30 — incumbent</td><td><b>82.7</b> (4 seeds)</td><td>+29.1</td><td>+36.3</td><td>−19.6</td><td>+51.6</td><td>+97.4</td><td><span class="chip good">holds title</span></td></tr>
+      <tr><td>a200 0.30 / 0.15 (flip: beta in dips)</td><td>81.6 / Sh 1.82</td><td>+29.3</td><td>+32.4</td><td>−20.5</td><td>+51.9</td><td>+93.1</td><td><span class="chip bad">failed</span></td></tr>
+      <tr><td>a200 0.95 / 0.05 (extreme flip)</td><td>85.8 / Sh 1.96 ← day's best</td><td>+25.1</td><td>+8.1</td><td>−18.6</td><td>+26.4</td><td>+41.0</td><td><span class="chip bad">failed — window-fit</span></td></tr>
+      <tr><td>a200 0.15 / 0.30</td><td>71.0</td><td colspan="4" style="text-align:center;color:var(--ink-3)">eliminated at live screen</td><td>—</td><td><span class="chip bad">failed</span></td></tr>
+      <tr><td>a200 0.05 / 0.95 (extreme defensive)</td><td>73.1</td><td colspan="4" style="text-align:center;color:var(--ink-3)">eliminated at live screen</td><td>—</td><td><span class="chip bad">failed</span></td></tr>
+      <tr><td>a100 variants (both orientations)</td><td>= a200 twins (bit-identical)</td><td colspan="4" style="text-align:center;color:var(--ink-3)">EMA speed made zero difference on this window</td><td>—</td><td><span class="chip info">merged</span></td></tr>
+      <tr><td>spy200 0.15 / 0.45 (morning ref.)</td><td>71.8</td><td>+27.7</td><td>+43.7</td><td>−19.6</td><td>+58.5</td><td><b>+110.3</b></td><td><span class="chip warn">best deep, fails live</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="foot">Lessons: (1) orientation B — beta-heavy in drawdowns — beats A on the live window in every pairing, validating the
+  dip-harvest mechanism directionally; (2) the extreme flip is the campaign's cautionary tale: best single number of the whole day
+  (85.8) and the second-worst regime profile (+41) — window-fit in its purest form; (3) no adaptive arm cleared the pre-registered
+  gate, and the strongest challenger (0.30/0.15) is dominated by fixed 0.30 on both axes; (4) the odd couple remains: spy200
+  (0.15/0.45) wins regimes but loses the recent window — regime-conditioning has real breadth value that this simple SPY-EMA
+  trigger can't capture without giving up recent-window performance. The lever with a mechanism for both: condition on the
+  <i>strategy's own trailing efficacy</i>, not market state — the one untested idea, deliberately excluded from today's scope.</p>
+</section>
+
+<section>
+  <div class="sechead"><h2>Verdict &amp; recommendation</h2></div>
+  <ol class="plain">
+    <li><b>Keep dose 0.30 as the production default.</b> <span class="chip good">decided</span> Best measured point on the honest live
+    window (82.7%, 4 seeds), second-best cross-regime sum, already validated twice and wired into the nightly pipeline. Nothing in
+    0.35–1.00 challenges it; 0.45 is actively destructive.</li>
+    <li><b>The real challenger is your adaptive idea, upgraded:</b> <span class="chip warn">next lever</span> spy200 won cross-regime
+    despite its defensive constant (0.45) being the live curve's one hole. The obvious variant —
+    <code>0.15 above the 200-EMA / 0.30 below</code> (defensive dose = the known-good default instead of the hole) — plausibly
+    dominates both parents. That's a 2-arm test: live window (2 seeds) + 4 deep slices ≈ 45 min of compute, and it must pass the
+    standard gate before touching production.</li>
+    <li><b>Stop fine-tuning fixed doses.</b> <span class="chip info">closed</span> The surface is jagged at ±15pp between adjacent
+    doses; anything inside 0.10–0.30 is defensible and differences within the zone are window-dependent noise. 68 backtests bought
+    this certainty; more grid points would buy none.</li>
+    <li><b>Full neutralization is refuted as a config</b> but diagnostic as a finding: the model's factor-aligned component carries
+    real signal in most regimes (removing 100% of it collapses cross-regime performance), yet the majority of the edge is
+    idiosyncratic (dose 1.0 still beat raw on the live window). Partial neutralization is the right family.</li>
+  </ol>
+</section>
+
+<section>
+  <div class="sechead"><h2>Methodology &amp; disclosures</h2></div>
+  <ul class="plain foot" style="font-size:13px">
+    <li>Live arms: production <code>5__NightlyBackTester.py</code>, <code>--data_dir</code> read-only override, BT_SAMPLE_SEED ∈ {42,44}
+        (0.30 reference = 4 seeds from the morning A/B). Deep arms: <code>BT_AS_OF</code> fork, pinned slices, seed 42
+        (spot-checked bit-identical across seeds).</li>
+    <li>Factor panel for deep arms rebuilt by invoking the production block code per ticker (beta_metrics / volatility_atr /
+        liquidity), float32-cast; <b>parity gate vs the original dose-0.3 arm: max |ΔUpProbability| = 0</b> across 100 sampled tickers.</li>
+    <li>Disclosure: the first sweep launch had a 10× dose-encoding bug (arm names divided by 1000, not 100). Caught after 8 runs
+        via curve-shape implausibility; those runs are archived as genuine micro-dose data (0.015–0.035) and the entire grid re-ran
+        under the corrected parser. Nothing from the bugged runs is mixed into the tables above.</li>
+    <li>Adaptive dose uses same-day SPY close vs its 200-day EMA (yfinance, fetched through 2026-07-02) — observable state,
+        no lookahead. Per-day dose applied to the same per-day centered projection; quantile-map preserves each day's
+        UpProbability marginal exactly, so no downstream gate/threshold was retuned anywhere in this study.</li>
+    <li>Live prediction set remained RAW throughout (verified at each launch); every backtest ran against copies. The live signals
+        file was backed up and restored after every batch. Deep slice levels carry survivorship bias (survivor-only lake).</li>
+  </ul>
+</section>
+</div>
+
+<div id="tt" role="tooltip"></div>
+
+<script>
+(function () {
+  var data = [
+    { k: "0",    v: 60.33, s: [60.33, 60.33], t: "fixed", note: "raw baseline (4 seeds identical)" },
+    { k: ".05",  v: 66.35, s: [66.54, 66.15], t: "fixed" },
+    { k: ".10",  v: 73.04, s: [75.10, 70.98], t: "fixed" },
+    { k: ".15",  v: 76.32, s: [73.73, 78.90], t: "fixed" },
+    { k: ".20",  v: 77.92, s: [74.86, 80.97], t: "fixed" },
+    { k: ".25",  v: 72.93, s: [72.93, 72.93], t: "fixed" },
+    { k: ".30",  v: 82.75, s: [79.51, 83.79, 83.89, 83.79], t: "fixed", note: "promoted default — 4 seeds" },
+    { k: ".35",  v: 62.63, s: [65.90, 59.36], t: "fixed" },
+    { k: ".40",  v: 64.21, s: [63.65, 64.76], t: "fixed" },
+    { k: ".45",  v: 45.00, s: [45.00, 45.00], t: "hole", note: "only dose below raw" },
+    { k: ".50",  v: 70.06, s: [69.33, 70.78], t: "fixed" },
+    { k: ".55",  v: 65.03, s: [64.24, 65.81], t: "fixed" },
+    { k: ".60",  v: 61.54, s: [61.54, 61.54], t: "fixed" },
+    { k: ".70",  v: 67.62, s: [67.62, 67.62], t: "fixed" },
+    { k: ".85",  v: 70.38, s: [70.38, 70.38], t: "fixed" },
+    { k: "1.0",  v: 73.85, s: [73.85, 73.85], t: "fixed" },
+    { k: "EMA",  v: 71.82, s: [69.22, 74.42], t: "adaptive", note: "binary 0.15/0.45" },
+    { k: "EMAc", v: 67.13, s: [63.41, 70.85], t: "adaptive", note: "continuous" },
+  ];
+  var RAW = 60.33;
+  var svg = document.getElementById("curve");
+  var NS = "http://www.w3.org/2000/svg";
+  var W = 1040, H = 360, M = { t: 22, r: 12, b: 34, l: 46 };
+  var iw = W - M.l - M.r, ih = H - M.t - M.b;
+  var yMin = 0, yMax = 90;
+  function y(v) { return M.t + ih * (1 - (v - yMin) / (yMax - yMin)); }
+  function css(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  function el(name, attrs, parent) {
+    var e = document.createElementNS(NS, name);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    (parent || svg).appendChild(e);
+    return e;
+  }
+  function draw() {
+    svg.innerHTML = "";
+    var ink2 = css("--ink-2"), ink3 = css("--ink-3"), rule = css("--rule");
+    var colors = { fixed: css("--fixed"), adaptive: css("--adaptive"), hole: css("--hole") };
+    for (var v = 0; v <= 90; v += 30) {
+      el("line", { x1: M.l, x2: W - M.r, y1: y(v), y2: y(v), stroke: rule, "stroke-width": 1 });
+      el("text", { x: M.l - 8, y: y(v) + 4, "text-anchor": "end", fill: ink3, "font-size": 11.5,
+                   "font-family": "Consolas, Menlo, monospace" }).textContent = v + "%";
+    }
+    el("line", { x1: M.l, x2: W - M.r, y1: y(RAW), y2: y(RAW), stroke: ink2,
+                 "stroke-width": 1.4, "stroke-dasharray": "5 4" });
+    var gw = iw / data.length, bw = Math.min(40, gw * 0.62);
+    data.forEach(function (d, i) {
+      var cx = M.l + gw * (i + 0.5), x = cx - bw / 2;
+      var top = y(d.v), h = y(0) - top, r = Math.min(4, h);
+      var path = "M" + x + "," + (top + h) + " L" + x + "," + (top + r) +
+        " Q" + x + "," + top + " " + (x + r) + "," + top +
+        " L" + (x + bw - r) + "," + top + " Q" + (x + bw) + "," + top + " " + (x + bw) + "," + (top + r) +
+        " L" + (x + bw) + "," + (top + h) + " Z";
+      var bar = el("path", { d: path, fill: colors[d.t] });
+      if (d.k === ".30") el("path", { d: path, fill: "none", stroke: ink2, "stroke-width": 1.6 });
+      el("text", { x: cx, y: top - 5, "text-anchor": "middle", fill: ink2, "font-size": 10.5,
+                   "font-weight": 600, "font-family": "Consolas, Menlo, monospace" }).textContent = d.v.toFixed(1);
+      d.s.forEach(function (sv) {
+        el("circle", { cx: cx, cy: y(sv), r: 2.4, fill: "none", stroke: ink2, "stroke-width": 1 });
+      });
+      el("text", { x: cx, y: H - 12, "text-anchor": "middle", fill: ink2, "font-size": 11.5,
+                   "font-family": "Segoe UI, system-ui, sans-serif" }).textContent = d.k;
+      var hit = el("rect", { x: x - 3, y: M.t, width: bw + 6, height: ih, fill: "transparent" });
+      [bar, hit].forEach(function (t) {
+        t.addEventListener("mousemove", function (ev) { tip(ev, d); });
+        t.addEventListener("mouseleave", hide);
+      });
+    });
+  }
+  var tt = document.getElementById("tt");
+  function tip(ev, d) {
+    tt.innerHTML = "<b>" + (d.t === "adaptive" ? "adaptive " : "dose ") + d.k + "</b>" +
+      (d.note ? " — " + d.note : "") + "<br>mean " + d.v.toFixed(2) + "%<br>seeds: " +
+      d.s.map(function (x) { return x.toFixed(2); }).join(" / ");
+    tt.style.opacity = 1;
+    var pad = 14, w = tt.offsetWidth, h = tt.offsetHeight;
+    var x = ev.clientX + pad, yy = ev.clientY - h - pad;
+    if (x + w > innerWidth - 8) x = ev.clientX - w - pad;
+    if (yy < 8) yy = ev.clientY + pad;
+    tt.style.left = x + "px"; tt.style.top = yy + "px";
+  }
+  function hide() { tt.style.opacity = 0; }
+  draw();
+  if (window.matchMedia) matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
+})();
+</script>
+</body>
+</html>

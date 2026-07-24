@@ -29,10 +29,25 @@ mechanical screens:
   (RSI>80) is now a soft de-prioritization, and the user-requested concentration cap was
   added in Stage 4. See analysis_output/MACRO_FILTER_FINDINGS.md.
 
-IDEMPOTENT: if _Buy_Signals.parquet already holds a narrowed book dated for the
-next trading day (e.g. you funneled by hand via the trade-signals skill), this
-exits immediately and spends $0. Use --force to re-run anyway.
+IDEMPOTENT + PROVENANCE-GUARDED: the target session is taken from the POOL's
+TargetDate, not the calendar — get_next_trading_day(today) returns the day AFTER
+today, so any run on the session day itself (the overnight pipeline finishing at
+~02:00, the 07:00 morning task) used to compute the wrong session, the guard never
+matched, and every rerun clobbered the book (2026-07-02: overwrote a hand-vetted
+book with the mechanical fallback while the API key was unfunded).
+If _Buy_Signals.parquet already holds a narrowed book for the target session:
+  - VetSource='manual' (hand-vetted via the trade-signals skill): NEVER replaced
+    automatically; --force is the only override.
+  - VetSource='llm': already vetted — exits immediately, spends $0.
+  - VetSource='mechanical' (or an older unstamped book): re-runs ONLY if this run
+    has a working LLM stage to upgrade it; a mechanical rerun keeps the book.
+The guard is re-checked right before the write (the research-window wait is up to
+~35 min), and a run whose LLM died mid-flight (0 successful checks) refuses to
+overwrite an existing same-session book. Use --force to re-run anyway.
 """
+
+
+
 import argparse
 import glob
 import json
@@ -329,24 +344,35 @@ def compute_weekly_vol_pct(price_df, window=5):
 # Idempotency — has the funnel already produced today's book?
 # ════════════════════════════════════════════════════════════════════════════════
 def already_funneled(next_td):
-    """True if _Buy_Signals.parquet already holds a narrowed book for next_td."""
+    """(done, symbols, vet_source) — does _Buy_Signals.parquet already hold a narrowed
+    book for next_td, and who produced it ('manual' / 'llm' / 'mechanical')?
+    Books written before provenance stamping report 'mechanical' (lowest tier), so
+    they stay upgradeable. Any 'manual' row marks the whole book manual — that is
+    the protective direction."""
     if not os.path.exists(BOOK_FILE):
-        return False, None
+        return False, None, None
     try:
         df = pd.read_parquet(BOOK_FILE)
     except Exception:
-        return False, None
+        return False, None, None
     if "Status" not in df.columns:          # raw ledger / unnarrowed
-        return False, None
+        return False, None, None
     pend = df[df["Status"] == "Pending"]
     if pend.empty or len(pend) > MAX_BOOK:   # empty or still pool-sized
-        return False, None
+        return False, None, None
     if "TargetDate" not in pend.columns:
-        return False, None
+        return False, None, None
     dates = set(pd.to_datetime(pend["TargetDate"], errors="coerce").dt.date.dropna())
     if dates == {next_td}:                   # narrowed AND dated for the upcoming session
-        return True, pend["Symbol"].tolist()
-    return False, None
+        src = "mechanical"
+        if "VetSource" in pend.columns:
+            vals = {str(v).strip().lower() for v in pend["VetSource"].dropna()}
+            if "manual" in vals:
+                src = "manual"
+            elif "llm" in vals:
+                src = "llm"
+        return True, pend["Symbol"].tolist(), src
+    return False, None, None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -568,8 +594,11 @@ class LLMJudge:
 # ════════════════════════════════════════════════════════════════════════════════
 # Output
 # ════════════════════════════════════════════════════════════════════════════════
-def write_book(pool_df, selected_symbols, dry_run):
-    """Write the chosen symbols (rich pool schema) to _Buy_Signals.parquet."""
+def write_book(pool_df, selected_symbols, dry_run, vet_source="mechanical"):
+    """Write the chosen symbols (rich pool schema) to _Buy_Signals.parquet.
+    vet_source stamps provenance ('llm' when >=1 successful LLM check ran this run,
+    else 'mechanical'); the trade-signals skill stamps 'manual'. The guard in main()
+    uses this to decide what may ever be overwritten."""
     book = pool_df[pool_df["Symbol"].isin(selected_symbols)].copy()
     # Preserve rank order
     book["Symbol"] = pd.Categorical(book["Symbol"], categories=selected_symbols, ordered=True)
@@ -582,6 +611,8 @@ def write_book(pool_df, selected_symbols, dry_run):
     for c in ("StopPrice", "TargetPrice", "ATR"):
         if c in book.columns:
             book[c] = pd.NA
+    book["VetSource"] = vet_source
+    book["VetTime"] = pd.Timestamp.now()
 
     if dry_run:
         logger.info("DRY RUN — not writing the book.")
@@ -626,7 +657,7 @@ def wait_for_research_window(no_wait=False):
 # Main
 # ════════════════════════════════════════════════════════════════════════════════
 def main():
-    ap = argparse.ArgumentParser(description="Signal funnel: pool -> final book (<=4).")
+    ap = argparse.ArgumentParser(description="Signal funnel: pool -> final narrowed book.")
     ap.add_argument("--force", action="store_true",
                     help="Re-run even if a narrowed book already exists for the next session.")
     ap.add_argument("--skip-llm", action="store_true",
@@ -641,19 +672,10 @@ def main():
     logger.info("MACRO FILTER — SIGNAL FUNNEL")
     logger.info("=" * 70)
 
-    next_td = _next_trading_day()
-    logger.info(f"Next trading day: {next_td}")
-
-    # ── Idempotency: skip (spend $0) if already funneled for this session ─────────
-    done, syms = already_funneled(next_td)
-    if done and not args.force:
-        logger.info(f"Book already narrowed for {next_td}: {syms}. "
-                    f"Nothing to do (use --force to re-run). Spent $0.")
-        return
-    if done and args.force:
-        logger.info(f"Existing book for {next_td} found ({syms}) — --force given, re-running.")
-
-    # ── Stage 0: load + align ────────────────────────────────────────────────────
+    # ── Stage 0: load the pool FIRST — it defines the session this run targets ────
+    # (get_next_trading_day(today) returns the day AFTER today, so a run on the
+    # session day itself would compute the wrong date; the pool's TargetDate is the
+    # canonical session, written by the nightly pipeline. Calendar is fallback only.)
     if not os.path.exists(POOL_FILE):
         logger.error(f"Pool file not found: {POOL_FILE}. Nothing to funnel.")
         return
@@ -662,16 +684,61 @@ def main():
         pool = pool[pool["Status"] == "Pending"].copy()
     logger.info(f"Pool: {len(pool)} pending candidate(s).")
 
+    session = None
     if "TargetDate" in pool.columns:
         td = pd.to_datetime(pool["TargetDate"], errors="coerce").dt.date
-        day = pool[td == next_td].copy()
-        if day.empty:
-            logger.warning(f"No pool rows dated {next_td}; falling back to all pending rows.")
-            day = pool.copy()
-        pool = day
+        valid = td.dropna()
+        if not valid.empty:
+            session = valid.max()
+            pool = pool[td == session].copy()
+    if session is None:
+        session = _next_trading_day()
+        logger.warning(f"Pool has no usable TargetDate — falling back to the calendar "
+                       f"next trading day: {session}.")
+    logger.info(f"Target session: {session}")
+
+    today_et = datetime.now(ET).date()
+    if session < today_et:
+        logger.error(f"Pool is STALE (dated {session}, today {today_et} ET) — the nightly "
+                     f"pipeline did not produce fresh signals. Leaving the existing book "
+                     f"UNTOUCHED; refusing to funnel stale candidates.")
+        return
     if pool.empty:
         logger.info("No candidates to funnel. Exiting.")
         return
+
+    # ── Idempotency + provenance guard ────────────────────────────────────────────
+    # A book already narrowed for this session is only replaced when this run can
+    # genuinely improve it; a MANUALLY vetted book is never replaced automatically.
+    judge = LLMJudge(skip=args.skip_llm)
+
+    done, syms, vet_src = already_funneled(session)
+    if done and not args.force:
+        if vet_src == "manual":
+            logger.info(f"Book for {session} is MANUALLY VETTED ({syms}) — protected; "
+                        f"not touching it (--force is the only override). Spent $0.")
+            logger.info("FUNNEL COMPLETE")
+            return
+        if vet_src == "llm":
+            logger.info(f"Book already LLM-vetted for {session}: {syms}. "
+                        f"Nothing to do (use --force to re-run). Spent $0.")
+            logger.info("FUNNEL COMPLETE")
+            return
+        if not judge.enabled:
+            logger.info(f"Book for {session} ({syms}) is mechanical-vetted and this run "
+                        f"has no working LLM stage — a rerun could only produce the same "
+                        f"or worse. Keeping the existing book (--force to override). Spent $0.")
+            logger.info("FUNNEL COMPLETE")
+            return
+        logger.info(f"Existing book for {session} ({syms}) is mechanical-only — "
+                    f"re-funneling WITH LLM vetting to upgrade it.")
+    if done and args.force:
+        if vet_src == "manual":
+            logger.warning(f"--force: OVERRIDING a MANUALLY VETTED book for {session} "
+                           f"({syms}). If this is an automated run, something is wrong.")
+        else:
+            logger.info(f"Existing {vet_src} book for {session} found ({syms}) — "
+                        f"--force given, re-running.")
 
     quarantine = load_quarantine()
     price_cache = {s: load_price_history(s) for s in pool["Symbol"].unique()}
@@ -709,7 +776,6 @@ def main():
     # ── Stage 3: web-search top-down ONLY until the book is full (bounds cost + time;
     #    must finish before the broker locks in at 10:00 ET). Confirmed active-M&A /
     #    crisis is dropped and we research the next-ranked name instead.
-    judge = LLMJudge(skip=args.skip_llm)
     if judge.enabled:
         wait_for_research_window(args.no_wait)   # hold for post-open news before web-searching
 
@@ -726,7 +792,8 @@ def main():
 
     chosen = []          # list of (survivor-dict, verdict, was_checked)
     deferred_conc = []   # LLM-cleared names held back by a concentration cap (relax-fill later)
-    checks = 0
+    checks = 0           # LLM checks attempted
+    checks_ok = 0        # LLM checks that actually returned a verdict (key alive)
     for cand in ordered:
         if len(chosen) >= TARGET_BOOK_SIZE:
             break
@@ -734,6 +801,7 @@ def main():
             verdict = judge.judge(cand["symbol"], cand["row"])
             checks += 1
             checked = not verdict.get("skipped", True)
+            checks_ok += int(checked)
             if verdict["has_active_ma"] or verdict["has_crisis"]:
                 why = verdict["ma_details"] if verdict["has_active_ma"] else verdict["crisis_details"]
                 logger.info(f"[{cand['symbol']}] DROPPED (LLM): {why}")
@@ -781,7 +849,28 @@ def main():
                     f"{TARGET_BOOK_SIZE - len(selected)} slot(s) left empty)")
     logger.info("─" * 70)
 
-    write_book(pool, selected, args.dry_run)
+    # ── Final guard, re-checked at WRITE time ─────────────────────────────────────
+    # The research-window wait above can be ~35 min, so a manually vetted book may
+    # have landed on disk since the launch check; and a run whose LLM died mid-flight
+    # (unfunded key: enabled at construction, fails on first call) must not replace
+    # an existing same-session book with a mechanical-only rewrite.
+    vet_source = "llm" if checks_ok > 0 else "mechanical"
+    done_now, syms_now, src_now = already_funneled(session)
+    if done_now and not args.force:
+        if src_now == "manual":
+            logger.info(f"WRITE ABORTED: a MANUALLY VETTED book for {session} ({syms_now}) "
+                        f"is on disk — keeping it. (This run would have written: {selected})")
+            logger.info("FUNNEL COMPLETE")
+            return
+        if checks_ok == 0:
+            logger.info(f"WRITE ABORTED: zero successful LLM checks this run (key unfunded/"
+                        f"errored?) and a {src_now} book for {session} ({syms_now}) already "
+                        f"exists — a mechanical rewrite adds nothing over it. Keeping the "
+                        f"existing book. (This run would have written: {selected})")
+            logger.info("FUNNEL COMPLETE")
+            return
+
+    write_book(pool, selected, args.dry_run, vet_source)
     logger.info("FUNNEL COMPLETE")
 
 

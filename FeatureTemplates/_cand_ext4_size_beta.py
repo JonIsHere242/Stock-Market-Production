@@ -71,13 +71,13 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
     work = work.sort_values("Date").reset_index(drop=True)
 
     def _merge_index(ser, col_name):
+        nonlocal work
         if ser is None or len(ser) == 0:
             work[col_name] = np.nan
             return
         idx_df = ser.reset_index()
         idx_df.columns = ["Date", col_name]
         idx_df["Date"] = pd.to_datetime(idx_df["Date"])
-        nonlocal work
         work["Date"] = pd.to_datetime(work["Date"])
         work = pd.merge_asof(
             work.sort_values("Date"),

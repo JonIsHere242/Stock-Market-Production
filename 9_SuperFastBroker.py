@@ -58,13 +58,15 @@ MAX_BOOK = 12
 # was built FOR; the broker runs on that day, so a fresh book is dated today. Staleness is
 # measured in TRADING days (np.busday_count, so weekends don't count against it):
 #   0 trading days   → fresh, trade normally
-#   1 trading day    → WARN (yellow) but proceed (e.g. a late/manual run)
 #   >= STALE_ABORT_TDAYS → ABORT: place NO orders, print a big red banner
 # 2026-06-26 incident: the broker filled a 4-trading-day-old book (TargetDate 06-22)
 # because the morning narrowing left a stale _Buy_Signals.parquet in place and nothing
 # checked the date. Bump STALE_ABORT_TDAYS if you ever want to tolerate older books.
+# 2026-07-10 incident: the 1-trading-day "warn but proceed" path traded the stale 07-06
+# book on 07-07 (STAA/CRK) after the nightly pipeline silently stopped running. A book
+# that is not dated for TODAY's session is untested by the morning funnel — abort.
 STALE_WARN_TDAYS  = 1
-STALE_ABORT_TDAYS = 2
+STALE_ABORT_TDAYS = 1
 
 ET = ZoneInfo('America/New_York')
 
@@ -561,15 +563,7 @@ class AsyncFastExecutor:
                 transmit=False
             )
 
-            # ── STAGE-2 (2026-06-12): TRAILING STOP REMOVED ──────────────────────
-            # The 5-min intraday replay + the full strategy exit-sweep BOTH found the
-            # trailing stop was the whipsaw culprit: with the trail, 68% of trades stop
-            # out (34% on the trail alone) for -0.05%/trade; dropping it -> 55% stop-outs,
-            # +0.06%/trade, and the strategy backtest jumps 154%->182% ann at HALF the max
-            # drawdown (22.7%->12.2%, ret/DD 6.8->14.9). Bracket is now TP + hard-stop only.
-            # To re-enable: restore a TRAIL ibi.Order(orderType='TRAIL', trailingPercent=
-            # trail_pct, ... ocaGroup=oca_group, transmit=False) and re-add it to the
-            # orders_staged list below. See STAGE2_VERDICT.md.
+            # ── STAGE-2  ──────────────────────
 
             # Hard stop: fires immediately if price falls HARD_STOP_PCT% from entry.
             # Sits inside the same OCA group — whichever of TP / trail / hard-stop
