@@ -11,8 +11,14 @@ trap) and across multiple time-folds (so a single-path fluke doesn't fool us; th
 hard-won lesson is that single-sample lift is noise).
 
 It does NOT touch ProcessedData_v2 or retrain anything. It builds a fresh panel straight
-from Data/PriceData by running the candidate blocks' compute() on a ticker sample, then
-reuses the EXACT tail-lift definition from __feature_lab.py.
+from Data/PriceData by running the candidate blocks in DEPENDENCY ORDER (prerequisite
+blocks are pulled in automatically) on a ticker sample.
+
+It reuses the exact tail-LIFT definition from __feature_lab.py -- but NOT the same
+NEUTRALIZATION. __feature_lab residualizes against _vol_z/_trend; this tool residualizes
+against NEUT_FACTORS (_ret1, _ret5, _volabs, _logprice, _logdvol). A `neut` number from
+one tool is therefore NOT comparable to a `neut` number from the other. The active basis
+is printed in the run header. See __common.py for the full account.
 
 METRIC
 ------
@@ -65,24 +71,34 @@ XDM = ["capital_gains_overhang", "salience_theory_value", "recurrence_interval_h
        "pettitt_changepoint", "mann_kendall_trend", "conditional_reversion_skew", "langevin_cubic_drift"]
 CSA = ["residual_momentum", "beta_dynamics", "seasonality_calendar", "variance_ratio", "informed_drift"]
 
-# tiny ANSI
-def _c(t, code): return f"\033[{code}m{t}\033[0m"
-def lc(v):
-    if not np.isfinite(v): return "38;5;240"
-    e = abs(v - 1.0)
-    return "1;32" if e >= 0.30 else "32" if e >= 0.15 else "33" if e >= 0.07 else "38;5;240"
+# Shared primitives live in ONE place now -- see __common.py for the drift audit
+# that motivated it, and for why add_context is deliberately NOT shared.
+_cspec = importlib.util.spec_from_file_location("__common", HERE / "__common.py")
+_common = importlib.util.module_from_spec(_cspec)
+_cspec.loader.exec_module(_common)
+
+_c                   = _common.c
+lc                   = _common.lift_color
+compute_ic           = _common.compute_ic
+_within_z            = _common.within_z
+_xs_neutralize       = _common.xs_neutralize
+_xs_neutralize_multi = _common.xs_neutralize_multi
+load_block           = _common.load_block
+_load_framework      = _common.load_framework
+_HAVE_SCIPY          = _common.HAVE_SCIPY
 
 
 # ---------------------------------------------------------------------------
-# helpers copied verbatim from __feature_lab.py (identical methodology)
+# THIS TOOL'S context columns.
+#
+# NOT the same function as __feature_lab.add_context, despite the shared name:
+# that one builds gates/interaction partners (_vol_z, _gate_hivol, _gate_up,
+# _dvol_z), this one builds alt-targets plus the NEUT_FACTORS neutralization
+# basis. The two tools therefore residualize against DIFFERENT factor sets, so a
+# `neut` printed here is NOT comparable to a `neut` printed there. The basis is
+# echoed in this tool's output header so the difference is visible at the point of
+# use rather than buried here.
 # ---------------------------------------------------------------------------
-def _within_z(panel, series, win):
-    tmp = series.copy(); grp = panel["Ticker"]
-    mean = tmp.groupby(grp).transform(lambda s: s.rolling(win, min_periods=max(10, win // 4)).mean())
-    std = tmp.groupby(grp).transform(lambda s: s.rolling(win, min_periods=max(10, win // 4)).std())
-    return (tmp - mean) / std.replace(0, np.nan)
-
-
 def add_context(panel):
     panel["_logc"] = np.log(panel["Close"].clip(lower=1e-10))
     panel["_fwd_ret"] = panel.groupby("Ticker")["_logc"].shift(-1) - panel["_logc"]
@@ -150,65 +166,6 @@ TARGET_COL = {
     "dt":        "_tgt_dt",         # de-trended surprise (next ret - trailing 5d mean daily ret)
     "vw":        "_tgt_vw",         # volume-confirmed return (next ret * relative volume)
 }
-
-
-def _xs_neutralize_multi(panel, col, factors):
-    """Per-day residual of feature jointly regressed on `factors` (multi-factor vector_neut)."""
-    f = panel[col].to_numpy(dtype=float)
-    X = np.column_stack([panel[fc].to_numpy(dtype=float) for fc in factors])
-    out = np.full(len(panel), np.nan)
-    codes, _ = pd.factorize(panel["Date"].to_numpy())
-    order = np.argsort(codes, kind="stable"); cs = codes[order]
-    bounds = np.flatnonzero(np.diff(cs)) + 1
-    kf = X.shape[1]
-    for idx in np.split(order, bounds):
-        ff = f[idx]; XX = X[idx]
-        m = np.isfinite(ff) & np.isfinite(XX).all(axis=1)
-        if m.sum() < max(20, kf * 5):
-            continue
-        Xm = XX[m]; mu = Xm.mean(axis=0)
-        Xc = Xm - mu; yc = ff[m] - ff[m].mean()
-        beta, *_ = np.linalg.lstsq(Xc, yc, rcond=None)
-        out[idx] = ff - (ff[m].mean() + (XX - mu) @ beta)
-    return out
-
-
-def _xs_neutralize(panel, col, factor):
-    """Per-day residual of feature regressed on `factor` (WorldQuant vector_neut)."""
-    f = panel[col].to_numpy(dtype=float); x = panel[factor].to_numpy(dtype=float)
-    out = np.full(len(panel), np.nan)
-    codes, _ = pd.factorize(panel["Date"].to_numpy())
-    order = np.argsort(codes, kind="stable")
-    cs = codes[order]
-    bounds = np.flatnonzero(np.diff(cs)) + 1
-    for idx in np.split(order, bounds):
-        ff, xx = f[idx], x[idx]
-        m = np.isfinite(ff) & np.isfinite(xx)
-        if m.sum() < 10:
-            continue
-        xc = xx[m] - xx[m].mean()
-        denom = float((xc * xc).sum())
-        beta = float((xc * (ff[m] - ff[m].mean())).sum()) / denom if denom > 0 else 0.0
-        out[idx] = ff - (ff[m].mean() + beta * (xx - xx[m].mean()))
-    return out
-
-
-try:
-    from scipy import stats as _ss
-    _HAVE_SCIPY = True
-except Exception:
-    _HAVE_SCIPY = False
-
-
-def compute_ic(values, fwd):
-    v = np.asarray(values, dtype=float)
-    m = np.isfinite(v) & np.isfinite(fwd)
-    if m.sum() < 100:
-        return np.nan
-    if _HAVE_SCIPY:
-        c, _ = _ss.spearmanr(v[m], fwd[m]); return float(c) if np.isfinite(c) else np.nan
-    a = pd.Series(v[m]).rank().to_numpy(); b = pd.Series(fwd[m]).rank().to_numpy()
-    c = np.corrcoef(a, b)[0, 1]; return float(c) if np.isfinite(c) else np.nan
 
 
 def tail_lift_folds(dates, vals, is_winner, valid, fold_code, K, q, wp):
@@ -346,51 +303,12 @@ def romano_wolf_stepdown(dates, valid, is_winner_real, fwd_rank_real, q, wp,
 # ---------------------------------------------------------------------------
 # panel construction (fresh from PriceData, candidate blocks only)
 # ---------------------------------------------------------------------------
-def load_block(name):
-    spec = importlib.util.spec_from_file_location(name, HERE / f"{name}.py")
-    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+BASE_COLS = _common.BASE_COLS
 
 
 def build_panel(n, seed, blocks):
-    paths = sorted(PRICE_DIR.glob("*.parquet"))
-    rng = random.Random(seed)
-    sample = rng.sample(paths, min(n, len(paths)))
-
-    mods = []
-    feat_cols, family = [], {}
-    for b in blocks:
-        try:
-            m = load_block(b)
-        except Exception as exc:
-            print(f"  [skip block {b}: {exc}]"); continue
-        mods.append((b, m))
-        for col in m.METADATA["produces"]:
-            feat_cols.append(col); family[col] = b
-
-    base = ["Date", "Ticker", "Open", "High", "Low", "Close", "Volume"]
-    frames = []
-    t0 = time.perf_counter()
-    for p in sample:
-        try:
-            df = pd.read_parquet(p)
-        except Exception:
-            continue
-        if "Ticker" not in df.columns:
-            df["Ticker"] = p.stem
-        df = df.sort_values("Date").reset_index(drop=True)
-        for _b, m in mods:
-            try:
-                df = m.compute(df)
-            except Exception:
-                pass
-        keep = base + [c for c in feat_cols if c in df.columns]
-        frames.append(df[keep])
-    panel = pd.concat(frames, ignore_index=True)
-    panel["Date"] = pd.to_datetime(panel["Date"])
-    panel = panel.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-    print(f"  built panel: {len(sample)} tickers, {len(panel):,} rows, {len(feat_cols)} features, "
-          f"{time.perf_counter()-t0:.1f}s")
-    return panel, feat_cols, family
+    """Dependency-correct panel build -- see __common.build_panel."""
+    return _common.build_panel(n, seed, blocks, price_dir=PRICE_DIR, sort_panel=True)
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +355,10 @@ def main():
 
     print(f"\n  Tier-2 tail screen  | target={args.target} n={args.n} seed={args.seed} "
           f"folds={args.folds} winner=top{args.winner_pct:.0%} slice=±{args.q:.0%}")
+    # State the basis explicitly: __feature_lab neutralizes against a DIFFERENT set,
+    # so `neut` numbers are only comparable within one tool.
+    print(f"  neut basis: {', '.join(NEUT_FACTORS)}   "
+          f"(__feature_lab uses _vol_z/_trend -- numbers are NOT cross-comparable)")
     panel, feat_cols, family = build_panel(args.n, args.seed, blocks)
     panel = add_context(panel)
 

@@ -1,0 +1,28 @@
+  feature                      family                        IC    raw   neut side foldmin  robust
+  ------------------------------------------------------------------------------------------------
+  csa_resmom_126               residual_momentum         -0.019   1.84   1.79  bot    0.62     YES
+  csa_resmom_252               residual_momentum         -0.013   1.81   1.78  top    0.73     YES
+  szc_turnover_60_tsr63        lens_liquidity            -0.003   1.39   1.29  bot    0.11     YES
+  csa_residir_126              residual_momentum         -0.012   1.28   1.22  top    0.08        
+  micro_amihud_63_tsr252       lens_liquidity            -0.004   1.37   1.21  bot    0.10        
+  volume_spike_ratio_tsr21     lens_liquidity            -0.016   1.27   1.21  top    0.07        
+  volume_spike_ratio_tsr63     lens_liquidity            -0.013   1.31   1.20  top    0.03        
+  csa_residir_252_sk21         residual_momentum         +0.007   1.17   1.20  bot    0.19        
+  micro_amihud_63_tsr63        lens_liquidity            +0.002   1.33   1.18  bot    0.08        
+  csa_residir_252              residual_momentum         -0.004   1.22   1.18  bot    0.16        
+  liquidity_stress_3d_tsr21    lens_liquidity            -0.003   1.21   1.13  top    0.02        
+  _ctrl_rand                   CONTROL                   +0.002   1.19   1.12  bot    0.09        
+  szc_turnover_60_tsr252       lens_liquidity            +0.002   1.53   1.12  bot    0.09        
+  _ctrl_volabs                 CONTROL                   -0.040   2.34    nan  bot     nan        
+  _ctrl_rev5                   CONTROL                   +0.027   2.00    nan  bot     nan        
+
+  ============================================================
+  FAMILY ROLLUP (mean neutralized edge, best feature)
+  ------------------------------------------------------------
+  residual_momentum          mean_edge=0.433  robust=2/5  best=csa_resmom_126 (neut 1.79)
+  lens_liquidity             mean_edge=0.192  robust=1/7  best=szc_turnover_60_tsr63 (neut 1.29)
+  CONTROL                    mean_edge=0.121  robust=0/3  best=_ctrl_rand (neut 1.12)
+
+  [robust = fold-stable AND neut edge >= null p99 (0.241) AND foldmin >= 0.05 AND RW-adj p <= 0.10]
+  [ledger] 15 features + null floor logged -> C:\Users\Masam\Desktop\Stock-Market-lab\Data\_eda_ledger\trial_ledger.csv
+
