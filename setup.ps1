@@ -217,17 +217,17 @@ function Write-IfMissing($path, $content) {
 }
 
 $fredExample = Join-Path $root ".fred_api_key.example"
-$claudExample = Join-Path $root "Claud-API-KEY.txt.example"
+$claudExample = Join-Path $root "auxiliary\Claud-API-KEY.txt.example"
 Write-IfMissing $fredExample  "# Put your FRED API key on the first line (no quotes).`r`n# Get one free at https://fred.stlouisfed.org/docs/api/api_key.html`r`n# Then rename this file to  .fred_api_key" | Out-Null
-Write-IfMissing $claudExample "# Put your Anthropic API key on the first line (sk-ant-...).`r`n# Then rename this file to  Claud-API-KEY.txt" | Out-Null
-Info "templates: .fred_api_key.example, Claud-API-KEY.txt.example"
+Write-IfMissing $claudExample "# Put your Anthropic API key on the first line (sk-ant-...).`r`n# Then rename this file to  Claud-API-KEY.txt  (stays in auxiliary\)`r`n# Alternative: skip the file entirely -- run 'ant auth login' once and the`r`n# SDK authenticates from the stored OAuth profile." | Out-Null
+Info "templates: .fred_api_key.example, auxiliary\Claud-API-KEY.txt.example"
 
 if (-not (Test-Path (Join-Path $root ".fred_api_key"))) {
     Warn "No .fred_api_key -- FRED macro fetch will be skipped until you add one."
 } else { Ok ".fred_api_key present" }
-if (-not (Test-Path (Join-Path $root "Claud-API-KEY.txt"))) {
-    Warn "No Claud-API-KEY.txt -- 7__MacroFilter LLM overlay will run in mock/skip mode."
-} else { Ok "Claud-API-KEY.txt present" }
+if (-not (Test-Path (Join-Path $root "auxiliary\Claud-API-KEY.txt"))) {
+    Warn "No auxiliary\Claud-API-KEY.txt -- 7__MacroFilter LLM overlay needs it, or an ANTHROPIC_API_KEY env var, or an 'ant auth login' OAuth profile."
+} else { Ok "auxiliary\Claud-API-KEY.txt present" }
 
 # ----------------------------------------------------------------------------
 #  9. Protect secrets with a .gitignore  (safety net)
@@ -355,7 +355,8 @@ Write-Host @"
   ----------
   1. Add API keys (optional but recommended):
        - rename .fred_api_key.example     -> .fred_api_key      (paste FRED key)
-       - rename Claud-API-KEY.txt.example -> Claud-API-KEY.txt  (paste Anthropic key)
+       - rename auxiliary\Claud-API-KEY.txt.example -> auxiliary\Claud-API-KEY.txt  (paste Anthropic key)
+         (or skip the file: run 'ant auth login' once for an OAuth profile)
 
   2. Pull the free macro/fundamentals data:
        .\stock_env\Scripts\python.exe fetch_all_data.py

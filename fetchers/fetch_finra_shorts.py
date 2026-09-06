@@ -5,11 +5,11 @@ its trade-reporting facilities. Predictive of forward returns per Diether/
 Lee/Werner (2009) and many follow-ons.
 
 Files: ~1-5 MB each, one per trading day. Available 2010-present.
-  CNMSshvol  — consolidated NMS (the broad daily file)
-  FNRAshvol  — FINRA ADF
-  FNSQshvol  — NASDAQ TRF Carteret
-  FNYXshvol  — NYSE TRF
-  FORFshvol  — ORF off-exchange
+  CNMSshvol - consolidated NMS (the broad daily file)
+  FNRAshvol - FINRA ADF
+  FNSQshvol - NASDAQ TRF Carteret
+  FNYXshvol - NYSE TRF
+  FORFshvol - ORF off-exchange
 
 Refresh: today's file becomes available next business morning. Cached
 files are immutable; re-running pulls only what's new.

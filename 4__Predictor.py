@@ -1,4 +1,4 @@
-"""Self-contained XGBoost pipeline — data loading, labeling, training, prediction.
+"""Self-contained XGBoost pipeline - data loading, labeling, training, prediction.
 
 Merges prepare_data.py + simple_xgb.py + predict_to_rf.py into one file.
 Originally written as xgb_pipeline.py (2026-05-19), renamed to 4__Predictor.py
@@ -14,7 +14,7 @@ Max Drawdown:   11.49%
 PSR:            98.58%
 Total Return:   177.78%
 
-Monthly performance (OOS window Dec 2025 – Apr 2026):
+Monthly performance (OOS window Dec 2025 - Apr 2026):
   2025-12:  -1.93% excess
   2026-01: +25.81% excess  [Unicorn]
   2026-02: +22.14% excess  [Unicorn]
@@ -39,26 +39,32 @@ Pipeline steps
 ==============
   Phase 1:  Load per-ticker parquets from Data/ProcessedData/
   Phase 2:  Label engineering (shift target -1, add ret_5d)
-  Phase 3:  Universe filter — FilterRubric Step 1
+  Phase 3:  Universe filter - FilterRubric Step 1
   Phase 4:  Shuffle within each date (kills row-order leakage)
   Phase 5:  Train/calib split with N-day embargo
-  Phase 6:  Build feature matrix — xs rank features if enabled
+  Phase 6:  Build feature matrix - xs rank features if enabled
   Phase 7:  Build labels (topq / risk_adj_topq / binary_up)
   Phase 8:  Recency weights
   Phase 9:  Optuna hyperparameter tuning
   Phase 10: Train final XGBClassifier
   Phase 11: Evaluate on calibration slice + save model/reports
-  Phase 12: Inference — score all ProcessedData tickers, write RFpredictions
+  Phase 12: Inference - score all ProcessedData tickers, write RFpredictions
+  Phase 13: Pred-space factor neutralization (--neutralize; was 4.5__NeutralizePreds.py)
+  Phase 14: Conviction-momentum tilt (ON by default; was 4.6__ConvictionMomentum.py)
 
 Run:
     python 4__Predictor.py                         # full train + predict
     python 4__Predictor.py --predict_only          # inference only (model saved)
+    python 4__Predictor.py --predict_only --neutralize             # ship config (Phase 14 is default-on)
+    python 4__Predictor.py --predict_only --neutralize --no_conviction_momentum  # un-tilted ablation
+    python 4__Predictor.py --cm_retilt Data/RFpredictions --cm_k 1.0 --cm_retilt_out Data/_cm_k1
+                                                   # re-tilt existing preds for an A/B, no inference
     python 4__Predictor.py --inspect               # print cached report
     python 4__Predictor.py --n_trials 10           # quick diagnostic run
     python 4__Predictor.py --no_tune               # skip Optuna (match pre-Optuna baseline)
     python 4__Predictor.py --tune_device cuda       # run the Optuna search on GPU (~2 hr -> ~20 min; see FAST TUNING below)
 
-BEST PRACTICE — STANDARD RETRAIN
+BEST PRACTICE - STANDARD RETRAIN
 ==================================
 The bare `python 4__Predictor.py` invocation is the canonical retrain. Every
 default below is the winning-config value (see "EXACT CONFIG ..." above) and
@@ -67,19 +73,19 @@ should NOT be overridden unless you are running a diagnostic ablation:
     drop_vol_features=False, tune=True, tune_objective=top1_meanret,
     n_trials=100, tune_subsample=0.35, recency_half_life_days=720,
     top_frac_per_day=0.01
-Do NOT raise --runpercent beyond 75 for a standard retrain — the OOS validation
+Do NOT raise --runpercent beyond 75 for a standard retrain - the OOS validation
 slice (Dec 2025+) is load-bearing for the backtester's reported metrics, and
 shrinking it makes the backtest mostly in-sample. After this script completes,
 run the backtester: `python 5__NightlyBackTester.py --force [--sample N]`.
 
-FAST TUNING — RUN THE OPTUNA SEARCH ON GPU (~2 hr -> ~20 min)
+FAST TUNING - RUN THE OPTUNA SEARCH ON GPU (~2 hr -> ~20 min)
 ==============================================================
 The Optuna search (Phase 9) is the long pole of a retrain. Each trial fits an
 XGB `hist` model on the inner-train slice (~232k rows x ~1,416 features after the
 xs-rank expansion); the cost is dominated by per-round histogram construction
 scaled by the trial's depth/colsample/subsample, repeated every trial. Measured
 CPU cost is ~80-130s per trial, so the canonical `n_trials=100` search is ~2.5-3
-hours. Tree count barely moves it — it is the per-round work on the wide feature
+hours. Tree count barely moves it - it is the per-round work on the wide feature
 matrix that hurts.
 
 The lever is the GPU. Add `--tune_device cuda`:
@@ -88,14 +94,14 @@ The lever is the GPU. Add `--tune_device cuda`:
 
   - Scope: ONLY the Optuna search runs on the GPU. The final model (Phase 10)
     still trains on CPU, so the saved model and all inference (Phase 12) are
-    completely unchanged — no GPU is needed at predict time.
+    completely unchanged - no GPU is needed at predict time.
   - Speed: GPU `hist` on this feature width is roughly an order of magnitude
     faster on the search, taking the 100-trial run from ~2-3 hr toward ~20 min.
-    (GPU is SLOWER on tiny data due to kernel-launch overhead — the win only
+    (GPU is SLOWER on tiny data due to kernel-launch overhead - the win only
     shows up at this row x feature scale.)
   - Reproducibility: GPU `hist` chooses slightly different split points than CPU
     `hist`, so the tuned hyperparameters will not be bit-identical to a CPU
-    search. They are equally good — tuning is a search, not a fixed computation —
+    search. They are equally good - tuning is a search, not a fixed computation - 
     but if you need to reproduce a specific saved model's params exactly, keep
     the default `--tune_device cpu`.
   - GPU memory: the inner-train + eval QuantileDMatrices are ~1.5-2 GB plus
@@ -104,6 +110,36 @@ The lever is the GPU. Add `--tune_device cuda`:
 
 The default is `--tune_device cpu`, so the canonical retrain above is unchanged
 unless you opt in.
+
+PHASE 13 - PRED-SPACE FACTOR NEUTRALIZATION (the old 4.5 stage, now in here)
+============================================================================
+`4.5__NeutralizePreds.py` was folded into this file on 2026-07-27. It used to
+re-read the whole RFpredictions dir + the whole feature panel, rewrite every
+parquet into a tmp dir, and rename RFpredictions -> RFpredictions_raw. All of
+that data is already in memory at the end of Phase 12, so it now runs inline:
+
+    python 4__Predictor.py --predict_only --neutralize \
+        --neut_mode spy200v2 --neut_dose_above 0.15 --neut_dose_below 0.30
+
+  - What it does: per day, project the cross-section of raw_score onto
+    [beta_spy, atr_percentage, log dollar_volume_ma_10], subtract
+    dose*projection, then quantile-map back onto that day's ORIGINAL
+    UpProbability values. The per-day marginal is preserved exactly - only the
+    within-day ordering changes, so the backtester's threshold/percentile
+    machinery sees the same distribution. Zero fitted parameters.
+  - Dose: `--neut_mode spy200v2` uses 0.15 above the SPY 200d EMA and 0.30
+    below (validated 2026-07-12: live 80.2% vs 52.2% for fixed 0.30, 2 seeds).
+    `--neut_mode fixed --neut_dose 0.3` is the older validated overlay.
+  - Rollback: the un-neutralized value is written per row as `raw_up_prob`
+    (this replaces the old RFpredictions_raw directory).
+  - `UpPrediction` is deliberately NOT recomputed from the neutralized ordering
+    - it stays the raw top-1% flag, exactly as the standalone stage left it.
+  - FAIL-SAFE: on any gate failure (too few tickers, signal day un-neutralized
+    because the factor panel is stale) the RAW preds are written and the script
+    exits 1 - the nightly runner alerts but the pipeline continues on the plain
+    ship signal.
+  - Default is OFF so research/ablation runs keep raw preds; the live runners
+    (trading_system.ps1, rerun_for_live.ps1) pass the flags explicitly.
 """
 
 import os
@@ -113,12 +149,14 @@ import time
 import argparse
 import logging
 import re
+import shutil
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from tqdm import tqdm
+from auxiliary._quiet_progress import tqdm
 from joblib import dump, load as joblib_load
 
 import warnings
@@ -130,6 +168,16 @@ from sklearn.metrics import (
 )
 from scipy.special import expit
 from scipy.optimize import minimize
+
+# Diagnostics sidecars (diagnostics/hooks.py). Every call is a no-op unless the
+# DIAG_OUT env var names a directory; the stand-in keeps this script independent
+# of the diagnostics folder. Output is byte-identical with DIAG_OUT unset.
+try:
+    from diagnostics import hooks as _diag
+except Exception:
+    class _diag:
+        enabled = staticmethod(lambda: False)
+        dump_json = dump_parquet = append_jsonl = stamp = staticmethod(lambda *a, **k: None)
 
 
 # -------------------------------------------------------------------------- #
@@ -144,7 +192,7 @@ logging.basicConfig(
 
 
 # -------------------------------------------------------------------------- #
-# CLI — defaults match the 172% winning config                               #
+# CLI - defaults match the 172% winning config                               #
 # -------------------------------------------------------------------------- #
 parser = argparse.ArgumentParser(
     description="Self-contained XGBoost pipeline (data -> train -> predict)."
@@ -158,7 +206,7 @@ parser.add_argument("--max_files", type=int, default=None, help="Cap on tickers 
 
 # Data split
 parser.add_argument("--runpercent", type=int, default=75, help="Percent of rows (sorted by date) used for training. 75 = train through 2025-11-20 with current data.")
-parser.add_argument("--train_end_date", default=None, help="Override --runpercent: train through this exact date (YYYY-MM-DD). For refit-cadence experiments — hold params fixed, vary only the cutoff.")
+parser.add_argument("--train_end_date", default=None, help="Override --runpercent: train through this exact date (YYYY-MM-DD). For refit-cadence experiments - hold params fixed, vary only the cutoff.")
 parser.add_argument("--calibpercent", type=int, default=15, help="Percent of rows used for calibration (after embargo).")
 parser.add_argument("--embargo_days", type=int, default=5, help="Calendar-day gap between train end and calib start.")
 parser.add_argument("--horizon_5d", type=int, default=5, help="Horizon for the secondary ret_5d label.")
@@ -170,15 +218,16 @@ parser.add_argument("--date_column", default="Date")
 parser.add_argument("--ticker_column", default="Ticker")
 
 # Label
-parser.add_argument("--label_mode", choices=["binary_up", "topq", "risk_adj_topq"], default="topq", help="topq = per-day top-20%% next-day return (winning config). risk_adj_topq = top-20%% of return/vol. binary_up = simple next-day return > 0.")
+parser.add_argument("--label_mode", choices=["binary_up", "topq", "risk_adj_topq", "topq_5d", "thresh_5d", "thresh_5d_xs", "thresh_mfe_5d", "thresh_5d_vol", "book_5d", "book_5d_all", "book_5d_stop", "book_ratchet", "book_ratchet_all"], default="topq", help="topq = per-day top-20%% next-day return (winning config). risk_adj_topq = top-20%% of return/vol. binary_up = simple next-day return > 0.")
 parser.add_argument("--topq_frac", type=float, default=0.20)
+parser.add_argument("--thresh_5d", type=float, default=0.08, help="thresh_5d label: y=1 when the 5-day forward close-to-close return (ret_5d) >= this. Payoff-targeted label (predictor lab 2026-09-02): the book's profit is the frequency of +10%%-class winners inside the ~5-day hold, which the 1-day topq label does not target. topq_5d = per-day top --topq_frac of ret_5d instead.")
 parser.add_argument("--vol_col", default="Realized_Vol_21d")
 parser.add_argument("--vol_floor", type=float, default=1e-3)
 
 # Features
-parser.add_argument("--add_xs_features", action="store_true", default=True, help="Add per-day percentile-rank column for each numeric feature (doubles feature count). ON by default — these were top-ranked in the winning model.")
+parser.add_argument("--add_xs_features", action="store_true", default=True, help="Add per-day percentile-rank column for each numeric feature (doubles feature count). ON by default - these were top-ranked in the winning model.")
 parser.add_argument("--no_xs_features", action="store_true", help="Disable --add_xs_features.")
-parser.add_argument("--drop_vol_features", action="store_true", help="Drop volatility-family features. OFF by default — vol features were the top-ranked features in the winning model. Only set this for diagnostic ablations.")
+parser.add_argument("--drop_vol_features", action="store_true", help="Drop volatility-family features. OFF by default - vol features were the top-ranked features in the winning model. Only set this for diagnostic ablations.")
 parser.add_argument("--drop_feature_patterns", type=str, default=None, help="Comma-separated substrings to drop from feature list.")
 parser.add_argument("--drop_features_exact", type=str, default=None, help="Comma-separated EXACT column names to drop (useful when a betrayal feature name is a substring of a feature you want to keep, e.g. 'composite' vs 'market_regime_composite').")
 
@@ -191,12 +240,49 @@ parser.add_argument("--reg_alpha", type=float, default=0.5)
 parser.add_argument("--reg_lambda", type=float, default=2.0)
 parser.add_argument("--subsample", type=float, default=0.8)
 parser.add_argument("--colsample_bytree", type=float, default=0.6)
-parser.add_argument("--early_stopping_rounds", type=int, default=30)
+parser.add_argument("--load_start_date", default=None, help="Phase 1: drop panel rows before this date at read (deep-history panels; default None = load everything, prod path unchanged).")
+parser.add_argument("--x_float32", action="store_true", help="Phase 6: cast the feature matrix to uniform float32 and drop feature columns from the frames (same model, about half the fit-phase RAM). Default off.")
+parser.add_argument("--prefilter_quality", action="store_true", help="Phase 1: apply the universe quality gate per ticker at read (identical rows downstream, ~4x less RAM). Default off.")
+parser.add_argument("--load_end_date", default=None, help="Phase 1: drop rows after this date (after labels are built). Use cutoff + calib window.")
+parser.add_argument("--early_stopping_rounds", type=int, default=30, help="0 = no holdout and no early stop: fit a fixed --n_estimators on every training row (predictor lab 2026-09-05).")
+parser.add_argument("--refit_full", action="store_true", help="After the early-stopped fit picks the tree count, refit on ALL training rows (the holdout is the newest 20%% of the window). Default off: prod path unchanged.")
 parser.add_argument("--scale_pos_weight", type=float, default=None)
+parser.add_argument("--train_row_filter", default=None, metavar="QUERY",
+                    help="REGIME SPECIALIST (predictor lab 2026-09-03): pandas query applied to the TRAIN split only, "
+                         "after the cache load, e.g. \"vix_close >= 20\" or \"vix_close < 20\". The calib split, the "
+                         "calibrator and inference are untouched, so the specialist scores every name every day and "
+                         "only its training population changes. Default None: prod path unchanged.")
+parser.add_argument("--payoff_weight_cap", type=float, default=None,
+                    help="Phase 8: multiply sample weights by (0.005 + min(|ret_5d|, cap)); big movers dominate the fit. Default None: off.")
+parser.add_argument("--add_weekday", action="store_true", help="Phase 6/12: add day-of-week (0-4) as a feature named dow.")
+parser.add_argument("--pool_top_n", type=int, default=0,
+                    help="POOL CAP (Order 66): after Phase 14, keep only the top N names per day by final UpProbability; every other "
+                         "name at or above 0.40 is floored to 0.30 so the book sees an N-name pool. 0 = off (prod path unchanged).")
+parser.add_argument("--limit_features", action="store_true",
+                    help="Phase 6/12: features measured at the trigger LIMIT price (Close x (1 - k x daily vol)) instead of the close: "
+                         "lim_depth, lim_to_support, lim_to_resistance, lim_gap_room.")
+parser.add_argument("--day_features", action="store_true",
+                    help="Phase 6/12: cross-sectional market-day context (same-day, no lookahead): day_dip_breadth, day_ret_mean, "
+                         "day_ret_disp, day_vol_mean, day_n.")
+parser.add_argument("--book_touch_k", type=float, default=1.5, help="book_5d label: limit = Close x (1 - k x daily vol).")
+parser.add_argument("--book_stop", type=float, default=0.03, help="book_5d label: stop below the fill.")
+parser.add_argument("--book_target", type=float, default=0.08, help="book_5d label: target above the fill within horizon_5d sessions.")
+parser.add_argument("--book_beta", action="store_true", help="book labels: depth = k x beta_spy x daily vol (the broker rule) instead of k x vol.")
+parser.add_argument("--book_min_depth", type=float, default=0.0, help="book labels: clamp the limit depth below (backtester floor 0.015).")
+parser.add_argument("--book_max_depth", type=float, default=1.0, help="book labels: clamp the limit depth above (broker 0.15).")
+parser.add_argument("--book_ratchet", type=float, default=0.03, help="book_ratchet label: exit when Close <= running max Close x (1 - this) after the fill.")
+parser.add_argument("--book_ratchet_win", type=float, default=0.05, help="book_ratchet label: win if the ratchet-exit return >= this.")
+parser.add_argument("--payoff_weight_col", default="ret_5d", help="column used by --payoff_weight_cap (ret_5d, book_ret, book_ret_ratchet).")
+parser.add_argument("--read_float32", action="store_true",
+                    help="Phase 1: cast feature columns to float32 at parquet read (labels, prices, keys and Phase-13 factors stay float64). "
+                         "Cuts a fresh-cache run from ~48 GB to ~36 GB but is NOT bit-identical (rank ties shift). Default OFF: prod path unchanged.")
+parser.add_argument("--bag_mode", choices=["prob", "rank"], default="prob",
+                    help="How --bag_seeds members combine: prob = mean probability (compresses the tail), rank = mean percentile rank.")
+parser.add_argument("--bag_seeds", type=int, default=1, help="Predictor lab (2026-09-02): fit N XGB models with different random seeds and average their probabilities (BaggedXGB wrapper). 1 = single model, unchanged. Targets Sharpe via lower seed variance; --wf_bag measured the same effect offline.")
 parser.add_argument("--recency_half_life_days", type=float, default=720, help="Exponential-decay recency weight half-life in days. 720 = samples 2 years old have half the weight of newest.")
 
 # Optuna
-parser.add_argument("--no_tune", action="store_true", help="Skip Optuna tuning — use default XGB params. Matches the original May-16 run (no Optuna) that produced 84%+ before config drift.")
+parser.add_argument("--no_tune", action="store_true", help="Skip Optuna tuning - use default XGB params. Matches the original May-16 run (no Optuna) that produced 84%%+ before config drift.")
 parser.add_argument("--n_trials", type=int, default=100)
 parser.add_argument("--tune_subsample", type=float, default=0.35, help="Row fraction for each Optuna trial (speeds up tuning). Final fit uses full training data.")
 parser.add_argument("--tune_objective", choices=["top1_prec", "top1_meanret", "aucpr"], default="top1_meanret", help="Optuna objective. top1_meanret = mean return of top-1%% picks per day (the objective used in the winning run).")
@@ -217,17 +303,33 @@ parser.add_argument("--fast", action="store_true", help="Quick diagnostic mode: 
 
 # Modes
 parser.add_argument("--predict_only", action="store_true", help="Skip training. Load saved model and run inference only.")
+# Inference peak-RAM control. X is len(combined) x len(feat_names) float32: at 3.07M rows
+# x 1414 features that is 16.2 GiB allocated ON TOP of `combined`, and it OOM'd the
+# nightly on 2026-08-13 and again on 2026-08-27 as the panel grew. The signal only needs
+# recent history: 5__NightlyBackTester feeds ~400 calendar days (~275 bars), so rows older
+# than that are computed and thrown away. This keeps the LAST N rows per ticker.
+# Default None = OFF, byte-identical to every run before this flag existed.
+# Cross-sectional (_xs) features rank WITHIN a day across tickers, so trimming each
+# ticker's tail equally leaves recent days' cross-sections complete. Keep N comfortably
+# above the conviction-momentum EMA spans so the last bar's tilt is fully warmed up.
+parser.add_argument("--infer_tail", type=int, default=None, metavar="N",
+                    help="Inference only: keep just the last N rows per ticker. Caps peak "
+                         "RAM (X is rows x features x 4 bytes). None = all rows (default, "
+                         "unchanged behaviour). 500 halves a 3.07M-row panel and leaves "
+                         "ample EMA warm-up over the ~275 bars the backtester actually reads.")
 parser.add_argument("--inspect", action="store_true", help="Print cached report + summary without running anything.")
-parser.add_argument("--oos_only", action="store_true", help="Skip training/inference. Load the saved model and measure true out-of-sample decay: score the held-out tail (rows after the calib window — data the model never saw in train OR calib) and print a rank-band x split table of per-day mean return + precision. Headline = top-1%% vs shoulder-band (0.90-0.95) decay. Writes oos_report.txt + oos_scores.parquet.")
+parser.add_argument("--oos_only", action="store_true", help="Skip training/inference. Load the saved model and measure true out-of-sample decay: score the held-out tail (rows after the calib window - data the model never saw in train OR calib) and print a rank-band x split table of per-day mean return + precision. Headline = top-1%% vs shoulder-band (0.90-0.95) decay. Writes oos_report.txt + oos_scores.parquet.")
 parser.add_argument("--oos_max_tickers", type=int, default=None, help="Cap tickers loaded for --oos_only (quick smoke test). None = all.")
 parser.add_argument("--walkforward", action="store_true", help="Walk-forward OOS engine: load+feature-build ONCE, then for a suite of training configs x monthly anchors, retrain and measure true-OOS band edge (net of market beta) on the following month. Judges configs across many independent OOS windows. Writes walkforward_report.txt + walkforward_results.parquet.")
 parser.add_argument("--wf_configs", default="baseline,recent_252,recent_126,hl_180,hl_90,decontam", help="Comma list of walk-forward configs to compare. Available: baseline, recent_252, recent_126, hl_180, hl_90, decontam.")
 parser.add_argument("--wf_min_anchor", default="2025-06", help="Earliest anchor year-month (YYYY-MM). Anchor = last train date of that month; OOS = the following month.")
-parser.add_argument("--wf_trees", type=int, default=200, help="Fixed n_estimators per walk-forward fit (no Optuna/early-stop — isolates the data/feature/weight effect across configs).")
+parser.add_argument("--wf_max_anchor", default=None, help="Latest anchor year-month (YYYY-MM), inclusive. Default None = run to the end of the data. Use with --wf_min_anchor to pin a walk-forward to one regime (e.g. pre- vs post-break), so a config's edge can be tested for regime-conditionality instead of being averaged across the break.")
+parser.add_argument("--wf_trees", type=int, default=200, help="Fixed n_estimators per walk-forward fit (no Optuna/early-stop - isolates the data/feature/weight effect across configs).")
 parser.add_argument("--wf_max_tickers", type=int, default=None, help="Cap tickers loaded for --walkforward (smoke test). None = all.")
-parser.add_argument("--wf_sweep", action="store_true", help="PARAM-SWEEP mode: parallel, multi-seed walk-forward over XGB hyperparameter configs (depth/reg/trees) on identical baseline data, to isolate the overfitting lever and beat the nondeterminism noise floor. Reports seed-averaged top1_net per config with anchor win%. Writes walkforward_sweep_report.txt + walkforward_sweep_results.parquet.")
+parser.add_argument("--wf_sweep", action="store_true", help="PARAM-SWEEP mode: parallel, multi-seed walk-forward over XGB hyperparameter configs (depth/reg/trees) on identical baseline data, to isolate the overfitting lever and beat the nondeterminism noise floor. Reports seed-averaged top1_net per config with anchor win%%. Writes walkforward_sweep_report.txt + walkforward_sweep_results.parquet.")
 parser.add_argument("--wf_sweep_configs", default="prod_optuna,d3,d4,d5,d6,d8_reg,d4_strongreg,d5_slow", help="Comma list of param-sweep configs (see SWEEP_CONFIGS registry).")
-parser.add_argument("--wf_seeds", type=int, default=4, help="Seeds per (config,anchor) — averaged to beat the ~0.02 XGB-hist nondeterminism noise floor.")
+parser.add_argument("--wf_sweep_windows", default="full720", help="Comma list of TRAINING-WINDOW specs to CROSS with --wf_sweep_configs, so complexity and window length are varied JOINTLY (they are coupled: a longer window buys samples but imports more non-stationarity). Grammar: 'full' or 'full<HL>' = all history up to the anchor with recency half-life HL days; 'w<K>' or 'w<K>hl<HL>' = only the last K trading days. Default 'full720' reproduces the old fixed-window behaviour exactly.")
+parser.add_argument("--wf_seeds", type=int, default=4, help="Seeds per (config,anchor) - averaged to beat the ~0.02 XGB-hist nondeterminism noise floor.")
 parser.add_argument("--wf_workers", type=int, default=4, help="Concurrent fits (threads; XGB releases the GIL during fit). Total cores ~= wf_workers * wf_threads.")
 parser.add_argument("--wf_threads", type=int, default=8, help="n_jobs per fit. Default 8; with wf_workers=4 that's 32 cores.")
 parser.add_argument("--wf_device", default="cpu", help="XGB device for walk-forward fits: cpu or cuda (or cuda:0/cuda:1).")
@@ -238,6 +340,41 @@ parser.add_argument("--wf_bag_seeds", type=int, default=12, help="S = seeds fit 
 parser.add_argument("--wf_bag_ks", default="1,3,5,8", help="Comma list of bag sizes K to evaluate (K=1 = single-seed noise floor baseline).")
 parser.add_argument("--wf_bag_bags", type=int, default=10, help="B = random K-seed bags sampled (without replacement within a bag) to estimate across-bag std. K=1 uses all S singles instead.")
 parser.add_argument("--wf_bag_mode", default="both", choices=["prob", "rank", "both"], help="Bag-combine method: 'prob' (avg probabilities), 'rank' (avg per-day percentile ranks), or 'both'.")
+parser.add_argument("--wf_feature_file", default=None, help="Optional path to a newline-separated list of BASE feature names. When set, walk-forward sweep restricts select_base_features() to this list before xs-rank expansion, so a frozen model's exact feature set can be retrained against the current full panel. None = use every feature the panel offers.")
+
+# --- Phase 13: pred-space factor neutralization (was the separate 4.5__NeutralizePreds.py) --
+parser.add_argument("--neutralize", action="store_true", help="Phase 13: partially neutralize the predictions against [beta_spy, atr_percentage, log dollar_volume_ma_10] per day, then quantile-map back onto that day's original UpProbability values (per-day marginal preserved, only within-day ordering changes). PRODUCTION runs this ON with --neut_mode spy200v2. OFF by default so research/ablation runs keep raw ship preds.")
+parser.add_argument("--neut_mode", choices=["fixed", "spy200v2"], default="spy200v2", help="fixed: constant --neut_dose. spy200v2: per-day dose = --neut_dose_above when SPY close >= its 200d EMA that day, else --neut_dose_below (validated 2026-07-12: live 80.2%% vs 52.2%% for fixed 0.30, 2 seeds).")
+parser.add_argument("--neut_dose", type=float, default=0.3, help="Dose for --neut_mode fixed (validated 2026-07-01/07-03).")
+parser.add_argument("--neut_dose_above", type=float, default=0.15, help="spy200v2 dose on days SPY closed at/above its 200d EMA.")
+parser.add_argument("--neut_dose_below", type=float, default=0.30, help="spy200v2 dose on days SPY closed below its 200d EMA (= the incumbent fixed dose).")
+parser.add_argument("--neut_flag_max_stale_days", type=int, default=14, help="Max calendar-day ffill of the SPY/EMA flag; staler days fall back to --neut_dose_below (safe degrade).")
+parser.add_argument("--neut_min_tickers", type=int, default=1000, help="Gate: skip neutralization (ship RAW preds, exit non-zero) if inference covered fewer tickers than this.")
+parser.add_argument("--neut_min_changed", type=float, default=0.05, help="Gate: the signal (last) day must actually be neutralized -- abort to RAW preds if fewer than this fraction of that day's names changed (stale factor panel).")
+
+# --- Phase 14: conviction-momentum tilt (was the separate 4.6__ConvictionMomentum.py) -------
+# ON BY DEFAULT since 2026-07-29. It is the ship config and every path that produces a live
+# book (trading_system.ps1, rerun_for_live.ps1, the README invocation) passed the flag
+# anyway, so opt-in bought nothing and left room to ship an un-tilted book by forgetting it.
+# The residuals in the Phase 14 block below are NOT closed by this default -- read them.
+parser.add_argument("--no_conviction_momentum", action="store_true", help="Disable Phase 14, the conviction-momentum tilt, which is ON by default. Use for research/ablation runs that need the un-tilted preds.")
+parser.add_argument("--conviction_momentum", action="store_true", help="Phase 14: tilt the FINAL (post-Phase-13) UpProbability toward names whose model conviction is RISING -- up' = clip(up + k * mean_spans(up - EMA_span(up))). Per ticker, causal, adds no data and drops no tickers. NO-OP as of 2026-07-29: the tilt is the default, and this flag is kept only so the existing ship invocations keep parsing. Pass --no_conviction_momentum to turn it off.")
+parser.add_argument("--cm_k", type=float, default=0.5, help="Tilt strength. 0.5 = max validated return; 1.0 = best validated drawdown.")
+parser.add_argument("--cm_spans", default="3,6,12", help="Comma-separated EMA spans; the deviation is AVERAGED over them (multi-scale, the validated default). A single value, e.g. 6, gives the single-scale variant.")
+parser.add_argument("--cm_lo", type=float, default=0.30, help="Clip floor (panel-native).")
+parser.add_argument("--cm_hi", type=float, default=0.70, help="Clip ceiling (panel-native).")
+parser.add_argument("--cm_min_tickers", type=int, default=1000, help="Gate: skip the tilt (ship un-tilted preds, exit non-zero) if inference covered fewer tickers than this.")
+parser.add_argument("--cm_min_changed", type=float, default=0.05, help="Gate: the signal (last) day must actually move -- abort to un-tilted preds if fewer than this fraction of that day's names changed (short history => inert transform).")
+# RETILT mode: tilt an EXISTING prediction dir on disk, without re-running inference. This
+# was the only capability 4.6__ConvictionMomentum.py had that Phase 14 did not, and it is
+# what an A/B or a k/spans sweep needs (re-scoring 1,900 tickers to change one scalar is
+# absurd). Ported here so there is exactly ONE implementation of the transform.
+parser.add_argument("--cm_retilt", metavar="SRC_DIR", default=None, help="RETILT MODE: skip the whole pipeline and apply the Phase 14 tilt to the prediction parquets already in SRC_DIR. Reads the per-row pre-tilt column if present, so re-running is idempotent rather than compounding. Writes to --cm_retilt_out; SRC_DIR is untouched unless --cm_retilt_apply.")
+parser.add_argument("--cm_retilt_out", default=os.path.join("Data", "_cm_tmp"), help="Retilt mode: where to write the tilted preds. Backtest this dir directly with 5__NightlyBackTester.py --data_dir.")
+parser.add_argument("--cm_retilt_apply", action="store_true", help="Retilt mode: swap the result into --cm_retilt (rollback copy kept at <SRC_DIR>_precm). Without this the source dir is NEVER touched.")
+parser.add_argument("--cm_retilt_dry_run", action="store_true", help="Retilt mode: compute and report only, write nothing at all.")
+parser.add_argument("--cm_retilt_book", type=int, default=12, help="Retilt mode: book size for the reported entry/exit delta.")
+parser.add_argument("--cm_retilt_workers", type=int, default=16, help="Retilt mode: parquet read/write threads.")
 
 args = parser.parse_args()
 
@@ -245,6 +382,8 @@ args = parser.parse_args()
 USE_XS    = args.add_xs_features and not args.no_xs_features
 TUNE      = not args.no_tune
 USE_CALIB = not args.nocalib
+# Phase 14 is the ship default; --conviction_momentum survives only as an accepted no-op.
+CM_ON     = not args.no_conviction_momentum
 
 # --fast: quick smoke-test mode
 if args.fast:
@@ -266,7 +405,16 @@ class Phase:
         logging.info(f"\n>>> {self.name} ...")
         return self
     def __exit__(self, *exc):
-        logging.info(f"<<< {self.name} done in {time.time()-self.t0:.1f}s.")
+        try:
+            import psutil as _ps
+            _rss = f"  rss {_ps.Process().memory_info().rss/1e9:.1f} GB"
+        except Exception:
+            _rss = ""
+        logging.info(f"<<< {self.name} done in {time.time()-self.t0:.1f}s.{_rss}")
+
+
+class CalibratorInversionError(RuntimeError):
+    """Fitted Beta calibration would REVERSE the ranking. Never accepted silently."""
 
 
 class BetaCalibrator:
@@ -274,7 +422,7 @@ class BetaCalibrator:
 
     Maps raw probabilities p through sigmoid(a*logit(p) + b*log((1-p)/p) + c).
     Fitted by minimising NLL on a held-out calibration slice.
-    When a=1, b=0, c=0 the transform is identity — safe default when fitting fails.
+    When a=1, b=0, c=0 the transform is identity - safe default when fitting fails.
     """
     def __init__(self):
         self.a = 1.0; self.b = 0.0; self.c = 0.0
@@ -304,6 +452,25 @@ class BetaCalibrator:
                            options={"maxiter": 200, "ftol": 1e-10})
         if res.success:
             self.a, self.b, self.c = float(res.x[0]), float(res.x[1]), float(res.x[2])
+        # SIGN GUARD. log(p/(1-p)) and log((1-p)/p) are negatives of each other, so
+        # the whole transform collapses to sigmoid((a-b)*logit(p) + c) and (a-b) is
+        # the ONLY thing that carries the ordering. A fitted (a-b) <= 0 monotonically
+        # REVERSES it: the names the model likes least would score highest and the
+        # traded book would be the exact inverse of the intended one, with no error
+        # anywhere. This runs offline in the nightly, so failing loudly is correct;
+        # do not fall back to identity, because a silent fallback is how a broken
+        # calibration slice gets shipped. `_fitted` stays False so the object is
+        # unusable rather than half-fitted.
+        slope = self.a - self.b
+        if not np.isfinite(slope) or slope <= 0:
+            raise CalibratorInversionError(
+                f"BetaCalibrator fitted a non-positive slope: a={self.a:.6f} "
+                f"b={self.b:.6f} c={self.c:.6f} -> (a-b)={slope:.6f}. The transform "
+                f"reduces to sigmoid((a-b)*logit(p)+c), so (a-b) <= 0 INVERTS the "
+                f"entire traded ranking. Refusing to fit. Inspect the calibration "
+                f"slice (rows={len(p)}, positives={float(np.mean(y)):.4f}) before "
+                f"re-running."
+            )
         self._fitted = True
         return self
 
@@ -345,9 +512,12 @@ def conformal_threshold(scores, labels, target_precision=0.75,
 
 
 def downcast(df):
-    floats = df.select_dtypes(include=["float64"]).columns
-    if len(floats):
-        df[floats] = df[floats].astype("float32")
+    # Column-by-column: select_dtypes + bulk assignment consolidate every float64
+    # block into one contiguous array (15.8 GiB on the 3M-row inference panel,
+    # OOM on 2026-07-30). Casting one column at a time caps the peak at a single
+    # column's copy.
+    for c in df.columns[(df.dtypes == "float64").to_numpy()]:
+        df[c] = df[c].to_numpy(dtype="float32")
     return df
 
 
@@ -359,27 +529,47 @@ def mem_gb(df):
 # Phase 1+2: Load tickers + label engineering                                #
 # -------------------------------------------------------------------------- #
 def load_and_label_tickers(input_dir, target_col, date_col, horizon_5d,
-                            max_files=None, usecols_fn=None):
+                            max_files=None, usecols_fn=None, read_float32=False,
+                            book_touch_k=1.5, book_stop=0.03, book_target=0.08, book_vol_col="Realized_Vol_21d",
+                            book_beta=False, book_min_depth=0.0, book_max_depth=1.0, book_ratchet=0.03,
+                            load_start_date=None, load_end_date=None, prefilter_quality=False):
     """Load every parquet in input_dir, shift target -1 (next-day return),
     add ret_5d (5-day forward return), drop last rows that have no label.
 
     usecols_fn: optional name->bool predicate. When given, only the columns it
     keeps are read from each parquet (intersected per-file so a missing column
     never errors). Used to skip feature families that are dropped in Phase 6
-    anyway — pure I/O + memory savings, identical surviving rows/columns.
+    anyway - pure I/O + memory savings, identical surviving rows/columns.
     """
     files = sorted(f for f in os.listdir(input_dir) if f.endswith(".parquet"))
     if max_files:
         files = files[:max_files]
         logging.info(f"  --max_files {max_files}: using {len(files)} tickers")
 
+    # Read-time float32 (2026-09-03): the 3.06M-row training frame in float64 is ~18 GB
+    # before the concat copy, and a fresh-cache run peaked at 45.7 GB (watchdog-killed).
+    # Feature columns are downcast to float32 for the model anyway, so casting them here
+    # is identical downstream; label sources, prices, keys and the Phase-13 factors keep
+    # float64 so labels and neutralization are bit-for-bit unchanged.
+    _keep64 = set(NON_FEATURES) | set(NEUT_FACTORS) | {target_col, date_col, "Ticker",
+               "ret_today", "dollar_volume_ma_10", "atr_percentage", "RSI"}
+
+    def _cast32(tbl):
+        if not read_float32:
+            return tbl
+        import pyarrow as _pa
+        fields = [(_pa.field(f.name, _pa.float32()) if (_pa.types.is_float64(f.type) and f.name not in _keep64) else f)
+                  for f in tbl.schema]
+        target = _pa.schema(fields)
+        return tbl if target == tbl.schema else tbl.cast(target)
+
     def _read(fn):
         path = os.path.join(input_dir, fn)
         if usecols_fn is None:
-            return pq.read_table(path)
+            return _cast32(pq.read_table(path))
         pf = pq.ParquetFile(path)
         cols = [c for c in pf.schema_arrow.names if usecols_fn(c)]
-        return pf.read(columns=cols)
+        return _cast32(pf.read(columns=cols))
 
     parts = []
     n_skip_short = n_drop_nan = n_drop_outlier = 0
@@ -393,6 +583,15 @@ def load_and_label_tickers(input_dir, target_col, date_col, horizon_5d,
             n_skip_short += df.shape[0]
             return None
         df = df.sort_values(date_col).reset_index(drop=True)
+        # LOAD WINDOW (2026-09-05, default off): a deep-history panel holds 6+ years and Phase 1
+        # keeps every row in RAM (peak ~12 GB per panel-year); a run only needs its training
+        # window plus the calib slice. Start is applied before labels (labels look forward only),
+        # end after them so the last rows keep their horizon.
+        if load_start_date is not None:
+            df = df[pd.to_datetime(df[date_col]) >= pd.Timestamp(load_start_date)].reset_index(drop=True)
+            if df.shape[0] <= 60:
+                n_skip_short += df.shape[0]
+                return None
         # Stash TODAY's return as an explicit feature BEFORE the in-place label shift.
         # LEAK GUARD (2026-07-01): the v2 panels name the target in lowercase
         # ('percent_change_close') but NON_FEATURES only excluded the capital-C name,
@@ -403,7 +602,70 @@ def load_and_label_tickers(input_dir, target_col, date_col, horizon_5d,
         df[target_col] = df[target_col].shift(-1)
         df["ret_5d"] = (df["Close"].shift(-horizon_5d) / df["Close"] - 1.0
                         if "Close" in df.columns else np.nan)
+        # Max favorable excursion over the next horizon_5d sessions (predictor lab
+        # 2026-09-02): the book's take-profit / ratchet exits fire on intraday HIGHS, so
+        # a label on the forward max high matches the payoff more literally than
+        # close-to-close. Only used by --label_mode thresh_mfe_5d; costs one column.
+        if "High" in df.columns and "Close" in df.columns:
+            _fwd_max = pd.concat([df["High"].shift(-k) for k in range(1, horizon_5d + 1)],
+                                 axis=1).max(axis=1)
+            df["mfe_5d"] = _fwd_max / df["Close"] - 1.0
+        else:
+            df["mfe_5d"] = np.nan
+        # BOOK-RULE label columns (predictor lab 2026-09-03): simulate the trigger arm on each
+        # row. Limit = Close x (1 - k x daily vol); touch if next session's Low reaches it; from
+        # that fill, walk horizon_5d sessions: win if High >= fill x (1+target) strictly before
+        # Low <= fill x (1-stop) (same-session tie counts as a stop). book_touch: 0/1;
+        # book_win: 0/1 for touching rows, NaN otherwise. Only --label_mode book_5d uses them.
+        if all(c in df.columns for c in ("Low", "High", "Close")) and book_vol_col in df.columns:
+            _v = df[book_vol_col].astype(float)
+            if np.nanmedian(_v.values) > 0.1:          # annualised -> daily
+                _v = _v / np.sqrt(252.0)
+            _depth = book_touch_k * _v
+            if book_beta and "beta_spy" in df.columns:
+                _depth = _depth * pd.to_numeric(df["beta_spy"], errors="coerce").abs().fillna(1.0)
+            _depth = _depth.clip(book_min_depth, book_max_depth)
+            _limit = df["Close"] * (1.0 - _depth)
+            _lows = np.column_stack([df["Low"].shift(-k).values for k in range(1, horizon_5d + 1)])
+            _highs = np.column_stack([df["High"].shift(-k).values for k in range(1, horizon_5d + 1)])
+            _closes = np.column_stack([df["Close"].shift(-k).values for k in range(1, horizon_5d + 1)])
+            _fill = _limit.values[:, None]
+            _touch = _lows[:, 0] <= _limit.values
+            _stop_hit = _lows <= _fill * (1.0 - book_stop)
+            _tgt_hit = _highs >= _fill * (1.0 + book_target)
+            _first = lambda m: np.where(m.any(axis=1), m.argmax(axis=1), horizon_5d + 1)
+            _fs, _ft = _first(_stop_hit), _first(_tgt_hit)
+            _win = (_ft < _fs).astype(float)
+            _stopf = (_fs <= _ft) & _stop_hit.any(axis=1)
+            # realised return under the fixed-target rule: +target, -stop, or the last close
+            _ret = np.where(_ft < _fs, book_target, np.where(_stopf, -book_stop, _closes[:, -1] / _limit.values - 1.0))
+            # ratchet exit: after the fill, exit at the first close <= running max close x (1 - ratchet),
+            # else the last close; stop-first days still stop out
+            _runmax = np.maximum.accumulate(np.nan_to_num(_closes, nan=-np.inf), axis=1)
+            _rat_hit = _closes <= _runmax * (1.0 - book_ratchet)
+            _fr = _first(_rat_hit)
+            _rat_ret = np.where(_fr <= horizon_5d - 1, _closes[np.arange(len(df)), np.minimum(_fr, horizon_5d - 1)] / _limit.values - 1.0,
+                                _closes[:, -1] / _limit.values - 1.0)
+            _rat_ret = np.where(_stopf & (_fs < _fr), -book_stop, _rat_ret)
+            df["book_touch"] = _touch.astype(np.int8)
+            df["book_win"] = np.where(_touch, _win, np.nan)
+            df["book_stop"] = np.where(_touch, _stopf.astype(float), np.nan)
+            df["book_ret"] = np.where(_touch, np.clip(np.nan_to_num(_ret, nan=0.0), -0.5, 0.5), np.nan)
+            df["book_ret_ratchet"] = np.where(_touch, np.clip(np.nan_to_num(_rat_ret, nan=0.0), -0.5, 0.5), np.nan)
+        else:
+            df["book_touch"] = 0
+            df["book_win"] = np.nan
+            df["book_stop"] = np.nan
+            df["book_ret"] = np.nan
+            df["book_ret_ratchet"] = np.nan
         df = df.iloc[:-max(horizon_5d, 1)]
+        if load_end_date is not None:
+            df = df[pd.to_datetime(df[date_col]) <= pd.Timestamp(load_end_date)]
+        if prefilter_quality:
+            # Same FilterRubric gate main() applies to the concatenated frame BEFORE the split and
+            # before the per-day xs ranks, so applying it per ticker here (after the labels, which
+            # look forward only) is identical downstream and keeps ~75% of the rows out of RAM.
+            df, _ = apply_quality_filter(df, quiet=True)
         df = df.replace([np.inf, -np.inf], np.nan)
         before = len(df)
         df = df.dropna(subset=[target_col])
@@ -413,6 +675,7 @@ def load_and_label_tickers(input_dir, target_col, date_col, horizon_5d,
         n_drop_outlier += before - len(df)
         return downcast(df) if not df.empty else None
 
+    _by_fn = {}
     with ThreadPoolExecutor(max_workers=16) as ex:
         future_to_fn = {ex.submit(_read, fn): fn for fn in files}
         for future in tqdm(as_completed(future_to_fn), total=len(files),
@@ -421,24 +684,41 @@ def load_and_label_tickers(input_dir, target_col, date_col, horizon_5d,
             try:
                 result = _process(fn, future.result())
                 if result is not None:
-                    parts.append(result)
+                    _by_fn[fn] = result
             except Exception as e:
                 logging.warning(f"  skipping {fn}: {e}")
+    # DETERMINISTIC ORDER (2026-09-05): the threads finish in a different order every run,
+    # and shuffle_within_date assigns its random keys by row POSITION, so the concat order
+    # used to change the within-date shuffle and with it the fitted model (the predictor
+    # lab found two "identical" fits whose stitched books differed by 70pp). Emit the parts
+    # in filename order so the same flags + seed give the same rows in the same order.
+    parts = [_by_fn[fn] for fn in files if fn in _by_fn]
+    try:  # hand the Arrow read buffers back to the OS (the 16 reader threads leave arenas behind)
+        import pyarrow as _pa
+        _held = _pa.total_allocated_bytes() / 1e9
+        _pa.default_memory_pool().release_unused()
+        logging.info(f"  arrow pool: {_held:.2f} GB still allocated after load ({_pa.default_memory_pool().backend_name}); release_unused() called")
+    except Exception:
+        pass
 
     logging.info(f"  accounting: skipped_short={n_skip_short:,}  "
                  f"nan_dropped={n_drop_nan:,}  outliers_dropped={n_drop_outlier:,}")
+    _diag.dump_json("T_load", {"n_files": len(files), "n_parts": len(parts),
+                               "rows": int(sum(len(p) for p in parts)),
+                               "skipped_short_rows": n_skip_short, "nan_dropped": n_drop_nan,
+                               "outliers_dropped": n_drop_outlier, "horizon_5d": horizon_5d})
     return parts
 
 
 # -------------------------------------------------------------------------- #
-# Phase 3: Universe filter — FilterRubric Step 1                             #
+# Phase 3: Universe filter - FilterRubric Step 1                             #
 # -------------------------------------------------------------------------- #
 def apply_quality_filter(df,
                           min_close=5.0,
                           min_dollar_volume=5_000_000.0,
                           max_atr_pct=0.05,
                           rsi_exclude_lo=30.0,
-                          rsi_exclude_hi=40.0):
+                          rsi_exclude_hi=40.0, quiet=False):
     """Apply the FilterRubric Step 1 universe gate.
 
     Returns (filtered_df, boolean_mask_aligned_to_input_index).
@@ -446,28 +726,41 @@ def apply_quality_filter(df,
     """
     n0 = len(df)
     mask = pd.Series(True, index=df.index)
+    gates = {}
 
     if "Close" in df.columns:
         gate = df["Close"] >= min_close
-        logging.info(f"  gate Close>={min_close}: removes {int((~gate & mask).sum()):,}")
+        _n = int((~gate & mask).sum())
+        if not quiet: logging.info(f"  gate Close>={min_close}: removes {_n:,}")
+        gates["close_ge_%g" % min_close] = _n
         mask &= gate
     if "dollar_volume_ma_10" in df.columns:
         gate = df["dollar_volume_ma_10"] >= min_dollar_volume
-        logging.info(f"  gate dollar_vol>={min_dollar_volume:,.0f}: removes {int((~gate & mask).sum()):,}")
+        _n = int((~gate & mask).sum())
+        if not quiet: logging.info(f"  gate dollar_vol>={min_dollar_volume:,.0f}: removes {_n:,}")
+        gates["dollar_vol_ge_%g" % min_dollar_volume] = _n
         mask &= gate
     if "atr_percentage" in df.columns:
         gate = df["atr_percentage"] <= max_atr_pct
-        logging.info(f"  gate atr_pct<={max_atr_pct}: removes {int((~gate & mask).sum()):,}")
+        _n = int((~gate & mask).sum())
+        if not quiet: logging.info(f"  gate atr_pct<={max_atr_pct}: removes {_n:,}")
+        gates["atr_pct_le_%g" % max_atr_pct] = _n
         mask &= gate
     if "RSI" in df.columns:
         gate = ~((df["RSI"] >= rsi_exclude_lo) & (df["RSI"] < rsi_exclude_hi))
-        logging.info(f"  gate RSI not in [{rsi_exclude_lo},{rsi_exclude_hi}): "
-                     f"removes {int((~gate & mask).sum()):,}")
+        _n = int((~gate & mask).sum())
+        if not quiet: logging.info(f"  gate RSI not in [{rsi_exclude_lo},{rsi_exclude_hi}): "
+                     f"removes {_n:,}")
+        gates["rsi_not_in_%g_%g" % (rsi_exclude_lo, rsi_exclude_hi)] = _n
         mask &= gate
 
     out = df.loc[mask].copy()
-    logging.info(f"  universe: {n0:,} -> {len(out):,} rows "
+    if not quiet: logging.info(f"  universe: {n0:,} -> {len(out):,} rows "
                  f"({100*len(out)/max(n0,1):.1f}% retained)")
+    _diag.append_jsonl("P_quality_gates", {"n0": int(n0), "n_pass": int(len(out)), "gates": gates,
+                                           "columns_present": [c for c in ("Close", "dollar_volume_ma_10",
+                                                                           "atr_percentage", "RSI")
+                                                               if c in df.columns]})
     return out, mask
 
 
@@ -534,7 +827,7 @@ def time_split_with_embargo(df, train_pct, calib_pct, embargo_days, date_col,
 # Phase 6: Feature matrix                                                    #
 # -------------------------------------------------------------------------- #
 NON_FEATURES = {
-    "percent_change_Close", "ret_5d",
+    "percent_change_Close", "ret_5d", "mfe_5d", "book_touch", "book_win", "book_stop", "book_ret", "book_ret_ratchet", "book_win_ratchet",
     # LEAK GUARD (2026-07-01): v2 panels use the LOWERCASE target name; without this
     # entry the in-place-shifted label (tomorrow's return) becomes a feature in any
     # fresh full-feature train. Today's return survives as 'ret_today' instead.
@@ -613,8 +906,38 @@ def risk_adj_topq_label(returns, vol, dates, top_frac=0.20, vol_floor=1e-3):
     return (rar >= cutoff).astype(int).values
 
 
+def add_limit_features(df, vol_col, k=1.5):
+    """Features measured at the trigger limit price rather than the close (Order 66, 2026-09-03).
+    Uses columns the panel already has; missing inputs give NaN (XGB handles them)."""
+    v = pd.to_numeric(df.get(vol_col), errors="coerce").astype(float)
+    if np.nanmedian(v.values) > 0.1:
+        v = v / np.sqrt(252.0)
+    depth = (k * v).clip(0.0, 0.30)
+    df["lim_depth"] = depth.astype(np.float32)
+    ds = (pd.to_numeric(df.get("Distance to Support (%)"), errors="coerce") / 100.0).clip(-0.5, 0.9)
+    dr = (pd.to_numeric(df.get("Distance to Resistance (%)"), errors="coerce") / 100.0).clip(-0.5, 5.0)
+    df["lim_to_support"] = ((1.0 - depth) / (1.0 - ds) - 1.0).clip(-1.0, 1.0).astype(np.float32)     # limit vs support level
+    df["lim_to_resistance"] = ((1.0 + dr) / (1.0 - depth) - 1.0).clip(-1.0, 3.0).astype(np.float32)  # room from limit to resistance
+    df["lim_gap_room"] = (df["lim_to_resistance"] - 0.08).astype(np.float32)                        # room beyond the +8% target
+    return ["lim_depth", "lim_to_support", "lim_to_resistance", "lim_gap_room"]
+
+
+def add_day_features(df, date_col, vol_col, ret_col="ret_today", k=1.5):
+    """Cross-sectional market-day context, same-day information only (Order 66, 2026-09-03)."""
+    v = pd.to_numeric(df.get(vol_col), errors="coerce").astype(float)
+    if np.nanmedian(v.values) > 0.1:
+        v = v / np.sqrt(252.0)
+    r = pd.to_numeric(df.get(ret_col), errors="coerce").astype(float)
+    g = pd.DataFrame({"d": df[date_col].values, "r": r.values, "dip": (r.values < -k * v.values).astype(float), "v": v.values})
+    agg = g.groupby("d").agg(day_dip_breadth=("dip", "mean"), day_ret_mean=("r", "mean"), day_ret_disp=("r", "std"),
+                             day_vol_mean=("v", "mean"), day_n=("r", "size"))
+    for c in agg.columns:
+        df[c] = pd.Series(df[date_col].values).map(agg[c]).values.astype(np.float32)
+    return list(agg.columns)
+
+
 def build_labels(train_df, calib_df, label_mode, target_col, date_col,
-                  topq_frac, vol_col, vol_floor):
+                  topq_frac, vol_col, vol_floor, thresh_5d=0.08, ratchet_win=0.05):
     if label_mode == "binary_up":
         y_train = (train_df[target_col] > 0).astype(int).values
         y_calib = (calib_df[target_col] > 0).astype(int).values
@@ -635,6 +958,95 @@ def build_labels(train_df, calib_df, label_mode, target_col, date_col,
             calib_df[target_col].values, calib_df[vol_col].values,
             calib_df[date_col].values, top_frac=topq_frac, vol_floor=vol_floor)
         logging.info(f"  label = per-day top {topq_frac*100:.0f}% of return/{vol_col}")
+    elif label_mode == "topq_5d":
+        # Payoff-targeted (predictor lab 2026-09-02): per-day top-q of the 5-DAY forward
+        # return, i.e. names that move big inside the book's typical hold, not tomorrow's
+        # top-20%. ret_5d is built in Phase 2 and is in NON_FEATURES, so it cannot leak.
+        for _df in (train_df, calib_df):
+            if "ret_5d" not in _df.columns:
+                raise ValueError("label_mode topq_5d needs the ret_5d column from Phase 2")
+        y_train = topq_label(train_df["ret_5d"].values, train_df[date_col].values, top_frac=topq_frac)
+        y_calib = topq_label(calib_df["ret_5d"].values, calib_df[date_col].values, top_frac=topq_frac)
+        logging.info(f"  label = per-day top {topq_frac*100:.0f}% of 5-day forward return (ret_5d)")
+    elif label_mode == "thresh_5d":
+        for _df in (train_df, calib_df):
+            if "ret_5d" not in _df.columns:
+                raise ValueError("label_mode thresh_5d needs the ret_5d column from Phase 2")
+        y_train = (train_df["ret_5d"].values >= thresh_5d).astype(int)
+        y_calib = (calib_df["ret_5d"].values >= thresh_5d).astype(int)
+        logging.info(f"  label = 5-day forward return >= {thresh_5d:+.2%} (thresh_5d)")
+    elif label_mode == "thresh_mfe_5d":
+        for _df in (train_df, calib_df):
+            if "mfe_5d" not in _df.columns:
+                raise ValueError("label_mode thresh_mfe_5d needs the mfe_5d column from Phase 2 (fresh cache)")
+        y_train = (train_df["mfe_5d"].values >= thresh_5d).astype(int)
+        y_calib = (calib_df["mfe_5d"].values >= thresh_5d).astype(int)
+        logging.info(f"  label = 5-day forward MAX HIGH vs close >= {thresh_5d:+.2%} (thresh_mfe_5d)")
+    elif label_mode == "thresh_5d_vol":
+        # +threshold measured in units of the name's own 5-day volatility (annualised vol
+        # columns are converted to daily): equalises positives across vol buckets.
+        def _volscaled(df):
+            v = df[vol_col].astype(float).values
+            if np.nanmedian(v) > 0.1:
+                v = v / np.sqrt(252.0)
+            return df["ret_5d"].values / np.maximum(v * np.sqrt(5.0), vol_floor)
+        y_train = (_volscaled(train_df) >= thresh_5d).astype(int)
+        y_calib = (_volscaled(calib_df) >= thresh_5d).astype(int)
+        logging.info(f"  label = 5-day return / (5-day vol) >= {thresh_5d:.2f} (thresh_5d_vol)")
+    elif label_mode == "book_ratchet":
+        # win = the ratchet-exit trade from the fill returned >= --book_ratchet_win (train on touching rows)
+        for _df in (train_df, calib_df):
+            if "book_ret_ratchet" not in _df.columns:
+                raise ValueError("label_mode book_ratchet needs the book_ret_ratchet column from Phase 2 (fresh cache)")
+        y_train = (np.nan_to_num(train_df["book_ret_ratchet"].values, nan=-1.0) >= ratchet_win).astype(int)
+        y_calib = (np.nan_to_num(calib_df["book_ret_ratchet"].values, nan=-1.0) >= ratchet_win).astype(int)
+        logging.info(f"  label = ratchet-exit return >= {ratchet_win:+.2%} (book_ratchet); positives {y_train.mean():.3%}")
+    elif label_mode == "book_ratchet_all":
+        # P(touch AND ratchet-exit return >= win) on ALL rows (non-touch = 0)
+        for _df in (train_df, calib_df):
+            if "book_ret_ratchet" not in _df.columns:
+                raise ValueError("label_mode book_ratchet_all needs the book_ret_ratchet column from Phase 2 (fresh cache)")
+        y_train = (np.nan_to_num(train_df["book_ret_ratchet"].values, nan=-1.0) >= ratchet_win).astype(int)
+        y_calib = (np.nan_to_num(calib_df["book_ret_ratchet"].values, nan=-1.0) >= ratchet_win).astype(int)
+        logging.info(f"  label = touch AND ratchet-exit return >= {ratchet_win:+.2%}, all rows (book_ratchet_all); positives {y_train.mean():.3%}")
+    elif label_mode == "book_5d_stop":
+        # WICK MODEL: P(stop first | touch). Train with --train_row_filter 'book_touch == 1'.
+        for _df in (train_df, calib_df):
+            if "book_stop" not in _df.columns:
+                raise ValueError("label_mode book_5d_stop needs the book_stop column from Phase 2 (fresh cache)")
+        y_train = np.nan_to_num(train_df["book_stop"].values, nan=0.0).astype(int)
+        y_calib = np.nan_to_num(calib_df["book_stop"].values, nan=0.0).astype(int)
+        logging.info(f"  label = stop-first under the book rule (book_5d_stop); positives {y_train.mean():.3%}")
+    elif label_mode == "book_5d_all":
+        # P(touch AND win) on ALL rows (non-touch = 0): ranking by this is ranking by expected
+        # book wins per pool name, the scorecard's ev_touch. No row filter needed.
+        for _df in (train_df, calib_df):
+            if "book_win" not in _df.columns:
+                raise ValueError("label_mode book_5d_all needs the book_win column from Phase 2 (fresh cache)")
+        y_train = np.nan_to_num(train_df["book_win"].values, nan=0.0).astype(int)
+        y_calib = np.nan_to_num(calib_df["book_win"].values, nan=0.0).astype(int)
+        logging.info(f"  label = touch AND win under the book rule, all rows (book_5d_all); positives {y_train.mean():.3%}")
+    elif label_mode == "book_5d":
+        for _df in (train_df, calib_df):
+            if "book_win" not in _df.columns:
+                raise ValueError("label_mode book_5d needs the book_win column from Phase 2 (fresh cache)")
+        y_train = np.nan_to_num(train_df["book_win"].values, nan=0.0).astype(int)
+        y_calib = np.nan_to_num(calib_df["book_win"].values, nan=0.0).astype(int)
+        logging.info("  label = book rule (touch, then target before stop); train touch rows "
+                     f"{int(train_df['book_touch'].sum()):,} of {len(train_df):,} (use --train_row_filter 'book_touch == 1')")
+    elif label_mode == "thresh_5d_xs":
+        # Same big-move label, measured in EXCESS of that day's cross-sectional mean 5-day
+        # return, so market-wide rallies do not mint positives (predictor lab 2026-09-02).
+        for _df in (train_df, calib_df):
+            if "ret_5d" not in _df.columns:
+                raise ValueError("label_mode thresh_5d_xs needs the ret_5d column from Phase 2")
+        def _xs_excess(df):
+            r = pd.Series(df["ret_5d"].values)
+            d = pd.Series(df[date_col].values)
+            return (r - r.groupby(d).transform("mean")).values
+        y_train = (_xs_excess(train_df) >= thresh_5d).astype(int)
+        y_calib = (_xs_excess(calib_df) >= thresh_5d).astype(int)
+        logging.info(f"  label = 5-day forward return minus day mean >= {thresh_5d:+.2%} (thresh_5d_xs)")
     else:
         raise ValueError(f"unknown label_mode: {label_mode}")
 
@@ -767,6 +1179,16 @@ def run_optuna_tuning(X_train, y_train, ret_train, dates_train, sw_train,
     _n_jobs = n_gpus if (device.startswith("cuda") and n_gpus > 1) else 1
     study.optimize(objective, n_trials=n_trials, callbacks=[_log],
                    show_progress_bar=False, n_jobs=_n_jobs)
+    if _diag.enabled():
+        try:
+            _diag.dump_parquet("T_optuna_trials", study.trials_dataframe())
+        except Exception:
+            pass
+        _diag.dump_json("T_optuna", {"inner_train_rows": int(len(X_it)), "inner_val_rows": int(len(X_iv)),
+                                     "inner_cut_row": int(cut), "tune_subsample": tune_subsample,
+                                     "objective": objective_name, "n_trials": n_trials, "device": device,
+                                     "best_trial": int(study.best_trial.number), "best_value": float(study.best_value),
+                                     "best_params": study.best_params})
 
     logging.info(f"  best trial #{study.best_trial.number}  "
                  f"value={study.best_value:.4f}")
@@ -782,10 +1204,14 @@ def run_optuna_tuning(X_train, y_train, ret_train, dates_train, sw_train,
 def train_model(X_train, y_train, tuned_params, sw_train, scale_pos_weight,
                 n_estimators, max_depth, learning_rate, min_child_weight,
                 reg_alpha, reg_lambda, subsample, colsample_bytree,
-                early_stopping_rounds, seed=42):
+                early_stopping_rounds, seed=42, refit_full=False):
     """Fit final XGBClassifier on full training data.
 
-    Uses last 20% of train as internal val for early stopping.
+    Uses last 20% of train as internal val for early stopping. NOTE (2026-09-05): the
+    frame is date-sorted, so that 20% is the most RECENT fifth of the training window
+    and the early-stopped model never trains on it. --refit_full re-fits on every row
+    with the tree count the early stop chose; --early_stopping_rounds 0 skips the
+    holdout entirely and fits a fixed --n_estimators on every row.
     """
     val_start = int(len(X_train) * 0.80)
     sw_fit = sw_val = None
@@ -809,6 +1235,14 @@ def train_model(X_train, y_train, tuned_params, sw_train, scale_pos_weight,
         early_stopping_rounds=early_stopping_rounds, verbosity=1,
         **xgb_params,
     )
+    if early_stopping_rounds is not None and early_stopping_rounds <= 0:
+        # FIXED TREES (2026-09-05, flag-gated): no holdout, no early stop, every row.
+        clf = XGBClassifier(scale_pos_weight=spw, objective="binary:logistic", eval_metric="aucpr",
+                            tree_method="hist", n_jobs=-1, random_state=seed, verbosity=1, **xgb_params)
+        clf.fit(X_train, y_train, **({"sample_weight": sw_train} if sw_train is not None else {}))
+        clf.get_booster().set_attr(best_iteration=str(int(xgb_params.get("n_estimators", n_estimators)) - 1))
+        logging.info(f"  trained {clf.best_iteration+1} trees (FIXED, no early stop, all {len(X_train):,} rows)")
+        return clf
     fk = dict(eval_set=[(X_train.iloc[val_start:], y_train[val_start:])],
               verbose=False)
     if sw_fit is not None:
@@ -817,7 +1251,70 @@ def train_model(X_train, y_train, tuned_params, sw_train, scale_pos_weight,
     clf.fit(X_train.iloc[:val_start], y_train[:val_start], **fk)
     logging.info(f"  trained {clf.best_iteration+1} trees "
                  f"(early stopped from {n_estimators})")
+    if refit_full:
+        # REFIT ON EVERY ROW (2026-09-05, flag-gated): keep the early-stopped tree count,
+        # drop the holdout so the newest fifth of the window is in the fit.
+        n_best = int(clf.best_iteration) + 1
+        p2 = dict(xgb_params); p2["n_estimators"] = n_best
+        clf2 = XGBClassifier(scale_pos_weight=spw, objective="binary:logistic", eval_metric="aucpr",
+                             tree_method="hist", n_jobs=-1, random_state=seed, verbosity=1, **p2)
+        clf2.fit(X_train, y_train, **({"sample_weight": sw_train} if sw_train is not None else {}))
+        clf2.get_booster().set_attr(best_iteration=str(n_best - 1))
+        logging.info(f"  --refit_full: refit {n_best} trees on all {len(X_train):,} rows (holdout was {len(X_train)-val_start:,})")
+        clf = clf2
+    if _diag.enabled():
+        try:
+            _ev = clf.evals_result()
+        except Exception:
+            _ev = None
+        _diag.dump_json("T_fit", {"val_start_row": int(val_start), "n_fit": int(val_start),
+                                  "n_val": int(len(X_train) - val_start), "best_iteration": int(clf.best_iteration),
+                                  "n_estimators": xgb_params.get("n_estimators", n_estimators),
+                                  "params": xgb_params, "evals_result": _ev})
     return clf
+
+
+class BaggedXGB:
+    """Average of N seed-varied XGBClassifiers. Quacks like one classifier for
+    everything Phases 11-12 touch: predict_proba, feature_names_in_,
+    feature_importances_, best_iteration, evals_result. Pickles by reference to
+    this module, so load it from a process running 4__Predictor.py (as the
+    nightly does); other tools should read summary.json instead."""
+    def __init__(self, members, bag_mode="prob"):
+        self.members = list(members)
+        self.bag_mode = bag_mode
+        self.feature_names_in_ = self.members[0].feature_names_in_
+        self.best_iteration = int(round(np.mean([m.best_iteration for m in self.members])))
+        self.feature_importances_ = np.mean([m.feature_importances_ for m in self.members], axis=0)
+
+    def predict_proba(self, X):
+        if getattr(self, "bag_mode", "prob") == "rank":
+            # Rank-average (predictor lab 2026-09-02): averaging PROBABILITIES compressed
+            # the extreme-tail scores the 3-slot book lives on (bag3 lost 11pp on the
+            # honest window). Averaging each member's percentile rank keeps the tail
+            # shape while still voting across seeds.
+            from scipy.stats import rankdata
+            n = float(len(X))
+            p = np.mean([rankdata(m.predict_proba(X)[:, 1]) / n for m in self.members], axis=0)
+            return np.column_stack([1.0 - p, p])
+        return np.mean([m.predict_proba(X) for m in self.members], axis=0)
+
+    def evals_result(self):
+        return self.members[0].evals_result()
+
+
+def train_bagged(n_bags, seed, bag_mode="prob", **kw):
+    """Fit n_bags models via train_model with seeds seed..seed+n-1 and wrap them.
+    n_bags == 1 returns the plain classifier, exactly the pre-flag behaviour."""
+    if n_bags <= 1:
+        return train_model(seed=seed, **kw)
+    members = []
+    for i in range(n_bags):
+        logging.info(f"  bag member {i+1}/{n_bags} (seed {seed + i})")
+        members.append(train_model(seed=seed + i, **kw))
+    bag = BaggedXGB(members, bag_mode=bag_mode)
+    logging.info(f"  BaggedXGB: {n_bags} members ({bag_mode}-averaged), mean best_iteration {bag.best_iteration}")
+    return bag
 
 
 # -------------------------------------------------------------------------- #
@@ -871,7 +1368,7 @@ def evaluate_and_save(clf, X_calib, y_calib, calib_df, feature_cols,
     # Save model
     dump(clf, model_path)
 
-    # Beta calibration (diagnostic — does not alter inference UpPrediction logic)
+    # Beta calibration (diagnostic - does not alter inference UpPrediction logic)
     calibrator_info = {"fitted": False}
     p_calib_cal = p_calib.copy()   # calibrated scores (same as raw if disabled)
     conf_thr = conf_prec = conf_cov = float("nan")
@@ -893,6 +1390,10 @@ def evaluate_and_save(clf, X_calib, y_calib, calib_df, feature_cols,
             logging.info(f"  Conformal threshold (target_prec={target_precision}): "
                          f"thr={conf_thr:.4f}  prec={conf_prec:.4f}  "
                          f"cov={conf_cov:.4f}")
+        except CalibratorInversionError:
+            # An inverted calibration is not a "skip calibration" case: it means the
+            # fit says the ranking should be flipped. Let it kill the run.
+            raise
         except Exception as e:
             logging.warning(f"  BetaCalibrator fit failed ({e}); skipping calibration")
 
@@ -972,7 +1473,7 @@ def evaluate_and_save(clf, X_calib, y_calib, calib_df, feature_cols,
             f"c={calibrator_info['c']:.4f}",
             f"  Conformal threshold @ prec>={target_precision}: "
             f"thr={conf_thr:.4f}  prec={conf_prec:.4f}  cov={conf_cov:.4f}",
-            f"  (diagnostic only — does not gate UpPrediction)",
+            f"  (diagnostic only - does not gate UpPrediction)",
         ]
     lines += [
         "",
@@ -991,7 +1492,7 @@ def evaluate_and_save(clf, X_calib, y_calib, calib_df, feature_cols,
 
 
 # -------------------------------------------------------------------------- #
-# Phase 12: Inference — score all tickers, write RFpredictions               #
+# Phase 12: Inference - score all tickers, write RFpredictions               #
 # -------------------------------------------------------------------------- #
 def map_pct_rank_to_upprob(pct_rank, top_frac):
     """Map per-day percentile rank of model score to UpProbability.
@@ -1007,10 +1508,396 @@ def map_pct_rank_to_upprob(pct_rank, top_frac):
     return np.clip(up, 0.30, 0.70)
 
 
+# -------------------------------------------------------------------------- #
+# Phase 13: pred-space PARTIAL FACTOR NEUTRALIZATION                          #
+# -------------------------------------------------------------------------- #
+# Was the standalone stage 4.5__NeutralizePreds.py (2026-07-01 .. 2026-07-27);
+# folded in here 2026-07-27 so the predictor emits ship-ready preds in one pass.
+# Merging it removed a full re-read of RFpredictions + ProcessedData_v2 (the old
+# stage's dominant cost) and the RFpredictions -> _raw directory swap: the factor
+# panel and the scores are already in memory at this point, and the pre-
+# neutralization value is preserved per row in the `raw_up_prob` column.
+#
+# Per day: project the cross-section of raw_score onto [beta_spy,
+# atr_percentage, log dollar_volume_ma_10] and subtract dose*projection, then
+# quantile-map the neutralized scores back onto that day's ORIGINAL
+# UpProbability values. The per-day marginal is preserved EXACTLY -- only the
+# within-day ordering changes, so the backtester's threshold/percentile
+# machinery sees the same distribution.
+#
+# Validated 2026-07-01 (pinned BT_AS_OF=2026-06-26, BT_SAMPLE_SEED 42-45: base
+# 254.5%/Sh 3.68 vs dose-0.3 305.7-340.8%/Sh 4.05-4.37), 2026-07-03 on the live
+# window, and 2026-07-12 for the spy200v2 adaptive dose (live 80.2% vs 52.2%).
+NEUT_FACTORS = ["beta_spy", "atr_percentage", "dollar_volume_ma_10"]
+
+
+def spy_above_200ema_flag():
+    """Date-indexed bool Series: SPY close >= its 200d EMA.
+
+    Splices the deep index lake with the live one, then tries a yfinance tail
+    freshen (the live lake can lag by days). EMA is computed over the full
+    spliced history. Returns None if no SPY parquet exists.
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    parts = []
+    for d in [os.path.join(root, "Data", "IndexesFull"),
+              os.path.join(root, "Data", "Indexes")]:
+        p = os.path.join(d, "SPY.parquet")
+        if not os.path.exists(p):
+            continue
+        s = pd.read_parquet(p)
+        if "Date" not in s.columns:
+            s = s.reset_index()
+        dcol = [c for c in s.columns if str(c).lower() == "date"][0]
+        s = s.rename(columns={dcol: "Date"})[["Date", "Close"]].dropna()
+        s["Date"] = pd.to_datetime(s["Date"])
+        parts.append(s)
+    if not parts:
+        return None
+    spy = pd.concat(parts).drop_duplicates("Date", keep="last").sort_values("Date")
+    try:
+        import yfinance as yf
+        tail = yf.download("SPY", start=str((spy["Date"].max()
+                           - pd.Timedelta(days=10)).date()), progress=False,
+                           auto_adjust=False)
+        tail = tail.reset_index()
+        if hasattr(tail.columns, "get_level_values"):
+            tail.columns = [c[0] if isinstance(c, tuple) else c for c in tail.columns]
+        tail = tail[["Date", "Close"]].dropna()
+        tail["Date"] = pd.to_datetime(tail["Date"])
+        spy = pd.concat([spy, tail]).drop_duplicates("Date", keep="last").sort_values("Date")
+    except Exception as e:
+        logging.warning(f"  yfinance SPY freshen failed ({type(e).__name__}); "
+                        f"lake flag ends {spy['Date'].max().date()}")
+    spy = spy.reset_index(drop=True)
+    ema = spy["Close"].ewm(span=200, adjust=False).mean()
+    return pd.Series((spy["Close"] >= ema).values,
+                     index=spy["Date"].values).sort_index()
+
+
+def neutralize_upprob(dates, tickers, up_prob, score, factors,
+                      mode="spy200v2", dose=0.3, dose_above=0.15,
+                      dose_below=0.30, flag_max_stale_days=14):
+    """Per-day partial factor-neutralization of `score`, quantile-mapped back
+    onto `up_prob`.
+
+    dates    : datetime64 array (one row per ticker-day)
+    tickers  : ticker array (only used to fix the within-day row order, so the
+               result does not depend on file-read order)
+    up_prob  : the UpProbability values that would ship un-neutralized
+    score    : the raw model score being neutralized (raw_score)
+    factors  : dict name -> float64 array for NEUT_FACTORS (missing -> all-NaN)
+
+    Returns (new_up, meta). new_up is a per-day permutation of up_prob.
+    """
+    n = len(dates)
+    dcodes, dvals = pd.factorize(pd.to_datetime(dates), sort=True)
+    n_days = int(dcodes.max()) + 1 if n else 0
+    # Date-major, ticker-minor: reproduces the old stage's sort_values(["Date","Ticker"]),
+    # which is what breaks ties in the quantile map below. factorize(sort=True) gives
+    # alphabetical ticker codes, so lexsort stays on ints (an object-array lexsort over
+    # millions of rows is minutes of Python string compares).
+    tcodes = pd.factorize(np.asarray(tickers), sort=True)[0]
+    order = np.lexsort((tcodes, dcodes))
+    bounds = np.searchsorted(dcodes[order], np.arange(n_days + 1))
+
+    # per-day dose
+    day_dose = np.full(n_days, float(dose))
+    meta = {"mode": mode, "n_days": n_days,
+            "dose_desc": ("%.2f" % dose if mode == "fixed"
+                          else "spy200v2 %.2f/%.2f" % (dose_above, dose_below))}
+    if mode == "spy200v2":
+        flag = spy_above_200ema_flag()
+        if flag is None:
+            raise RuntimeError("spy200v2: no SPY parquet found in Data/Indexes[Full]")
+        n_stale = 0
+        for di in range(n_days):
+            d = pd.Timestamp(dvals[di])
+            sub = flag.loc[:d]
+            if len(sub) == 0 or (d - pd.Timestamp(sub.index[-1])).days > flag_max_stale_days:
+                day_dose[di] = dose_below      # safe degrade = incumbent dose
+                n_stale += 1
+            else:
+                day_dose[di] = dose_above if bool(sub.iloc[-1]) else dose_below
+        sig_d = pd.Timestamp(dvals[-1])
+        sig_flag = flag.loc[:sig_d]
+        sig_stale = (len(sig_flag) == 0
+                     or (sig_d - pd.Timestamp(sig_flag.index[-1])).days > flag_max_stale_days)
+        logging.info("  spy200v2: dose_above=%.2f on %.1f%% of %d days; %d days degraded "
+                     "to dose_below (stale flag); signal-day flag date %s (above=%s)"
+                     % (dose_above, 100 * float((day_dose == dose_above).mean()), n_days,
+                        n_stale, sig_flag.index[-1] if len(sig_flag) else "NONE",
+                        bool(sig_flag.iloc[-1]) if len(sig_flag) else "n/a"))
+        if sig_stale:
+            logging.warning("  signal-day SPY flag stale/missing -> trading dose_below "
+                            "%.2f today" % dose_below)
+        meta["signal_day_flag_stale"] = bool(sig_stale)
+
+    # design matrix columns (log-transform dollar volume, as validated)
+    XV = {
+        "beta":  np.asarray(factors["beta_spy"], dtype=np.float64),
+        "atr":   np.asarray(factors["atr_percentage"], dtype=np.float64),
+        "logdv": np.log(np.clip(np.asarray(factors["dollar_volume_ma_10"],
+                                           dtype=np.float64), 1.0, None)),
+    }
+    sv = np.asarray(score, dtype=np.float64)
+    neut = np.full(n, np.nan)
+    for di in range(n_days):
+        idx = order[bounds[di]:bounds[di + 1]]
+        if len(idx) < 50:                      # too thin to fit -> pass through
+            neut[idx] = sv[idx]
+            continue
+        y = sv[idx]
+        good_y = np.isfinite(y)
+        cols = [np.ones(len(idx))]
+        for k in XV:
+            c = XV[k][idx]
+            med = np.nanmedian(c)
+            c = np.where(np.isfinite(c), c, 0.0 if not np.isfinite(med) else med)
+            c = np.clip(c, np.nanpercentile(c, 1), np.nanpercentile(c, 99))
+            sd = c.std()
+            cols.append((c - c.mean()) / (sd if sd > 1e-12 else 1.0))
+        X = np.column_stack(cols)
+        proj = np.zeros(len(idx))
+        if good_y.sum() >= 20:
+            coef, *_ = np.linalg.lstsq(X[good_y], y[good_y], rcond=None)
+            proj = X @ coef - (X @ coef)[good_y].mean() + y[good_y].mean()
+            proj = proj - y[good_y].mean()     # centered systematic component
+        out = y - day_dose[di] * proj
+        out[~good_y] = y[~good_y]
+        neut[idx] = out
+
+    # quantile-map back onto each day's ORIGINAL UpProbability values
+    up = np.asarray(up_prob)
+    new_up = np.full(n, np.nan, dtype=up.dtype if up.dtype.kind == "f" else np.float64)
+    for di in range(n_days):
+        idx = order[bounds[di]:bounds[di + 1]]
+        u = up[idx]
+        nv = neut[idx]
+        ok = np.isfinite(u) & np.isfinite(nv)
+        if ok.sum() < 5:
+            new_up[idx] = u
+            continue
+        ranks = np.empty(ok.sum(), dtype=np.int64)
+        ranks[np.argsort(nv[ok], kind="stable")] = np.arange(ok.sum())
+        tmp = u.copy()
+        tmp[ok] = np.sort(u[ok])[ranks]
+        new_up[idx] = tmp
+    if _diag.enabled():
+        _diag.dump_parquet("P_neut_by_day", pd.DataFrame({"Date": pd.to_datetime(dvals), "dose": day_dose,
+                                                          "n_rows": np.diff(bounds)}))
+    return new_up, meta
+
+
+##############################################################################
+# Phase 14: CONVICTION-MOMENTUM TILT   (was the standalone 4.6__ConvictionMomentum.py)
+#
+#     up' = clip( up + k * mean_over_spans( up - EMA_span(up) ), lo, hi )
+#
+# Algebraically (1+k)*up - k*EMA: a tilt toward names whose model conviction is
+# RISING and away from names where it is fading. It is a first derivative of
+# conviction, which the flat level does not expose.
+#
+# WHY IT WORKS: `can_buy` in 5__NightlyBackTester.py is a WITHIN-TICKER SPIKE
+# DETECTOR -- it fires when a ticker's UpProbability clears that ticker's OWN
+# rolling 90th/95th percentile. Amplifying a name's deviation from its own trend
+# makes genuine rising-conviction moves clear that bar decisively. The exact
+# inverse (EMA smoothing) damps those peaks and LOST 27-32pp in full sim.
+#
+# EVIDENCE (2026-07-27, full slot sim, BT_SAMPLE_SEED pinned), main 252d window:
+#   baseline, 8 seeds  : ann 59.40-62.13 | Sh 1.48-1.54 | DD 25.34-27.12
+#   k=.5 MULTI 3/6/12  : ann 98.73       | Sh 2.40      | DD 12.16
+#   -> +36pp above the baseline's BEST of 8 seeds; zero overlap on any metric.
+# Every arm of the family beats baseline in all 3 tested windows. Seed-INVARIANT
+# (42/43/44/999): the tilt removes ties, so BT_SAMPLE_SEED goes inert. Parameter
+# plateau over k .5/1.0 x span 3/6/12 -- not a knife-edge.
+#
+# RESIDUAL (do not let the fold-in launder this): the 3 validation windows
+# OVERLAP (~2 independent periods); pre-2023 slices are unreachable because
+# Data/RFpredictions only spans 2023-08-30+; and the baseline prints NEGATIVE in
+# the older asof windows, contradicting the live record, still unexplained.
+# Rank-IC FALLS as returns rise (0.18 -> 0.11 -> 0.06) -- IC would have rejected
+# this, which is why it is judged on the full sim only.
+##############################################################################
+
+def conviction_momentum_tilt(dates, tickers, up_prob, k=0.5, spans=(3, 6, 12),
+                             lo=0.30, hi=0.70):
+    """Per-ticker causal conviction tilt. Returns tilted values in INPUT row order.
+
+    `combined` is not guaranteed to be sorted by (ticker, date), and the EMA is a
+    time-series recursion -- computing it on unsorted rows silently produces a
+    different, wrong number rather than an error. So sort explicitly, transform,
+    then restore the original row order via the preserved index.
+    """
+    df = pd.DataFrame({"t": np.asarray(tickers), "d": np.asarray(dates),
+                       "up": np.asarray(up_prob, dtype=np.float64)})
+    df = df.sort_values(["t", "d"], kind="mergesort")     # stable: ties keep input order
+    g = df.groupby("t", sort=False)["up"]
+
+    tot = None
+    for sp in spans:
+        dev = df["up"] - g.transform(lambda s, _sp=sp: s.ewm(span=_sp, adjust=False).mean())
+        tot = dev if tot is None else tot + dev
+    new = (df["up"] + k * (tot / float(len(spans)))).clip(lo, hi)
+    return new.sort_index().to_numpy()                     # back to input row order
+
+
+def _cm_kwargs():
+    """Phase 14 parameters off the CLI. Shared by the inference path and by --cm_retilt,
+    so a sweep cannot silently tilt with parameters other than the ones it printed."""
+    spans = tuple(int(x) for x in str(args.cm_spans).split(",") if str(x).strip())
+    if not spans:
+        raise SystemExit("--cm_spans parsed to nothing")
+    return dict(k=args.cm_k, spans=spans, lo=args.cm_lo, hi=args.cm_hi)
+
+
+def run_cm_retilt():
+    """RETILT MODE -- Phase 14 applied to an EXISTING prediction dir, no inference.
+
+    This was the whole remaining reason 4.6__ConvictionMomentum.py existed: an A/B or a
+    k/spans sweep needs to re-tilt preds that are already on disk, and re-scoring ~1,900
+    tickers to change one scalar is absurd. It calls the SAME conviction_momentum_tilt()
+    Phase 14 uses, so the two can no longer drift apart the way two copies could.
+
+    IDEMPOTENCE (this is new, and it matters now that Phase 14 is the default): the base
+    is `pre_cm_up_prob` when that column exists, i.e. the post-neutralization pre-tilt
+    value. Pointing this at the live dir therefore RE-tilts from the same starting point
+    instead of compounding a second tilt onto an already-tilted book, which is exactly
+    what the standalone tool did if you ran it twice.
+    """
+    src = args.cm_retilt
+    ck = _cm_kwargs()
+    logging.info("RETILT: k=%.2f spans=%s clip=[%.2f,%.2f]"
+                 % (ck["k"], list(ck["spans"]), ck["lo"], ck["hi"]))
+    logging.info("  source: %s" % src)
+    if not os.path.isdir(src):
+        raise SystemExit("RETILT ABORT: source dir does not exist: %s" % src)
+    files = sorted(f for f in os.listdir(src) if f.endswith(".parquet"))
+    logging.info("  %d ticker files" % len(files))
+    if len(files) < args.cm_min_tickers:
+        raise SystemExit("RETILT ABORT: only %d files (< %d) -- %s left untouched."
+                         % (len(files), args.cm_min_tickers, src))
+
+    write = not args.cm_retilt_dry_run
+    out = args.cm_retilt_out
+    if write:
+        if os.path.abspath(out) == os.path.abspath(src):
+            raise SystemExit("RETILT ABORT: --cm_retilt_out equals the source dir; that "
+                             "would destroy the rollback base. Use --cm_retilt_apply.")
+        if os.path.isdir(out):
+            shutil.rmtree(out)
+        os.makedirs(out, exist_ok=True)
+
+    def _one(fn):
+        d = pd.read_parquet(os.path.join(src, fn))
+        if "UpProbability" not in d.columns or args.date_column not in d.columns:
+            return None
+        d[args.date_column] = pd.to_datetime(d[args.date_column])
+        d = d.sort_values(args.date_column).reset_index(drop=True)
+        based_on_pre = "pre_cm_up_prob" in d.columns
+        base_col = "pre_cm_up_prob" if based_on_pre else "UpProbability"
+        base = pd.to_numeric(d[base_col], errors="coerce").astype(np.float32)
+        new = conviction_momentum_tilt(d[args.date_column].values,
+                                       np.full(len(d), fn[:-8]), base, **ck)
+        new = new.astype(np.float32)
+        bad_nan = int(((~np.isfinite(new)) & np.isfinite(base)).sum())
+        oob = int(((new < ck["lo"] - 1e-6) | (new > ck["hi"] + 1e-6)).sum())
+        moved = int((np.abs(new.astype(np.float64) - base.astype(np.float64)) > 1e-9).sum())
+        if write:
+            d["pre_cm_up_prob"] = base
+            d["UpProbability"] = new
+            d["DownProbability"] = (1.0 - new).astype(np.float32)
+            d.to_parquet(os.path.join(out, fn), index=False)
+        return dict(ticker=fn[:-8], moved=moved, rows=len(d), nan=bad_nan, oob=oob,
+                    pre=based_on_pre, date=d[args.date_column].iloc[-1],
+                    old=float(base.iloc[-1]), new=float(new[-1]))
+
+    rows, n_nan, n_oob, n_moved, n_rows, n_pre = [], 0, 0, 0, 0, 0
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=args.cm_retilt_workers) as ex:
+        for fu in as_completed([ex.submit(_one, f) for f in files]):
+            r = fu.result()
+            if r is None:
+                continue
+            rows.append(r)
+            n_nan += r["nan"]; n_oob += r["oob"]
+            n_moved += r["moved"]; n_rows += r["rows"]; n_pre += int(r["pre"])
+    logging.info("  processed %d tickers / %d rows in %.0fs"
+                 % (len(rows), n_rows, time.time() - t0))
+    logging.info("  tilt base: %d files from pre_cm_up_prob (already-tilted source, "
+                 "re-tilted not double-tilted), %d from UpProbability"
+                 % (n_pre, len(rows) - n_pre))
+
+    # The standalone's hard gates: a tilt that emits a non-finite value, escapes the clip,
+    # or leaves the signal day inert is a BROKEN transform, not a weak one.
+    def _abort(m):
+        raise SystemExit("RETILT GATE FAILED: %s\nABORT -- %s left untouched." % (m, src))
+
+    if n_nan:
+        _abort("transform introduced %d non-finite values" % n_nan)
+    if n_oob:
+        _abort("%d values escaped the clip range" % n_oob)
+    if len(rows) < args.cm_min_tickers:
+        _abort("only %d tickers processed (< %d)" % (len(rows), args.cm_min_tickers))
+
+    S = pd.DataFrame(rows)
+    sig_date = S["date"].max()
+    sd = S[S["date"] == sig_date].copy()
+    changed = float((np.abs(sd["new"] - sd["old"]) > 1e-9).mean()) if len(sd) else 0.0
+    logging.info("  signal day %s: %d names, %.1f%% moved"
+                 % (pd.Timestamp(sig_date).date(), len(sd), 100 * changed))
+    if changed < args.cm_min_changed:
+        _abort("signal day barely moved (%.1f%% < %.0f%%) -- inert transform, short history?"
+               % (100 * changed, 100 * args.cm_min_changed))
+
+    for nm, col in (("pre-tilt ", "old"), ("post-tilt", "new")):
+        v = sd[col]
+        logging.info("  %s  min %.4f  p50 %.4f  p95 %.4f  max %.4f  sd %.4f"
+                     % (nm, v.min(), v.median(), v.quantile(.95), v.max(), v.std()))
+    b = args.cm_retilt_book
+    old_top = set(sd.nlargest(b, "old")["ticker"])
+    new_top = set(sd.nlargest(b, "new")["ticker"])
+    logging.info("  top-%d book delta: %d of %d unchanged | entering %s | leaving %s"
+                 % (b, len(old_top & new_top), b,
+                    sorted(new_top - old_top) or "-", sorted(old_top - new_top) or "-"))
+    logging.info("  NOTE: top-N is only indicative. `can_buy` fires per ticker against "
+                 "that TICKER'S OWN rolling percentile, so the tilt changes WHICH names "
+                 "trigger over time. Judge it by the backtest, not by this table.")
+    logging.info("  rows moved: %.1f%% (%d of %d)"
+                 % (100 * n_moved / max(n_rows, 1), n_moved, n_rows))
+
+    if args.cm_retilt_dry_run:
+        logging.info("--cm_retilt_dry_run: nothing written.")
+        return
+    logging.info("wrote %d files -> %s" % (len(rows), out))
+    if not args.cm_retilt_apply:
+        logging.info("--cm_retilt_apply NOT set: %s is untouched (the safe default)." % src)
+        logging.info("Backtest it with: python 5__NightlyBackTester.py --force --data_dir %s"
+                     % out)
+        return
+    roll = src.rstrip("/\\") + "_precm"
+    if os.path.isdir(roll):
+        shutil.rmtree(roll)
+    os.rename(src, roll)
+    os.rename(out, src)
+    logging.info("APPLIED: %s is now tilted (k=%.2f spans=%s). Rollback dir: %s"
+                 % (src, ck["k"], list(ck["spans"]), roll))
+
+
 def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
-                   top_frac_per_day, max_files=None, calib_path=None):
-    """Load saved model, score all tickers, write RFpredictions parquets."""
+                   top_frac_per_day, max_files=None, calib_path=None,
+                   neutralize=False, neut_kwargs=None,
+                   neut_min_tickers=1000, neut_min_changed=0.05,
+                   conviction_momentum=False, cm_kwargs=None,
+                   cm_min_tickers=1000, cm_min_changed=0.05, infer_tail=None, pool_top_n=0):
+    """Load saved model, score all tickers, write RFpredictions parquets.
+
+    With neutralize=True the written UpProbability is the Phase-13 neutralized
+    one and the un-neutralized value is kept in `raw_up_prob`. Returns a status
+    dict: {"neutralized": bool, "gate_failed": bool, ...}.
+    """
     os.makedirs(output_dir, exist_ok=True)
+    status = {"neutralized": False, "gate_failed": False}
 
     with Phase("Load saved model"):
         clf = joblib_load(model_path)
@@ -1050,6 +1937,9 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
                   # source for the ret_today alias below (models trained post-leak-guard)
                   "percent_change_close", "percent_change_Close"}
         needed |= set(raw_features) | set(xs_src)
+        needed |= {"Realized_Vol_21d"}   # limit/day features (Order 66) derive from it at inference
+        # Phase-13 factors: needed even when the model itself doesn't use them.
+        needed |= set(NEUT_FACTORS)
 
         def _load_arrow_infer(fn):
             pf = pq.ParquetFile(os.path.join(input_dir, fn))
@@ -1057,6 +1947,31 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
             if date_col not in names or pf.metadata.num_rows == 0:
                 return None
             tbl = pf.read(columns=[c for c in names if c in needed])
+            # Peak-RAM cap: keep only this ticker's most recent rows. Files are stored
+            # date-ascending, so the tail IS the recent history. No-op when unset.
+            if infer_tail and tbl.num_rows > infer_tail:
+                # take(), not slice(): a slice is zero-copy and keeps the WHOLE file's buffers
+                # alive until the concat, so 4,209 files x every row sat in RAM (35 GB on a
+                # 6-year panel at tail 300). take() materialises only the tail rows. Same rows.
+                tbl = tbl.take(pa.array(range(tbl.num_rows - infer_tail, tbl.num_rows)))
+            # Peak-RAM cap 2 (2026-09-02): the concatenated panel is ~2.1M rows x ~1,400
+            # float64 columns (~24 GB in Arrow, doubled by to_pandas), which OOMed a
+            # 63 GB box at 49.6 GB. downcast() below turns every float64 into float32
+            # anyway, so casting feature columns to float32 HERE is identical for the
+            # model; only the Phase-13 factor columns (fit in native float64) and the
+            # key/price columns keep their types.
+            _keep64 = set(NEUT_FACTORS) | {date_col, ticker_col, "Open", "High", "Low",
+                                           "Close", "Volume", "percent_change_close",
+                                           "percent_change_Close"}
+            _fields = []
+            for f in tbl.schema:
+                if pa.types.is_float64(f.type) and f.name not in _keep64:
+                    _fields.append(pa.field(f.name, pa.float32()))
+                else:
+                    _fields.append(f)
+            _target = pa.schema(_fields)
+            if _target != tbl.schema:
+                tbl = tbl.cast(_target)
             if ticker_col not in tbl.schema.names:
                 tbl = tbl.append_column(
                     ticker_col,
@@ -1079,14 +1994,21 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
         if not arrow_tables:
             raise RuntimeError("No ticker data loaded for inference.")
 
-        # Single concat + single to_pandas() — avoids 4265 individual GIL hits
+        # Single concat + single to_pandas() - avoids 4265 individual GIL hits
         try:
-            combined = pa.concat_tables(arrow_tables, promote_options="default").to_pandas()
+            _big = pa.concat_tables(arrow_tables, promote_options="default")
+            del arrow_tables
+            # self_destruct releases each Arrow buffer as its pandas block is built,
+            # so the peak is ~1x the table instead of ~2x.
+            combined = _big.to_pandas(split_blocks=True, self_destruct=True)
+            del _big
         except Exception:
             combined = pd.concat([t.to_pandas() for t in arrow_tables], ignore_index=True)
-        del arrow_tables
+            del arrow_tables
 
         combined[date_col] = pd.to_datetime(combined[date_col])
+        if "dow" in raw_features and "dow" not in combined.columns:
+            combined["dow"] = combined[date_col].dt.dayofweek.astype(np.float32)
         # v2 FeatureFramework emits lowercase 'vix_close'; the backtester and the
         # RFpredictions output schema require uppercase 'VIX_Close'. Alias so
         # inference carries it through (otherwise the backtester drops the universe).
@@ -1100,11 +2022,46 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
                 if _src in combined.columns:
                     combined["ret_today"] = combined[_src]
                     break
+        if "lim_depth" in raw_features and "lim_depth" not in combined.columns:
+            add_limit_features(combined, "Realized_Vol_21d", 1.5)
+        if "day_n" in raw_features and "day_n" not in combined.columns:
+            add_day_features(combined, date_col, "Realized_Vol_21d", k=1.5)
+        # Phase 13 fits its per-day regression on the panel's native float64 factor
+        # values; downcast() below rounds every float64 column to float32, so stash
+        # them first (and carry the stash through the sort by the frame's own index).
+        neut_f64 = None
+        if neutralize:
+            neut_f64 = {c: (combined[c].to_numpy(np.float64, copy=True)
+                            if c in combined.columns
+                            else np.full(len(combined), np.nan))
+                        for c in NEUT_FACTORS}
         combined = downcast(combined)
-        combined = combined.sort_values(date_col).reset_index(drop=True)
+        # Sort by taking positions, not sort_values + reset_index: the latter leaves a
+        # shuffled index whose reset_index(drop=True) deep-copies and consolidates every
+        # float32 column into ONE contiguous block (703 cols x 3.06M rows = 8.02 GiB), on
+        # top of the frame already resident. That OOM'd the 2026-08-13 nightly run. .take()
+        # with a RangeIndex reaches the same row order at one block-wise copy.
+        # kind must stay "quicksort": that is what sort_values() used, and the tie order
+        # within a date is part of the contract downstream (verified row-identical; the
+        # stable/mergesort variants reorder ties and do NOT reproduce the old frame).
+        _pos = np.argsort(combined[date_col].to_numpy(), kind="quicksort")
+        combined = combined.take(_pos)
+        combined.index = pd.RangeIndex(len(combined))
+        if neut_f64 is not None:
+            neut_f64 = {k: v[_pos] for k, v in neut_f64.items()}
         logging.info(f"  combined: {combined.shape}  "
                      f"{combined[ticker_col].nunique()} tickers  "
                      f"{combined[date_col].nunique()} dates")
+        if _diag.enabled():
+            _diag.stamp("4__Predictor")
+            _diag.dump_json("P_load", {"n_files": len(files), "rows": int(len(combined)),
+                                       "tickers": int(combined[ticker_col].nunique()),
+                                       "dates": int(combined[date_col].nunique()), "infer_tail": infer_tail,
+                                       "model_features": len(feat_names), "raw": len(raw_features),
+                                       "xs": len(xs_features), "columns_loaded": int(len(combined.columns)),
+                                       "calibrator": ({"a": calibrator.a, "b": calibrator.b, "c": calibrator.c}
+                                                      if calibrator is not None else None)})
+            _diag.dump_parquet("P_rows_by_day", combined.groupby(date_col).size().reset_index(name="n"))
 
     with Phase("Universe filter (mark, don't drop)"):
         _, quality_mask = apply_quality_filter(combined)
@@ -1113,12 +2070,21 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
                      f"({100*n_pass/len(combined):.1f}%)")
 
     with Phase("Fill missing model features"):
-        for c in raw_features:
-            if c not in combined.columns:
-                combined[c] = 0.0
-        for c in xs_src:
-            if c not in combined.columns:
-                combined[c] = 0.0
+        # A feature the model expects but the panel lacks becomes a constant 0.0 (and
+        # its _xs rank a constant 0.5). Same effect as before; now counted and logged.
+        missing_raw = [c for c in raw_features if c not in combined.columns]
+        missing_xs = [c for c in xs_src if c not in combined.columns]
+        for c in missing_raw:
+            combined[c] = 0.0
+        for c in missing_xs:
+            combined[c] = 0.0
+        if missing_raw or missing_xs:
+            logging.warning(f"  ZERO-FILLED {len(missing_raw)} raw + {len(missing_xs)} xs-source model "
+                            f"features absent from the panel: "
+                            f"{(missing_raw + missing_xs)[:12]}{' ...' if len(missing_raw) + len(missing_xs) > 12 else ''}")
+        _diag.dump_json("P_zero_fill", {"missing_raw": missing_raw, "missing_xs_src": missing_xs,
+                                        "n_missing": len(missing_raw) + len(missing_xs),
+                                        "n_model_features": len(feat_names)})
 
     with Phase("Build prediction matrix X (mem-efficient: batched f32 xs-rank, no concat)"):
         # Build X directly as ONE float32 array in feat_names order: raw features copy from
@@ -1152,6 +2118,13 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
                 del rv
         np.putmask(X, ~np.isfinite(X), np.nan)    # inf -> nan (XGBoost missing)
         logging.info(f"  built X {X.shape} ({len(xs_idx)} xs cols, mem-efficient)")
+        if _diag.enabled():
+            # NaN share on a row stride, not the full 16 GiB matrix.
+            _sub = X[::97]
+            _diag.dump_json("P_matrix", {"shape": [int(v) for v in X.shape], "n_xs_cols": len(xs_idx),
+                                         "n_quality_rows": int(qmask.sum()), "n_pinned_rows": int((~qmask).sum()),
+                                         "nan_share_sampled": float(np.isnan(_sub).mean()),
+                                         "nan_share_sample_rows": int(len(_sub))})
 
     with Phase("Predict"):
         scores = clf.predict_proba(X)[:, 1].astype(np.float32)
@@ -1165,6 +2138,12 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
                          f"max={scores_cal.max():.4f}")
         else:
             scores_cal = scores
+        if _diag.enabled():
+            _pc = [0, 1, 5, 25, 50, 75, 95, 99, 100]
+            _diag.dump_json("P_scores", {"percentiles": _pc,
+                                         "raw": [float(v) for v in np.percentile(scores, _pc)],
+                                         "cal": [float(v) for v in np.percentile(scores_cal, _pc)],
+                                         "calibrated": calibrator is not None})
 
     with Phase("Rescale scores to backtester UpProbability"):
         pct_rank = np.zeros(len(combined), dtype=np.float32)
@@ -1189,6 +2168,141 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
         n_days = combined[date_col].nunique()
         logging.info(f"  fires: {n_fire:,}  avg {n_fire/max(n_days,1):.1f}/day "
                      f"over {n_days} dates")
+        if _diag.enabled():
+            _fb = pd.DataFrame({"Date": combined[date_col].values, "q": quality_mask.values,
+                                "f": (up_pred == 1)})
+            _diag.dump_parquet("P_fires_by_day",
+                               _fb.groupby("Date").agg(n_rows=("q", "size"), n_quality=("q", "sum"),
+                                                       n_fire=("f", "sum")).reset_index())
+
+    raw_up = None
+    if neutralize:
+        with Phase("Phase 13: Pred-space factor neutralization"):
+            # Neutralize the values that would actually ship (post-clip float32), so the
+            # result is a permutation of the shipped per-day marginal, exactly as the old
+            # standalone stage produced it by re-reading the written parquets.
+            raw_up = np.clip(up_prob, 0.01, 0.99).astype(np.float32)
+            n_tick = int(combined[ticker_col].nunique())
+            try:
+                if n_tick < neut_min_tickers:
+                    raise RuntimeError("only %d tickers scored (< %d) -- universe/panel "
+                                       "looks broken" % (n_tick, neut_min_tickers))
+                cov = {c: float(np.isfinite(neut_f64[c]).mean()) for c in NEUT_FACTORS}
+                logging.info("  factor coverage: %s"
+                             % {c: round(v, 3) for c, v in cov.items()})
+                # A factor the panel doesn't carry gets median-filled to a constant and
+                # contributes NOTHING to the projection. That is a silently-dead leg, so
+                # say it out loud (it is not a gate failure -- the shipped/validated
+                # overlay has been running this way; see the 2026-07-27 note in README).
+                dead = [c for c, v in cov.items() if v <= 0.0]
+                if dead:
+                    logging.warning("  factors with ZERO coverage (inert, no effect on the "
+                                    "projection): %s" % dead)
+                new_up, meta = neutralize_upprob(
+                    combined[date_col].values, combined[ticker_col].values,
+                    raw_up, scores, neut_f64, **(neut_kwargs or {}))
+
+                # GATE: the signal day must actually be neutralized (stale-panel guard)
+                last_day = combined[date_col].max()
+                ld = combined[date_col].values == np.datetime64(last_day)
+                changed = float((np.abs(new_up[ld].astype(np.float64)
+                                        - raw_up[ld].astype(np.float64)) > 1e-9).mean())
+                logging.info("  signal-day (%s) neutralization: %.1f%% of %d names changed"
+                             % (pd.Timestamp(last_day).date(), 100 * changed, int(ld.sum())))
+                if changed < neut_min_changed:
+                    raise RuntimeError("signal day looks UN-neutralized (%.1f%% < %.0f%%) "
+                                       "-- factor panel stale?"
+                                       % (100 * changed, 100 * neut_min_changed))
+
+                up_prob = new_up.astype(np.float64)
+                status["neutralized"] = True
+                status["neut"] = meta
+                logging.info("  dose %s applied over %d days" % (meta["dose_desc"],
+                                                                 meta["n_days"]))
+                _diag.dump_json("P_neut", dict(meta, signal_day_changed=changed, signal_day=str(last_day)[:10],
+                                               factor_coverage=cov, dead_factors=dead, n_tickers=n_tick,
+                                               gate_failed=False))
+            except Exception as e:
+                # FAIL-SAFE: ship the RAW preds and flag it. main() exits non-zero so the
+                # nightly runner alerts, but the backtester still gets a usable signal.
+                raw_up = None
+                status["gate_failed"] = True
+                status["neut_error"] = str(e)
+                _diag.dump_json("P_neut", {"gate_failed": True, "error": str(e), "n_tickers": n_tick})
+                logging.error("  NEUTRALIZATION GATE FAILED: %s" % e)
+                logging.error("  -> shipping RAW predictions (safe degrade); "
+                              "the predictor will exit non-zero.")
+
+    pre_cm_up = None
+    if conviction_momentum:
+        with Phase("Phase 14: Conviction-momentum tilt"):
+            # Tilt the values that would actually ship, i.e. AFTER Phase 13. The
+            # standalone stage read the written parquets, so it always saw the
+            # post-clip float32 value -- match that or the two disagree in the
+            # last decimal and the A/B stops being an A/B.
+            pre_cm_up = np.clip(up_prob, 0.01, 0.99).astype(np.float32)
+            n_tick = int(combined[ticker_col].nunique())
+            ck = dict(cm_kwargs or {})
+            try:
+                if n_tick < cm_min_tickers:
+                    raise RuntimeError("only %d tickers scored (< %d) -- universe/panel "
+                                       "looks broken" % (n_tick, cm_min_tickers))
+                new_up = conviction_momentum_tilt(
+                    combined[date_col].values, combined[ticker_col].values,
+                    pre_cm_up, **ck)
+
+                # The standalone's two hard gates, kept verbatim in spirit: a tilt
+                # that emits a non-finite value or escapes the clip is a broken
+                # transform, not a weak one.
+                bad_nan = int(((~np.isfinite(new_up)) & np.isfinite(pre_cm_up)).sum())
+                if bad_nan:
+                    raise RuntimeError("tilt introduced %d non-finite values" % bad_nan)
+                oob = int(((new_up < ck.get("lo", 0.30) - 1e-6)
+                           | (new_up > ck.get("hi", 0.70) + 1e-6)).sum())
+                if oob:
+                    raise RuntimeError("%d values escaped the clip range" % oob)
+
+                # GATE: the signal day must actually move (short-history guard)
+                last_day = combined[date_col].max()
+                ld = combined[date_col].values == np.datetime64(last_day)
+                changed = float((np.abs(new_up[ld].astype(np.float64)
+                                        - pre_cm_up[ld].astype(np.float64)) > 1e-9).mean())
+                logging.info("  signal-day (%s) tilt: %.1f%% of %d names moved"
+                             % (pd.Timestamp(last_day).date(), 100 * changed, int(ld.sum())))
+                if changed < cm_min_changed:
+                    raise RuntimeError("signal day barely moved (%.1f%% < %.0f%%) -- inert "
+                                       "transform, short history?"
+                                       % (100 * changed, 100 * cm_min_changed))
+
+                rising = float((new_up[ld] > pre_cm_up[ld]).mean())
+                logging.info("  rising-conviction names today: %.1f%% | mean |delta| %.5f"
+                             % (100 * rising,
+                                float(np.abs(new_up[ld] - pre_cm_up[ld]).mean())))
+                up_prob = new_up.astype(np.float64)
+                status["conviction_momentum"] = True
+                status["cm"] = dict(ck, n_tickers=n_tick, signal_day_changed=changed)
+                logging.info("  applied k=%.2f spans=%s clip=[%.2f,%.2f] over %d tickers"
+                             % (ck.get("k", 0.5), list(ck.get("spans", (3, 6, 12))),
+                                ck.get("lo", 0.30), ck.get("hi", 0.70), n_tick))
+                _diag.dump_json("P_cm", dict(status["cm"], signal_day=str(last_day)[:10], rising_share=rising,
+                                             mean_abs_delta=float(np.abs(new_up[ld] - pre_cm_up[ld]).mean()),
+                                             gate_failed=False))
+            except Exception as e:
+                # FAIL-SAFE, matching Phase 13: ship the un-tilted preds and flag it.
+                pre_cm_up = None
+                status["gate_failed"] = True
+                status["cm_error"] = str(e)
+                _diag.dump_json("P_cm", {"gate_failed": True, "error": str(e), "n_tickers": n_tick})
+                logging.error("  CONVICTION-MOMENTUM GATE FAILED: %s" % e)
+                logging.error("  -> shipping UN-TILTED predictions (safe degrade); "
+                              "the predictor will exit non-zero.")
+
+    if pool_top_n and pool_top_n > 0:
+        with Phase("Pool cap: top-%d names per day" % pool_top_n):
+            _rk = pd.Series(up_prob).groupby(combined[date_col].values).rank(ascending=False, method="first").values
+            _cut = (_rk > pool_top_n) & (up_prob >= 0.40)
+            up_prob = np.where(_cut, 0.30, up_prob)
+            logging.info("  pool cap: floored %s rows at/above 0.40 to 0.30" % format(int(_cut.sum()), ","))
 
     with Phase("Write per-ticker parquets to RFpredictions"):
         combined["UpProbability"]     = np.clip(up_prob, 0.01, 0.99).astype(np.float32)
@@ -1199,12 +2313,22 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
         combined["raw_score"]         = scores
         if calibrator is not None:
             combined["cal_score"] = scores_cal
+        if raw_up is not None:
+            # Phase 13 ran: keep the un-neutralized UpProbability alongside it. This
+            # replaces the old RFpredictions -> RFpredictions_raw directory swap --
+            # every row now carries its own rollback value.
+            combined["raw_up_prob"] = raw_up
+        if pre_cm_up is not None:
+            # Phase 14 ran: the post-neutralization, pre-tilt value. Same rollback
+            # contract as raw_up_prob, and the same column name the standalone
+            # 4.6 stage wrote, so anything reading it keeps working.
+            combined["pre_cm_up_prob"] = pre_cm_up
 
         base_out = [date_col, "Open", "High", "Low", "Close", "Volume",
                     "UpProbability", "DownProbability",
                     "PositiveThreshold", "NegativeThreshold",
                     "UpPrediction", "raw_score"]
-        optional = ["VIX_Close", "Distance to Resistance (%)",
+        optional = ["raw_up_prob", "pre_cm_up_prob", "VIX_Close", "Distance to Resistance (%)",
                     "Distance to Support (%)", "volatility"]
         out_cols = [c for c in base_out + optional if c in combined.columns]
 
@@ -1236,11 +2360,17 @@ def run_inference(model_path, input_dir, output_dir, date_col, ticker_col,
                     _harvest(done)
             _harvest(as_completed(inflight))
         pbar.close()
-        logging.info(f"  wrote {n_written:,} ticker parquets to {output_dir}")
+        logging.info(f"  wrote {n_written:,} ticker parquets to {output_dir}"
+                     + (f"  [NEUTRALIZED: dose {status['neut']['dose_desc']}]"
+                        if status["neutralized"] else "  [RAW: no neutralization]"))
+    return status
+
+
+
 
 
 # -------------------------------------------------------------------------- #
-# OOS decay harness — measure true out-of-sample generalization              #
+# OOS decay harness - measure true out-of-sample generalization              #
 # -------------------------------------------------------------------------- #
 # Rank bands are defined on the per-day percentile rank of the model score
 # (0 = worst score that day, 1 = best). The strategy trades the top ~1%, so the
@@ -1268,7 +2398,7 @@ def oos_band_stats(split_df, lo, hi, ret_col, label_col, rank_col, date_col):
     """Per-band stats for one split. Returns a dict of metrics.
 
     per-day mean return = average across days of (that day's mean return for the
-    band) — this is the strategy-relevant number (each day you hold the band).
+    band) - this is the strategy-relevant number (each day you hold the band).
     """
     m = (split_df[rank_col] >= lo) & (split_df[rank_col] < hi)
     sub = split_df.loc[m]
@@ -1351,7 +2481,7 @@ def run_oos_evaluation():
             args.input_dir, target_col, date_col, args.horizon_5d,
             max_files=args.oos_max_tickers)
         if not parts:
-            logging.error("No data loaded — check --input_dir")
+            logging.error("No data loaded - check --input_dir")
             return
         df = pd.concat(parts, ignore_index=True)
         del parts
@@ -1383,7 +2513,7 @@ def run_oos_evaluation():
             logging.info(f"  boundary check vs summary.json train_rows="
                          f"{expected_train_rows:,}: {match}"
                          + ("" if match == "EXACT" else
-                            "  (data snapshot changed since training — boundaries approximate)"))
+                            "  (data snapshot changed since training - boundaries approximate)"))
 
     with Phase("OOS: build model feature matrix"):
         for c in raw_features:
@@ -1412,7 +2542,7 @@ def run_oos_evaluation():
     oos_df   = df[df[date_col] > calib_end_date]
 
     if len(oos_df) == 0:
-        logging.error("  OOS slice is empty — no data after the calib window. "
+        logging.error("  OOS slice is empty - no data after the calib window. "
                       "Lower --runpercent/--calibpercent or add fresher data.")
         return
 
@@ -1427,18 +2557,18 @@ def run_oos_evaluation():
     scores_out.to_parquet(out_scores, index=False)
 
     # Build the report.
-    lines = ["=" * 92, "OOS DECAY REPORT — true out-of-sample generalization", "=" * 92,
+    lines = ["=" * 92, "OOS DECAY REPORT - true out-of-sample generalization", "=" * 92,
              f"Model:    {model_path}",
              f"Features: {len(feat_names)}   Label: topq (top_frac={args.topq_frac})   "
              f"rank = per-day percentile of model score",
              ""]
-    lines += oos_band_table_lines(is_df, "IS / TRAIN (in-sample — fit-optimistic)",
+    lines += oos_band_table_lines(is_df, "IS / TRAIN (in-sample - fit-optimistic)",
                                   "_ret", "_label", "_rank", date_col)
     lines.append("")
-    lines += oos_band_table_lines(calib_df, "CALIB (near-OOS — used for threshold/calib only)",
+    lines += oos_band_table_lines(calib_df, "CALIB (near-OOS - used for threshold/calib only)",
                                   "_ret", "_label", "_rank", date_col)
     lines.append("")
-    lines += oos_band_table_lines(oos_df, "OOS (TRUE HOLDOUT — never seen in train or calib)",
+    lines += oos_band_table_lines(oos_df, "OOS (TRUE HOLDOUT - never seen in train or calib)",
                                   "_ret", "_label", "_rank", date_col)
 
     # Headline decay: calib -> oos and train -> oos for the key bands.
@@ -1470,7 +2600,7 @@ def run_oos_evaluation():
 
 
 # -------------------------------------------------------------------------- #
-# Walk-forward OOS engine — judge configs across many independent windows     #
+# Walk-forward OOS engine - judge configs across many independent windows     #
 # -------------------------------------------------------------------------- #
 def is_regime_feature(name):
     """True for features that may encode the prevailing market regime (and so
@@ -1494,7 +2624,7 @@ def wf_config_spec(name, df, date_col, sorted_dates, feat_names, anchor):
     """Return (train_mask, feature_subset, half_life_days) for a named config.
 
     train_mask selects rows used to fit; feature_subset the columns; half_life
-    the recency-weight decay. Only the data/feature/weight treatment varies —
+    the recency-weight decay. Only the data/feature/weight treatment varies - 
     XGB params are held fixed so the comparison isolates the regime-adaptation
     lever.
     """
@@ -1544,7 +2674,7 @@ def run_walkforward_oos():
         parts = load_and_label_tickers(args.input_dir, target_col, date_col,
                                        args.horizon_5d, max_files=args.wf_max_tickers)
         if not parts:
-            logging.error("No data loaded — check --input_dir")
+            logging.error("No data loaded - check --input_dir")
             return
         df = pd.concat(parts, ignore_index=True)
         del parts
@@ -1631,7 +2761,7 @@ def run_walkforward_oos():
 
     # ---- report ----
     lines = ["=" * 100,
-             "WALK-FORWARD OOS — per-day mean return NET of bottom-50% market-drift baseline",
+             "WALK-FORWARD OOS - per-day mean return NET of bottom-50% market-drift baseline",
              "=" * 100,
              f"Configs: {configs}   anchors: {len(anchors)}   trees: {args.wf_trees} (fixed, no tune)",
              "Each row = train on config slice up to anchor month-end, OOS = the FOLLOWING month.",
@@ -1666,7 +2796,7 @@ def run_walkforward_oos():
                      f"{sm:>18.4f} {smd:>9.4f} {sw_*100:>5.0f}%")
     lines += ["",
               "top1_net = strategy-relevant (fires top ~1%). A config wins if it raises pooled",
-              "top1_net mean AND win% vs baseline across independent OOS windows — not one month.",
+              "top1_net mean AND win% vs baseline across independent OOS windows - not one month.",
               "=" * 100]
 
     report = "\n".join(lines)
@@ -1678,7 +2808,7 @@ def run_walkforward_oos():
 
 
 # -------------------------------------------------------------------------- #
-# Walk-forward PARAM SWEEP — parallel, multi-seed, isolates the overfit lever  #
+# Walk-forward PARAM SWEEP - parallel, multi-seed, isolates the overfit lever  #
 # -------------------------------------------------------------------------- #
 # All configs train on identical baseline data (all history up to anchor, all
 # features, 720d half-life). Only XGB hyperparameters vary, so any difference is
@@ -1722,14 +2852,38 @@ def _sweep_band_nets(scores, lo, hi, dates_all, ret_all):
     return top1 - base, shou - base
 
 
-def run_walkforward_sweep():
-    """Parallel, multi-seed walk-forward sweep over XGB hyperparameter configs.
+def parse_window_spec(spec):
+    """Parse a --wf_sweep_windows token into (n_days, half_life_days).
 
-    Isolates the overfitting lever: every config trains on the SAME baseline data
-    (all history up to each anchor, all features, 720d recency) and is scored on
-    the following month; only the hyperparameters differ. Each (config, anchor) is
-    fit with `wf_seeds` seeds and averaged to beat the ~0.02 hist nondeterminism.
-    Fits run concurrently in threads (XGB releases the GIL).
+    'full'        -> (None, 720.0)    all history up to the anchor
+    'full180'     -> (None, 180.0)    all history, faster forgetting
+    'w252'        -> (252,  720.0)    last 252 trading days only
+    'w126hl90'    -> (126,   90.0)
+    n_days=None means "no hard cutoff"; the half-life is the soft one.
+    """
+    s = spec.strip().lower()
+    m = re.fullmatch(r"full(\d+(?:\.\d+)?)?", s)
+    if m:
+        return None, float(m.group(1)) if m.group(1) else 720.0
+    m = re.fullmatch(r"w(\d+)(?:hl(\d+(?:\.\d+)?))?", s)
+    if m:
+        return int(m.group(1)), float(m.group(2)) if m.group(2) else 720.0
+    raise ValueError(f"bad window spec '{spec}'. Expected full / full<HL> / w<K> / w<K>hl<HL>")
+
+
+def run_walkforward_sweep():
+    """Parallel, multi-seed walk-forward sweep over XGB hyperparameter configs
+    CROSSED with training-window specs.
+
+    Every (config, window) cell is scored on the same following month; only the
+    hyperparameters and the training slice differ. The crossing matters because
+    complexity and window length are coupled -- a longer window buys samples but
+    imports more non-stationarity, so the best depth/regularization is a function
+    of the window and vice versa. Sweeping either one alone (the old behaviour,
+    reproduced by the default --wf_sweep_windows full720) can only see a marginal
+    of that surface. Each cell is fit with `wf_seeds` seeds and averaged to beat
+    the ~0.02 hist nondeterminism. Fits run concurrently in threads (XGB releases
+    the GIL).
     """
     date_col, target_col = args.date_column, args.target_column
     out_report  = os.path.join(args.model_dir, "walkforward_sweep_report.txt")
@@ -1738,6 +2892,9 @@ def run_walkforward_sweep():
     for c in configs:
         if c not in SWEEP_CONFIGS:
             raise ValueError(f"unknown sweep config '{c}'. Known: {list(SWEEP_CONFIGS)}")
+    windows = [w.strip() for w in args.wf_sweep_windows.split(",") if w.strip()]
+    window_spec = {w: parse_window_spec(w) for w in windows}
+    combos = [f"{c}@{w}" for c in configs for w in windows]
 
     with Phase("SWEEP: load + label all tickers"):
         parts = load_and_label_tickers(args.input_dir, target_col, date_col,
@@ -1755,6 +2912,12 @@ def run_walkforward_sweep():
 
     with Phase("SWEEP: build feature matrix (base + xs ranks)"):
         base_cols = select_base_features(df)
+        if args.wf_feature_file:
+            keep = set(open(args.wf_feature_file).read().split())
+            before = len(base_cols)
+            base_cols = [c for c in base_cols if c in keep]
+            logging.info(f"  --wf_feature_file: {before} -> {len(base_cols)} base features "
+                         f"({len(keep - set(base_cols))} listed names absent from panel)")
         if USE_XS:
             df = add_xs_rank_features(df, base_cols, date_col)
             feat_names = base_cols + [c + "_xs" for c in base_cols]
@@ -1775,10 +2938,11 @@ def run_walkforward_sweep():
     # anchors: month m -> train<=last date of m, OOS = month m+1
     months = sorted(pd.unique(ym_all))
     min_anchor = str(pd.Period(args.wf_min_anchor, freq="M"))
+    max_anchor = str(pd.Period(args.wf_max_anchor, freq="M")) if args.wf_max_anchor else None
     anchors = []
     for i in range(len(months) - 1):
         m, nxt = months[i], months[i + 1]
-        if m < min_anchor:
+        if m < min_anchor or (max_anchor and m > max_anchor):
             continue
         if (ym_all == nxt).sum() == 0:
             continue
@@ -1796,33 +2960,83 @@ def run_walkforward_sweep():
     # recency weights (depend only on anchor, not config/seed), and the contiguous
     # OOS row-range. This removes the GIL-held 1.15GB fancy-index copy that was
     # serializing the threaded fits.
-    anchor_info = {}   # m -> (k, sw, oos_lo, oos_hi, oos_period)
+    # The OOS row-range depends only on the anchor; the training slice and its
+    # recency weights depend on (anchor, window). Both are precomputed so the
+    # threaded fits never hold the GIL building them.
+    uniq_days = np.unique(dates_all)
+    anchor_oos = {}    # m -> (oos_lo, oos_hi, oos_period)
+    slice_info = {}    # (m, win) -> (lo, k, sw)
     for (m, anchor_date, nxt) in anchors:
-        k = int(np.searchsorted(dates_all, anchor_date, side="right"))
-        sw = recency_weights(pd.Series(dates_all[:k]), 720.0)
         oi = np.where(ym_all == nxt)[0]
-        anchor_info[m] = (k, sw, int(oi[0]), int(oi[-1]) + 1, nxt)
+        anchor_oos[m] = (int(oi[0]), int(oi[-1]) + 1, nxt)
+        k = int(np.searchsorted(dates_all, anchor_date, side="right"))
+        for win in windows:
+            n_days, hl = window_spec[win]
+            if n_days is None:
+                lo = 0
+            else:
+                prior = uniq_days[uniq_days <= anchor_date]
+                floor = prior[-n_days] if len(prior) >= n_days else prior[0]
+                lo = int(np.searchsorted(dates_all, floor, side="left"))
+            sw = recency_weights(pd.Series(dates_all[lo:k]), hl)
+            slice_info[(m, win)] = (lo, k, sw)
 
-    jobs = [(cfg, m, seed)
-            for cfg in configs
+    # ANCHOR-MAJOR order: every cell of one anchor finishes before the next anchor
+    # starts, so a partial/interrupted run still has COMPLETE paired anchors --
+    # which is what the (config x window) interaction contrast needs. Cell-major
+    # order would leave one config fully done and the rest empty: unusable.
+    jobs = [(cfg, win, m, seed)
             for (m, _ad, _nxt) in anchors
-            for seed in range(args.wf_seeds)]
-    logging.info(f"  total fits: {len(jobs)}")
+            for seed in range(args.wf_seeds)
+            for cfg in configs
+            for win in windows]
+    logging.info(f"  total fits: {len(jobs)}  "
+                 f"({len(configs)} configs x {len(windows)} windows x "
+                 f"{len(anchors)} anchors x {args.wf_seeds} seeds)")
+
+    # Crash/restart resume: every finished fit is appended to a JSONL as it lands,
+    # so an interrupted run (reboot, OOM, Ctrl-C) resumes instead of restarting
+    # from zero. A full sweep is hours of fits; losing them to a reboot is not ok.
+    ckpt_path = os.path.join(args.model_dir, "sweep_partial.jsonl")
+    done_rows, done_keys = [], set()
+    if os.path.exists(ckpt_path):
+        with open(ckpt_path) as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue        # torn last line from a hard kill
+                k = (r["config"], r["anchor_month"], r["seed"])
+                if k in done_keys:
+                    continue
+                done_keys.add(k)
+                done_rows.append(r)
+        jobs = [j for j in jobs
+                if (f"{j[0]}@{j[1]}", j[2], j[3]) not in done_keys]
+        logging.info(f"  RESUME: {len(done_rows)} fits already in {ckpt_path}; "
+                     f"{len(jobs)} left to run")
+    ckpt_lock = threading.Lock()
+    ckpt_fh = open(ckpt_path, "a")
 
     def _one(job):
-        cfg, m, seed = job
-        k, sw, olo, ohi, oos_period = anchor_info[m]
+        cfg, win, m, seed = job
+        olo, ohi, oos_period = anchor_oos[m]
+        lo, k, sw = slice_info[(m, win)]
         params = dict(SWEEP_CONFIGS[cfg])
         n_est = params.pop("n_estimators", 300)
         clf = XGBClassifier(n_estimators=n_est, tree_method="hist",
                             objective="binary:logistic", eval_metric="aucpr",
                             device=args.wf_device, n_jobs=args.wf_threads,
                             random_state=1000 + seed, **params)
-        clf.fit(Xall[:k], y_all[:k], sample_weight=sw)      # views, zero-copy
+        clf.fit(Xall[lo:k], y_all[lo:k], sample_weight=sw)  # views, zero-copy
         sc = clf.predict_proba(Xall[olo:ohi])[:, 1]
         t1n, shn = _sweep_band_nets(sc, olo, ohi, dates_all, ret_all)
-        return {"config": cfg, "oos_month": oos_period, "seed": seed,
-                "train_rows": int(k), "top1_net": t1n, "shoulder_net": shn}
+        return {"config": f"{cfg}@{win}", "base_config": cfg, "window": win,
+                "anchor_month": m, "oos_month": oos_period, "seed": seed,
+                "train_rows": int(k - lo), "top1_net": t1n, "shoulder_net": shn}
 
     rows = []
     done = 0
@@ -1834,6 +3048,10 @@ def run_walkforward_sweep():
                 try:
                     r = fut.result()
                     rows.append(r)
+                    with ckpt_lock:
+                        ckpt_fh.write(json.dumps(r) + "\n")
+                        ckpt_fh.flush()
+                        os.fsync(ckpt_fh.fileno())
                     if done % max(1, len(jobs) // 20) == 0 or done == len(jobs):
                         logging.info(f"  [{done}/{len(jobs)}] {r['config']:<12} "
                                      f"{r['oos_month']} s{r['seed']}: top1_net={r['top1_net']:+.4f}")
@@ -1841,7 +3059,11 @@ def run_walkforward_sweep():
                     j = futs[fut]
                     logging.warning(f"  job {j[0]}@{j[2]} s{j[3]} failed: {repr(e)[:120]}")
 
-    res = pd.DataFrame(rows)
+    ckpt_fh.close()
+    res = pd.DataFrame(done_rows + rows)
+    if res.empty:
+        logging.error("SWEEP: no results (all fits failed?)")
+        return
     res.to_parquet(out_parquet, index=False)
 
     # Seed-average per (config, anchor), then pool across anchors.
@@ -1852,15 +3074,17 @@ def run_walkforward_sweep():
                      .reset_index())
 
     lines = ["=" * 104,
-             "WALK-FORWARD PARAM SWEEP — seed-averaged top1_net (per-day mean ret NET of bot-50% baseline)",
+             "WALK-FORWARD PARAM SWEEP - seed-averaged top1_net (per-day mean ret NET of bot-50% baseline)",
              "=" * 104,
-             f"configs={configs}  anchors={len(anchors)}  seeds={args.wf_seeds}  "
-             f"(identical baseline data; only XGB params vary)",
+             f"configs={configs}  windows={windows}  anchors={len(anchors)}  "
+             f"seeds={args.wf_seeds}  (complexity x training-window, crossed)",
              ""]
-    # per-config per-anchor (seed-averaged) detail
-    for cfg in configs:
-        c = per_anchor[per_anchor["config"] == cfg].sort_values("oos_month")
-        lines.append(f"### {cfg} ###   (params: {SWEEP_CONFIGS[cfg]})")
+    # per-cell per-anchor (seed-averaged) detail
+    for cell in combos:
+        cfg, win = cell.split("@")
+        c = per_anchor[per_anchor["config"] == cell].sort_values("oos_month")
+        lines.append(f"### {cell} ###   (window: {window_spec[win]}  "
+                     f"params: {SWEEP_CONFIGS[cfg]})")
         lines.append(f"  {'OOS month':<10} {'top1_net%':>10} {'seed_std':>9} {'shoulder%':>10}")
         for _, r in c.iterrows():
             lines.append(f"  {r['oos_month']:<10} {r['top1_net']:>10.4f} "
@@ -1872,21 +3096,60 @@ def run_walkforward_sweep():
               f"  {'config':<13} {'anchors':>7} {'top1_net mean':>14} {'median':>9} {'win%':>6} "
               f"{'anchor_std':>11} {'avg_seed_std':>13} {'shoulder mean':>14}"]
     summ = []
-    for cfg in configs:
-        c = per_anchor[per_anchor["config"] == cfg]
+    for cell in combos:
+        c = per_anchor[per_anchor["config"] == cell]
         if len(c) == 0:
             continue
         t = c["top1_net"]
-        summ.append((cfg, len(c), t.mean(), t.median(), (t > 0).mean(),
+        summ.append((cell, len(c), t.mean(), t.median(), (t > 0).mean(),
                      t.std(), c["top1_std"].mean(), c["shoulder_net"].mean()))
-    for cfg, n, tm, tmd, tw, tstd, sds, sm in sorted(summ, key=lambda x: -x[2]):
-        lines.append(f"  {cfg:<13} {n:>7} {tm:>14.4f} {tmd:>9.4f} {tw*100:>5.0f}% "
+    for cell, n, tm, tmd, tw, tstd, sds, sm in sorted(summ, key=lambda x: -x[2]):
+        lines.append(f"  {cell:<13} {n:>7} {tm:>14.4f} {tmd:>9.4f} {tw*100:>5.0f}% "
                      f"{tstd:>11.4f} {sds:>13.4f} {sm:>14.4f}")
     lines += ["",
               "top1_net = strategy-relevant. avg_seed_std = the nondeterminism noise floor for a",
               "single fit; anchor_std = month-to-month dispersion. A config genuinely beats another",
               "only if the gap exceeds ~avg_seed_std/sqrt(seeds). prod_optuna = live config (to beat).",
               "=" * 104]
+
+    # ---- COUPLING PANEL: complexity x window, and the interaction contrast ----
+    # Paired per anchor (same OOS month, same seeds) so the month-to-month
+    # dispersion -- which dwarfs the effect -- cancels out of every contrast.
+    if len(configs) > 1 and len(windows) > 1:
+        cell_mean = {}
+        wide = per_anchor.pivot_table(index="oos_month", columns="config",
+                                      values="top1_net")
+        for cell in combos:
+            cell_mean[cell] = wide[cell].mean() if cell in wide else float("nan")
+        lines += ["", "=" * 104,
+                  "COUPLING PANEL - pooled top1_net by (config x window)", "=" * 104,
+                  "  " + " " * 14 + "".join(f"{w:>14}" for w in windows)]
+        for cfg in configs:
+            lines.append(f"  {cfg:<14}"
+                         + "".join(f"{cell_mean[f'{cfg}@{w}']:>14.4f}" for w in windows))
+        # Interaction: does the window effect depend on the config? Contrast the
+        # window-delta of the most complex vs the least complex config in the run.
+        w0, w1 = windows[0], windows[-1]
+        c0, c1 = configs[0], configs[-1]
+        if all(c in wide for c in (f"{c0}@{w0}", f"{c0}@{w1}", f"{c1}@{w0}", f"{c1}@{w1}")):
+            d0 = wide[f"{c0}@{w1}"] - wide[f"{c0}@{w0}"]     # window effect for c0
+            d1 = wide[f"{c1}@{w1}"] - wide[f"{c1}@{w0}"]     # window effect for c1
+            inter = d1 - d0
+            n_a = int(inter.notna().sum())
+            t_i = (inter.mean() / (inter.std(ddof=1) / np.sqrt(n_a))) if n_a > 1 and inter.std(ddof=1) > 0 else float("nan")
+            lines += ["",
+                      f"  window effect ({w0} -> {w1}) for {c0:<13}: {d0.mean():+.4f}  "
+                      f"(paired t={d0.mean()/(d0.std(ddof=1)/np.sqrt(max(n_a,1))):+.2f})",
+                      f"  window effect ({w0} -> {w1}) for {c1:<13}: {d1.mean():+.4f}  "
+                      f"(paired t={d1.mean()/(d1.std(ddof=1)/np.sqrt(max(n_a,1))):+.2f})",
+                      f"  INTERACTION (difference of the two)      : {inter.mean():+.4f}  "
+                      f"(paired t={t_i:+.2f}, n={n_a} anchors)",
+                      "",
+                      "  |t|>2 on the INTERACTION line = complexity and window are COUPLED on this",
+                      "  window, i.e. sweeping either knob alone was measuring a marginal of a",
+                      "  surface with a ridge in it. |t|<2 = they are separable here and the",
+                      "  one-knob-at-a-time sweeps were not leaving anything on the table.",
+                      "=" * 104]
 
     report = "\n".join(lines)
     with open(out_report, "w") as f:
@@ -1897,7 +3160,7 @@ def run_walkforward_sweep():
 
 
 # -------------------------------------------------------------------------- #
-# Walk-forward BAG-EVAL — does averaging K seeds' PREDICTIONS kill the per-seed #
+# Walk-forward BAG-EVAL - does averaging K seeds' PREDICTIONS kill the per-seed #
 # noise floor without killing top1_net? Fits S seeds per (config,anchor) ONCE,  #
 # then evaluates prob-averaged and rank-averaged bags of size K (sweeping K).   #
 # Read-only: writes only walkforward_bag_* reports, never the live model.       #
@@ -1927,7 +3190,7 @@ def run_walkforward_bag():
     do_prob = args.wf_bag_mode in ("prob", "both")
     do_rank = args.wf_bag_mode in ("rank", "both")
 
-    # ---- load + filter + feature matrix + label (ONCE) — mirrors run_walkforward_sweep ----
+    # ---- load + filter + feature matrix + label (ONCE) - mirrors run_walkforward_sweep ----
     with Phase("BAG: load + label all tickers"):
         parts = load_and_label_tickers(args.input_dir, target_col, date_col,
                                        args.horizon_5d, max_files=args.wf_max_tickers)
@@ -1980,7 +3243,7 @@ def run_walkforward_bag():
             continue
         anchors.append((m, dates_all[ym_all == m].max(), nxt))
     if not anchors:
-        logging.error("  no anchors — lower --wf_min_anchor or add data.")
+        logging.error("  no anchors - lower --wf_min_anchor or add data.")
         return
     logging.info(f"  anchors: {len(anchors)} ({anchors[0][0]}->{anchors[-1][0]})  "
                  f"configs={configs}  S={S} seeds  Ks={ks}  B={B}  mode={args.wf_bag_mode}")
@@ -2062,7 +3325,7 @@ def run_walkforward_bag():
 
     res = pd.DataFrame(rows)
     if res.empty:
-        logging.error("  no bag results — every fit failed (see warnings above). Nothing "
+        logging.error("  no bag results - every fit failed (see warnings above). Nothing "
                       "written. Most likely GPU OOM (use --wf_device cpu, or subsample with "
                       "--wf_max_tickers / --no_xs_features) or a data/config/target_column error.")
         return
@@ -2070,7 +3333,7 @@ def run_walkforward_bag():
     n_ok = res.groupby(["config", "oos_month"]).ngroups
     if n_ok < len(configs) * len(anchors):
         logging.warning(f"  PARTIAL: {n_ok}/{len(configs)*len(anchors)} (config,anchor) cells "
-                        f"produced results — some fits failed. Reporting on what completed.")
+                        f"produced results - some fits failed. Reporting on what completed.")
     res.to_parquet(out_parquet, index=False)
 
     # ---- aggregate: per (config,method,K,anchor) bag mean/std, then pool ----
@@ -2139,6 +3402,12 @@ def run_walkforward_bag():
 # Main                                                                       #
 # -------------------------------------------------------------------------- #
 def main():
+    # --cm_retilt: Phase 14 on an existing pred dir, no model and no inference. Checked
+    # before anything else touches disk (it must not create a model dir just to retilt).
+    if args.cm_retilt:
+        run_cm_retilt()
+        return
+
     os.makedirs(args.model_dir, exist_ok=True)
     model_path = os.path.join(args.model_dir, "xgb.joblib")
 
@@ -2198,6 +3467,11 @@ def main():
                 calib_df[args.date_column] = pd.to_datetime(calib_df[args.date_column])
                 logging.info(f"  train: {len(train_df):,} rows from {train_cache}")
                 logging.info(f"  calib: {len(calib_df):,} rows from {calib_cache}")
+                _diag.dump_json("T_split", {
+                    "reuse": True, "train_rows": len(train_df), "calib_rows": len(calib_df),
+                    "train_dates": [str(train_df[args.date_column].min())[:10], str(train_df[args.date_column].max())[:10]],
+                    "calib_dates": [str(calib_df[args.date_column].min())[:10], str(calib_df[args.date_column].max())[:10]],
+                    "train_cols": len(train_df.columns)})
         else:
             # Read-projection: skip columns that Phase 6 would drop anyway
             # (drop_feature_patterns / drop_features_exact / drop_vol_features)
@@ -2207,7 +3481,19 @@ def main():
             _pats    = [p.strip() for p in (args.drop_feature_patterns or "").split(",") if p.strip()]
             _protect = {args.date_column, args.ticker_column, args.target_column,
                         "Open", "High", "Low", "Close", "Volume", args.vol_col,
-                        "dollar_volume_ma_10", "atr_percentage", "RSI"}
+                        "dollar_volume_ma_10", "atr_percentage", "RSI",
+                        # Phase 11/13 outputs and factors, label sources, regime columns
+                        "VIX_Close", "vix_close", "Distance to Resistance (%)",
+                        "Distance to Support (%)", "volatility",
+                        "percent_change_close", "percent_change_Close",
+                        "Market_Regime", "VIX_Regime_Numeric"} | set(NON_FEATURES) | set(NEUT_FACTORS)
+            # Roster projection (2026-09-03): with --wf_feature_file, Phase 6 discards every
+            # base feature outside the roster, so reading them is pure memory (a fresh-cache
+            # run peaked at 47.8 GB on the 1,379-column panel and was killed by the RAM
+            # watchdog). Read only roster + protected columns; the feature set Phase 6
+            # builds is identical.
+            _roster = (set(open(args.wf_feature_file).read().split())
+                       if args.wf_feature_file else None)
 
             def _keep_col(c):
                 if c in _protect:
@@ -2218,21 +3504,29 @@ def main():
                     return False
                 if args.drop_vol_features and is_vol_feature(c):
                     return False
+                if _roster is not None and c not in _roster:
+                    return False
                 return True
 
-            usecols_fn = _keep_col if (_exact or _pats or args.drop_vol_features) else None
+            usecols_fn = _keep_col if (_exact or _pats or args.drop_vol_features or _roster) else None
 
             # Phase 1+2: Load tickers + label engineering
             with Phase("Phase 1+2: Load tickers + label engineering"):
                 parts = load_and_label_tickers(
                     args.input_dir, args.target_column, args.date_column,
-                    args.horizon_5d, max_files=args.max_files, usecols_fn=usecols_fn)
+                    args.horizon_5d, max_files=args.max_files, usecols_fn=usecols_fn,
+                    read_float32=args.read_float32, book_touch_k=args.book_touch_k,
+                    book_stop=args.book_stop, book_target=args.book_target, book_vol_col=args.vol_col,
+                    book_beta=args.book_beta, book_min_depth=args.book_min_depth, book_max_depth=args.book_max_depth,
+                    book_ratchet=args.book_ratchet,
+                    load_start_date=args.load_start_date, load_end_date=args.load_end_date,
+                    prefilter_quality=args.prefilter_quality)
                 logging.info(f"  loaded {len(parts)} tickers, "
                              f"{sum(len(p) for p in parts):,} rows total")
 
             with Phase("Concatenate"):
                 if not parts:
-                    logging.error("No data loaded — check --input_dir")
+                    logging.error("No data loaded - check --input_dir")
                     return
                 df = pd.concat(parts, ignore_index=True)
                 del parts
@@ -2254,6 +3548,8 @@ def main():
                     df, args.runpercent, args.calibpercent,
                     args.embargo_days, args.date_column,
                     train_end_date=args.train_end_date)
+                _diag.dump_json("T_split", dict(split_meta, reuse=False, train_cols=len(train_df.columns),
+                                                runpercent=args.runpercent, calibpercent=args.calibpercent))
                 del df
 
             # Save splits for --reuse on next run
@@ -2262,28 +3558,64 @@ def main():
             calib_df.to_parquet(calib_cache, index=False)
             logging.info(f"  PreparedData cached -> {prepared_dir}/")
 
+        if args.train_row_filter:
+            _n0 = len(train_df)
+            train_df = train_df.query(args.train_row_filter).reset_index(drop=True)
+            logging.info(f"  --train_row_filter '{args.train_row_filter}': train rows {_n0:,} -> {len(train_df):,}")
+            if len(train_df) < 20_000:
+                raise ValueError("train_row_filter left fewer than 20,000 rows")
+
         # Phase 6: Feature matrix
         with Phase("Phase 6: Build feature matrix"):
             base_cols = select_base_features(train_df)
             logging.info(f"  base numeric features: {len(base_cols)}")
+            _feat_steps = [("base", len(base_cols), [])]
+
+            if args.wf_feature_file:
+                keep = set(open(args.wf_feature_file).read().split())
+                before = len(base_cols)
+                base_cols = [c for c in base_cols if c in keep]
+                logging.info(f"  --wf_feature_file: {before} -> {len(base_cols)} base features "
+                             f"({len(keep - set(base_cols))} listed names absent from panel)")
+                _feat_steps.append(("wf_feature_file", len(base_cols), []))
+
+            if args.add_weekday:
+                for _df in (train_df, calib_df):
+                    _df["dow"] = pd.to_datetime(_df[args.date_column]).dt.dayofweek.astype(np.float32)
+                if "dow" not in base_cols:
+                    base_cols.append("dow")
+                logging.info("  --add_weekday: day-of-week feature 'dow' added")
+            if args.limit_features:
+                for _df in (train_df, calib_df):
+                    _new = add_limit_features(_df, args.vol_col, args.book_touch_k)
+                base_cols += [c for c in _new if c not in base_cols]
+                logging.info(f"  --limit_features: {_new}")
+            if args.day_features:
+                for _df in (train_df, calib_df):
+                    _new = add_day_features(_df, args.date_column, args.vol_col, k=args.book_touch_k)
+                base_cols += [c for c in _new if c not in base_cols]
+                logging.info(f"  --day_features: {_new}")
 
             if args.drop_vol_features:
                 dropped = [c for c in base_cols if is_vol_feature(c)]
                 base_cols = [c for c in base_cols if not is_vol_feature(c)]
                 logging.info(f"  --drop_vol_features removed {len(dropped)} cols "
                              f"(WARNING: vol features are top-ranked in winning config)")
+                _feat_steps.append(("drop_vol", len(base_cols), dropped))
 
             if args.drop_feature_patterns:
                 pats = [p.strip() for p in args.drop_feature_patterns.split(",") if p.strip()]
                 dropped = [c for c in base_cols if any(p in c for p in pats)]
                 base_cols = [c for c in base_cols if not any(p in c for p in pats)]
                 logging.info(f"  drop_feature_patterns removed {len(dropped)} cols")
+                _feat_steps.append(("drop_patterns", len(base_cols), dropped))
 
             if args.drop_features_exact:
                 exact = {n.strip() for n in args.drop_features_exact.split(",") if n.strip()}
                 dropped = [c for c in base_cols if c in exact]
                 base_cols = [c for c in base_cols if c not in exact]
                 logging.info(f"  drop_features_exact removed {len(dropped)} cols: {dropped}")
+                _feat_steps.append(("drop_exact", len(base_cols), dropped))
 
             if USE_XS:
                 logging.info("  --add_xs_features: appending per-day rank columns")
@@ -2294,8 +3626,23 @@ def main():
                 feature_cols = base_cols
 
             logging.info(f"  total features: {len(feature_cols)}")
+            _feat_steps.append(("xs_expand" if USE_XS else "no_xs", len(feature_cols), []))
+            _diag.dump_json("T_features", {"steps": [{"step": s, "n": n, "dropped": d} for s, n, d in _feat_steps],
+                                           "feature_cols": list(feature_cols), "use_xs": bool(USE_XS)})
             X_train = train_df[feature_cols]
             X_calib = calib_df[feature_cols]
+            if args.x_float32:
+                # RAM (2026-09-05, default off): a few roster columns stay float64 for Phase 13, so
+                # the mixed-dtype matrix upcast every copy (fit slice, eval set, DMatrix) to float64:
+                # 49 GB at 928k rows. XGBoost hist casts inputs to float32 anyway, so a uniform
+                # float32 matrix gives the same model (parity-checked). Feature columns are then
+                # dropped from the frames; nothing downstream reads them (labels, dates, len only).
+                X_train = X_train.astype(np.float32)
+                X_calib = X_calib.astype(np.float32)
+                _keep_nonfeat = [c for c in train_df.columns if c not in set(feature_cols)]
+                train_df = train_df[_keep_nonfeat]
+                calib_df = calib_df[_keep_nonfeat]
+                logging.info(f"  --x_float32: X_train {X_train.shape} float32 ({X_train.memory_usage().sum()/1e9:.1f} GB); feature columns dropped from the frames")
 
         # Phase 7: Labels
         with Phase("Phase 7: Build labels"):
@@ -2307,7 +3654,15 @@ def main():
                 topq_frac=args.topq_frac,
                 vol_col=args.vol_col,
                 vol_floor=args.vol_floor,
+                thresh_5d=args.thresh_5d, ratchet_win=args.book_ratchet_win,
             )
+            _diag.dump_json("T_labels", {"label_mode": args.label_mode, "topq_frac": args.topq_frac,
+                                         "p_train": float(np.mean(y_train)), "p_calib": float(np.mean(y_calib)),
+                                         "n_train": int(len(y_train)), "n_calib": int(len(y_calib))})
+            if _diag.enabled():
+                _lbd = pd.DataFrame({"Date": train_df[args.date_column].values, "y": y_train})
+                _diag.dump_parquet("T_label_by_day",
+                                   _lbd.groupby("Date")["y"].agg(["size", "mean"]).reset_index())
 
         # Phase 8: Recency weights
         sw_train_full = None
@@ -2315,9 +3670,19 @@ def main():
             with Phase("Phase 8: Recency weights"):
                 sw_train_full = recency_weights(
                     train_df[args.date_column], args.recency_half_life_days)
+                if args.payoff_weight_cap:
+                    _pw = 0.005 + np.minimum(np.abs(np.nan_to_num(train_df[args.payoff_weight_col].values)), args.payoff_weight_cap)
+                    sw_train_full = (sw_train_full * (_pw / _pw.mean())).astype(np.float32)
+                    logging.info(f"  --payoff_weight_cap {args.payoff_weight_cap}: weights x (0.005 + min(|ret_5d|, cap)), "
+                                 f"p90/p10 = {np.percentile(sw_train_full, 90) / max(np.percentile(sw_train_full, 10), 1e-9):.1f}x")
                 logging.info(f"  half_life={args.recency_half_life_days}d  "
                              f"newest:oldest ratio = "
                              f"{sw_train_full.max()/max(sw_train_full.min(),1e-9):.1f}x")
+                _diag.dump_json("T_recency", {"half_life_days": args.recency_half_life_days,
+                                              "ratio_newest_oldest": float(sw_train_full.max() / max(sw_train_full.min(), 1e-9)),
+                                              "w_p10": float(np.percentile(sw_train_full, 10)),
+                                              "w_p50": float(np.percentile(sw_train_full, 50)),
+                                              "w_p90": float(np.percentile(sw_train_full, 90))})
 
         # Phase 9: Optuna tuning
         tuned_params = None
@@ -2342,8 +3707,10 @@ def main():
 
         # Phase 10: Train final model
         with Phase("Phase 10: Train final XGBClassifier"):
-            clf = train_model(
-                X_train, y_train, tuned_params, sw_train_full,
+            clf = train_bagged(
+                args.bag_seeds, args.seed, bag_mode=args.bag_mode,
+                X_train=X_train, y_train=y_train, tuned_params=tuned_params,
+                sw_train=sw_train_full,
                 scale_pos_weight=args.scale_pos_weight,
                 n_estimators=args.n_estimators,
                 max_depth=args.max_depth,
@@ -2354,7 +3721,7 @@ def main():
                 subsample=args.subsample,
                 colsample_bytree=args.colsample_bytree,
                 early_stopping_rounds=args.early_stopping_rounds,
-                seed=args.seed,
+                refit_full=args.refit_full,
             )
 
         # Phase 11: Evaluate + save
@@ -2385,8 +3752,32 @@ def main():
     if args.predict_only:
         calib_path = os.path.join(args.model_dir, "calibrator.joblib")
 
-    with Phase("Phase 12: Inference — score all tickers -> RFpredictions"):
-        run_inference(
+    neut_kwargs = dict(
+        mode=args.neut_mode,
+        dose=args.neut_dose,
+        dose_above=args.neut_dose_above,
+        dose_below=args.neut_dose_below,
+        flag_max_stale_days=args.neut_flag_max_stale_days,
+    )
+    if args.neutralize:
+        logging.info("--neutralize: Phase 13 ON (%s)"
+                     % ("fixed dose %.2f" % args.neut_dose if args.neut_mode == "fixed"
+                        else "spy200v2 %.2f above / %.2f below the SPY 200d EMA"
+                             % (args.neut_dose_above, args.neut_dose_below)))
+    else:
+        logging.info("Phase 13 neutralization OFF (pass --neutralize for the ship config)")
+
+    cm_kwargs = _cm_kwargs()
+    if CM_ON:
+        logging.info("Phase 14 conviction momentum ON (default) "
+                     "(k=%.2f spans=%s clip=[%.2f,%.2f])"
+                     % (args.cm_k, list(cm_kwargs["spans"]), args.cm_lo, args.cm_hi))
+    else:
+        logging.info("--no_conviction_momentum: Phase 14 OFF -- these are UN-TILTED preds, "
+                     "NOT the ship config")
+
+    with Phase("Phase 12: Inference - score all tickers -> RFpredictions"):
+        status = run_inference(
             model_path=model_path,
             input_dir=args.input_dir,
             output_dir=args.output_dir,
@@ -2395,6 +3786,16 @@ def main():
             top_frac_per_day=args.top_frac_per_day,
             max_files=args.max_files,
             calib_path=calib_path if USE_CALIB else None,
+            neutralize=args.neutralize,
+            neut_kwargs=neut_kwargs,
+            neut_min_tickers=args.neut_min_tickers,
+            neut_min_changed=args.neut_min_changed,
+            conviction_momentum=CM_ON,
+            cm_kwargs=cm_kwargs,
+            cm_min_tickers=args.cm_min_tickers,
+            cm_min_changed=args.cm_min_changed,
+            infer_tail=args.infer_tail,
+            pool_top_n=args.pool_top_n,
         )
 
     total_min = (time.time() - run_t0) / 60
@@ -2402,8 +3803,34 @@ def main():
     logging.info(f"Pipeline done in {total_min:.1f}m")
     logging.info(f"  Model:          {model_path}")
     logging.info(f"  RFpredictions:  {args.output_dir}/")
+    logging.info(f"  Neutralization: "
+                 + (f"ON  ({status['neut']['dose_desc']})" if status["neutralized"]
+                    else f"FAILED GATE ({status['neut_error']}) -> un-neutralized preds"
+                    if status.get("neut_error") else "off (raw preds)"))
+    logging.info(f"  Conviction mom: "
+                 + (f"ON  (k={args.cm_k:.2f} spans={list(cm_kwargs['spans'])})"
+                    if status.get("conviction_momentum")
+                    else f"FAILED GATE ({status['cm_error']}) -> un-tilted preds"
+                    if status.get("cm_error") else "off (--no_conviction_momentum)"))
     logging.info(f"  Next step:      python 5__NightlyBackTester.py --force")
     logging.info(f"{'='*70}")
+
+    if status["gate_failed"]:
+        # Same contract as the old 4.5 / 4.6 stages: usable preds are in place, but they
+        # are NOT the ship config, so the runner must alert. Non-zero exit is the alert.
+        # Name the phase that actually failed -- with Phase 14 on by default, blaming
+        # neutralization for a tilt failure sends whoever reads the log the wrong way.
+        why = "; ".join(
+            "%s gate failed (%s)" % (ph, status[key])
+            for ph, key in (("Phase 13 neutralization", "neut_error"),
+                            ("Phase 14 conviction momentum", "cm_error"))
+            if status.get(key)) or "unknown gate failure"
+        logging.error("EXIT 1: %s. %s holds usable but NON-SHIP preds."
+                      % (why, args.output_dir))
+        sys.exit(1)
+
+
+
 
 
 if __name__ == "__main__":

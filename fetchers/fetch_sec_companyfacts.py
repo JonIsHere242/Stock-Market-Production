@@ -1,4 +1,4 @@
-"""Download SEC companyfacts.zip — XBRL fundamentals for every filer.
+"""Download SEC companyfacts.zip - XBRL fundamentals for every filer.
 
 This is the bulk archive of every concept (Revenues, NetIncome, etc.) ever
 filed via XBRL, one JSON per CIK. ~1-2 GB compressed; extracts to ~10+ GB.
@@ -29,16 +29,16 @@ def fetch(force: bool = False, extract: bool = False, max_age_hours: float = 20.
 
     age = file_age_hours(ZIP_PATH)
     if not force and age < max_age_hours:
-        log(f"companyfacts.zip is {age:.1f}h old (< {max_age_hours}h) — skipping. Use --force to override.")
+        log(f"companyfacts.zip is {age:.1f}h old (< {max_age_hours}h) - skipping. Use --force to override.")
     else:
-        log(f"Downloading {URL} → {ZIP_PATH}")
+        log(f"Downloading {URL} -> {ZIP_PATH}")
         session = make_session(host="www.sec.gov", sec=True)
         n = stream_download(session, URL, ZIP_PATH, rate_limited_get=sec_get)
         log(f"  wrote {fmt_bytes(n)}")
 
     if extract:
         EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
-        log(f"Extracting → {EXTRACT_DIR} (this can take several minutes)")
+        log(f"Extracting -> {EXTRACT_DIR} (this can take several minutes)")
         with zipfile.ZipFile(ZIP_PATH) as zf:
             members = zf.namelist()
             log(f"  {len(members):,} JSON files in archive")

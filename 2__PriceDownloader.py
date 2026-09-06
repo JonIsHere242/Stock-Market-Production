@@ -8,7 +8,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import asyncio
 import nest_asyncio
-from tqdm import tqdm
+from auxiliary._quiet_progress import tqdm
 import traceback
 import glob
 import re
@@ -21,6 +21,17 @@ from functools import lru_cache
 from Util import get_logger
 
 warnings.filterwarnings('ignore')
+
+# Under trading_system.ps1 stdout is a pipe, so Windows defaults it to cp1252 and the
+# glyphs in the connection-failure prints raise UnicodeEncodeError. That exception fires
+# inside the except block of _create_new_connection, which skips the backoff/retry and
+# fails the ticker with a bogus 'charmap' error (seen 2026-08-04: A, AAMI, AAOI).
+# Reconfigure to UTF-8 once, mirroring FeatureDiscovery/validate_feature.py.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, Exception):
+    pass
 
 from ib_insync import IB, Contract, util
 
@@ -831,7 +842,7 @@ async def process_all_tickers(tickers, host='127.0.0.1', port=7496, batch_size=D
     print(f"  Downloaded:    {success_count}")
     success_rate = (success_count / eligible * 100) if eligible > 0 else 100.0
     print(f"  Failed:        {fail_count}  (download success rate: {success_rate:.1f}%)")
-    print(f"  Not on IBKR:   {not_found_count}  (delisted/OTC — cached, won't be retried)")
+    print(f"  Not on IBKR:   {not_found_count}  (delisted/OTC - cached, won't be retried)")
     
     stats = connection_pool.get_stats()
     print("\nConnection pool stats:")

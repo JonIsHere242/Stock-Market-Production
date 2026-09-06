@@ -28,6 +28,9 @@ import argparse
 import exchange_calendars as ec
 import backtrader as bt
 import json
+
+# The one bracket definition. Imports nothing but os, so this cannot create a cycle.
+from auxiliary import bracket_config as _BRACKET
 import random
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -118,7 +121,7 @@ STRATEGY_PARAMS = {
     'up_prob_min_trigger': 0.70,        # Minimum probability to trigger buy
     
     # Position management parameters 
-    'max_positions': 10,                # Maximum concurrent positions (4->8->10 2026-06-08; joint seed x config x book grid: k10 most robust marginally). NOTE: 9_SuperFastBroker sizes from its OWN hardcoded PositionSizer(max_positions=...) ~line 73 — kept in sync at 10.
+    'max_positions': 3,                 # Maximum concurrent positions (4->8->10->3 2026-08-23; the k10 grid ran on a GROSS backtest with no cost model, and book size is the main lever on the flat $1.00 commission floor). NOTE: 9_SuperFastBroker sizes from its OWN hardcoded PositionSizer(max_positions=...) ~line 264 - kept in sync at 3.
     'reserve_percent': 0.10,            # Cash reserve percentage
     'max_group_allocation': 0.45,       # Maximum allocation to a group
     
@@ -128,13 +131,24 @@ STRATEGY_PARAMS = {
     'min_position_pct': 20,            # Minimum position size as percentage
     'atr_period': 14,                   # ATR calculation period
     
-    # Stop loss and take profit parameters
-    'stop_loss_atr_multiple': 0.75,     # Stop loss ATR multiplier 
-    'trailing_stop_atr_multiple': 2.0,  # Trailing stop ATR multiplier
-    'take_profit_percent': 20.0,        # Take profit threshold percentage
-    
+    # ── Stop loss and take profit ──────────────────────────────────────────────
+    # THESE COME FROM bracket_config.py. Do not edit the numbers here -- edit there,
+    # or the backtest, the signals file and the live broker drift apart again (audit
+    # 2026-07-28 found five disagreeing definitions and a backtest simulating a
+    # strategy the broker does not trade).
+    # They stay as strategy params so the --take_profit / --position_timeout CLI and
+    # optimizer overrides still flow through self.p as they always have.
+    'hard_stop_percent': _BRACKET.HARD_STOP_PCT,     # 1.9
+    'take_profit_percent': _BRACKET.TAKE_PROFIT_PCT,  # 3.5  (was a stale 20.0)
+
+    # DEPRECATED 2026-07-28: both were defined here and referenced NOWHERE in the
+    # codebase. Kept only so any external caller reading STRATEGY_PARAMS by key does
+    # not KeyError. The backtest uses a fixed-percent stop, not an ATR multiple.
+    'stop_loss_atr_multiple': 0.75,     # DEAD -- no reader
+    'trailing_stop_atr_multiple': 2.0,  # DEAD -- no reader
+
     # Position timeout and evaluation parameters
-    'position_timeout': 5,              # Maximum days to hold a position
+    'position_timeout': _BRACKET.MAX_HOLD_DAYS,   # 5, from bracket_config
     'min_daily_return': 1.0,            # Minimum expected daily return
     
     # Volume filter parameters
@@ -145,7 +159,10 @@ STRATEGY_PARAMS = {
     'lockup_days': 3,                   # Trading lockup period
     'rule_201_threshold': -9.99,        # Rule 201 threshold
     'rule_201_cooldown': 1,             # Rule 201 cooldown period
-    'stop_loss_percent': 5.0,           # Standard stop loss percentage
+    # DEPRECATED 2026-07-28: only reader is should_sell() below, which is itself
+    # defined and never called anywhere. Aliased to the real stop so that if anything
+    # ever does read it, it cannot disagree with what is traded.
+    'stop_loss_percent': _BRACKET.HARD_STOP_PCT,   # was a stale 5.0
     'expected_profit_per_day_percentage': 0.25 # Expected profit per day
 }
 
@@ -3209,9 +3226,12 @@ def pstock(ticker, data_folder="Data/PriceData", log_scale=True, width=900, heig
 
 
 
-def colorize_output(value, label, good_threshold, bad_threshold, lower_is_better=False, reverse=False, unicorn_multiplier=20.0):
+def colorize_output(value, label, good_threshold, bad_threshold, lower_is_better=False, reverse=False, unicorn_multiplier=20.0, extra=None, width=30):
+    # A label longer than the column must never jam into its value: pad to at
+    # least one space past the label, keeping the standard column when it fits.
+    pad = max(width, len(label) + 1)
     if value is None or (isinstance(value, float) and math.isnan(value)):
-        return f"{label:<30}\033[38;2;150;150;150mN/A        \033[0m[\033[38;2;150;150;150mNo Data\033[0m]"
+        return f"{label:<{pad}}\033[38;2;150;150;150mN/A        \033[0m[\033[38;2;150;150;150mNo Data\033[0m]"
     
     def get_color_code(normalized_value, is_unicorn=False):
         if is_unicorn:
@@ -3279,7 +3299,7 @@ def colorize_output(value, label, good_threshold, bad_threshold, lower_is_better
             else:
                 normalized_value = (good_threshold - value) / (good_threshold - bad_threshold)
     except Exception as e:
-        return f"{label:<30}\033[38;2;150;150;150mError      \033[0m[\033[38;2;150;150;150mCalculation Error\033[0m]"
+        return f"{label:<{pad}}\033[38;2;150;150;150mError      \033[0m[\033[38;2;150;150;150mCalculation Error\033[0m]"
 
     color_code = get_color_code(normalized_value, is_unicorn)
     quality_tag = get_quality_tag(normalized_value, is_unicorn)
@@ -3289,7 +3309,8 @@ def colorize_output(value, label, good_threshold, bad_threshold, lower_is_better
     else:
         value_str = str(value)
     
-    return f"{label:<30}{color_code}{value_str:<10}\033[0m[{color_code}{quality_tag}\033[0m]"
+    extra_str = "" if extra is None else f"{extra:<12}"
+    return f"{label:<{pad}}{color_code}{value_str:<10}\033[0m{extra_str}[{color_code}{quality_tag}\033[0m]"
 
 
 
@@ -3409,7 +3430,7 @@ def create_ib_connection(host='127.0.0.1', port=7497, max_attempts=3, timeout=20
 
 
 def count_lines_of_code(root="."):
-    """LOC + on-disk data tally for the project. Run via `python Util.py --loc`.
+    """LOC + on-disk data tally for the project. Run via `python Util.py --loc` (or `--coode`).
 
     For Python it splits each file into code / docstrings / comments / blank using the
     `tokenize` module, so heavy structured docstrings (e.g. the FeatureTemplates blocks)
@@ -3418,6 +3439,7 @@ def count_lines_of_code(root="."):
     Data/ & backups are size-only (never line-counted).
     """
     import io
+    import stat
     import token
     import tokenize
     from collections import defaultdict
@@ -3482,6 +3504,15 @@ def count_lines_of_code(root="."):
                 code += 1
         return code, comment, blank
 
+    def is_reparse(p):
+        # os.walk skips symlinks but happily descends Windows junctions; the
+        # _prun worker clones junction back into the repo root, which loops forever.
+        try:
+            return bool(os.stat(p, follow_symlinks=False).st_file_attributes
+                        & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        except (OSError, AttributeError):
+            return os.path.islink(p)
+
     root = os.path.abspath(root)
     agg = defaultdict(lambda: [0, 0, 0, 0, 0])  # label -> [files, code, doc, comment, blank]
     prose = defaultdict(lambda: [0, 0])         # label -> [files, non-blank lines]
@@ -3489,7 +3520,7 @@ def count_lines_of_code(root="."):
     data_bytes = parquet_n = 0
 
     for dp, dn, fn in os.walk(root):
-        dn[:] = [d for d in dn if d not in SKIP]
+        dn[:] = [d for d in dn if d not in SKIP and not is_reparse(os.path.join(dp, d))]
         top = "." if dp == root else os.path.relpath(dp, root).split(os.sep)[0]
         for f in fn:
             if os.path.splitext(f)[0].lower() in RESERVED:
@@ -3559,8 +3590,9 @@ def count_lines_of_code(root="."):
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Consolidated trading system utilities")
-    parser.add_argument("--loc", action="store_true",
-                        help="Count lines of code + on-disk data size for the project, then exit")
+    parser.add_argument("--loc", "--coode", dest="loc", action="store_true",
+                        help="Count lines of code + on-disk data size for the project, then exit "
+                             "(--coode is an alias)")
     
     # Main commands (subparsers for different functions)
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -3604,7 +3636,8 @@ def parse_args():
                                help="Number of metrics to show")
     
     # Lines-of-code / data-size report command
-    subparsers.add_parser("loc", help="Count lines of code + on-disk data size for the project")
+    subparsers.add_parser("loc", aliases=["coode"],
+                          help="Count lines of code + on-disk data size for the project")
 
     # Migration command
     subparsers.add_parser("migrate", help="Migrate from legacy data files")
@@ -3646,8 +3679,8 @@ def main():
     args = parse_args()
     logger = get_logger()
 
-    # --loc flag (or `loc` subcommand) runs the code/data report and exits
-    if getattr(args, "loc", False) or args.command == "loc":
+    # --loc / --coode flag (or `loc` / `coode` subcommand) runs the code/data report and exits
+    if getattr(args, "loc", False) or args.command in ("loc", "coode"):
         count_lines_of_code()
         return
 

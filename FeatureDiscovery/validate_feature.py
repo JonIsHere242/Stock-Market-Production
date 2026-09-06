@@ -51,6 +51,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # book_target.py
 
 # The report uses ✓/~/✗ badges. On Windows cp1252 (default when stdout is a pipe/redirect) those
 # raise UnicodeEncodeError and crash the gate -- including when generate_feature.py runs it with
@@ -62,6 +63,11 @@ except (AttributeError, Exception):
     pass
 
 ROOT      = Path(__file__).resolve().parent.parent
+# repo root must be importable: 3__FeatureFramework.py imports repo helper
+# modules (e.g. auxiliary._quiet_progress); without this the redundancy check dies silently
+# and every candidate reports maxcorr 0.00.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 TEMPLATES = ROOT / "FeatureTemplates"
 PRICE_DIR = ROOT / "Data" / "PriceData"
 FW_PATH   = ROOT / "3__FeatureFramework.py"
@@ -150,6 +156,19 @@ def load_frames(paths: list[Path]) -> list[pd.DataFrame]:
 def forward_logret(df: pd.DataFrame) -> pd.Series:
     c = df["Close"].astype(float)
     return np.log(c.shift(-1) / c)   # fwd_ret[t] = log(close[t+1]/close[t]); causal target
+
+
+# Configurable gate target (2026-09-06). Default is the historical next-day log return so every
+# ledger row stays comparable; --target touch_win / win_touch / book_ret score the block against
+# the event the 3-slot trigger book actually pays for. See FeatureDiscovery/book_target.py.
+TARGET = "logret"
+
+
+def gate_target(df: pd.DataFrame) -> pd.Series:
+    if TARGET == "logret":
+        return forward_logret(df)
+    from book_target import make_target
+    return make_target(df, TARGET)
 
 
 def _spearman(a, b) -> float:
@@ -328,7 +347,7 @@ def build_panel(compute, frames, produces) -> pd.DataFrame:
         except Exception:
             continue
         r = r.copy()
-        r["__fwd"] = forward_logret(r)
+        r["__fwd"] = gate_target(r)
         cols = ["Date", "Ticker", "__fwd"] + [c for c in produces if c in r.columns]
         parts.append(r[[c for c in cols if c in r.columns]])
     if not parts:
@@ -628,7 +647,7 @@ def _print(report, static, leaks, signals, redun):
     badge = {"PASS": "PASS  ✓", "WEAK": "WEAK  ~", "FAIL": "FAIL  ✗"}.get(report["verdict"], report["verdict"])
     print("\n" + "=" * W)
     print(f"  VALIDATE  {report['block']}   ->   {badge}"
-          f"        (OOS cutoff {report.get('oos_cutoff','?')})")
+          f"        (target {TARGET}, OOS cutoff {report.get('oos_cutoff','?')})")
     print("=" * W)
     if report.get("structural"):
         print("  [GARBAGE] " + "; ".join(report["structural"][:4]))
@@ -754,7 +773,13 @@ def main() -> None:
     ap.add_argument("--inc_n", type=int, default=6, help="tickers for the incumbent redundancy matrix")
     ap.add_argument("--no_redundancy", action="store_true")
     ap.add_argument("--refresh_incumbents", action="store_true", help="rebuild the incumbent cache")
+    ap.add_argument("--target", default="logret",
+                    choices=["logret", "ret5", "hit8", "touch", "touch_win", "win_touch", "book_ret", "book_ret_all"],
+                    help="gate target: logret (default, historical ledger basis) or a book-rule outcome "
+                         "from FeatureDiscovery/book_target.py (touch_win = P(touch AND win), the book label)")
     args = ap.parse_args()
+    global TARGET
+    TARGET = args.target
 
     if args.batch:
         batch(args.batch, n=args.n, oos_frac=args.oos_frac, inc_n=args.inc_n,

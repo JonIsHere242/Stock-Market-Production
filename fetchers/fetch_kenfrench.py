@@ -1,4 +1,4 @@
-"""Download Ken French Data Library — canonical factor returns.
+"""Download Ken French Data Library - canonical factor returns.
 
 Daily and monthly factor returns (Mkt-RF, SMB, HML, MOM, RMW, CMA),
 industry portfolios, and size/BM/momentum quintile returns. Goes back

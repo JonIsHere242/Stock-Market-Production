@@ -1,0 +1,33 @@
+# =============================================================================
+#  Stock-Market CLIENT (broker-only) requirements
+# =============================================================================
+#  This is NOT the research pipeline. It is the thin execution client: it reads
+#  the daily _Buy_Signals.parquet book and routes the orders through IBKR.
+#
+#  Versions are pinned to the ones the signals are generated on, so the client
+#  parses the book with identical numerics. Verified working 2026-08-23 on a
+#  clean Python 3.13 venv.
+#
+#  Installed footprint: about 312 MB. No data lake, no model, no GPU.
+# =============================================================================
+
+# --- core numerics (must match the signal generator) -------------------------
+numpy==2.2.6
+pandas==2.3.3
+pyarrow==21.0.0
+
+# --- market calendars (Util.py imports both at module level) -----------------
+pandas-market-calendars==5.1.1
+exchange-calendars==4.11
+pytz
+
+# --- broker transport --------------------------------------------------------
+ib-insync==0.9.86
+nest-asyncio==1.6.0
+
+# --- imported at module level by Util.py, so required even though the client
+#     never plots or backtests. PyPI backtrader is sufficient here; the
+#     git-pinned commit in the research requirements is NOT needed, which is
+#     why the client install does not require git on PATH.
+backtrader==1.9.78.123
+plotly==6.2.0

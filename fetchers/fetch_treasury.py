@@ -1,4 +1,4 @@
-"""Download US Treasury daily par yield curve — canonical primary source.
+"""Download US Treasury daily par yield curve - canonical primary source.
 
 FRED's DGS series ultimately come from this Treasury table; we keep a
 local copy as the authoritative source for cross-checking and because
@@ -58,7 +58,7 @@ def fetch(start_year: int = START_YEAR, force: bool = False) -> None:
     session = make_session()
     today = dt.date.today()
     years = range(start_year, today.year + 1)
-    log(f"Fetching Treasury par yield curves for {start_year}–{today.year}")
+    log(f"Fetching Treasury par yield curves for {start_year}-{today.year}")
 
     total_rows = total_bytes = 0
     for y in years:

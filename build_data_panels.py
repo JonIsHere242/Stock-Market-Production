@@ -58,7 +58,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
+from auxiliary._quiet_progress import tqdm
 
 # ===========================================================================
 # Shared paths
@@ -179,6 +179,21 @@ def refresh_fundamentals_raw() -> None:
 def refresh_insider_raw() -> None:
     print("[refresh] insider archives via fetchers/fetch_sec_insider.py ...")
     _run_fetcher("fetch_sec_insider.py")
+
+
+def _run_builder(script: str, *flags: str) -> None:
+    """Run a sibling top-level builder script with the repo root as cwd."""
+    subprocess.run([sys.executable, str(ROOT / script), *flags], cwd=str(ROOT), check=True)
+
+
+def build_filing_meta_panel(workers: int = 8) -> None:
+    """Disclosure-behaviour panel (reporting lag / tag churn / silent revisions) from companyfacts."""
+    _run_builder("builders/build_filing_meta.py", "--jobs", str(workers))
+
+
+def build_filing_calendar_panel(workers: int = 8) -> None:
+    """Every filing event incl. non-XBRL forms (NT 12b-25, 8-K item codes) from submissions."""
+    _run_builder("builders/build_filing_calendar.py", "--jobs", str(workers))
 
 
 def refresh_submissions_raw() -> None:
@@ -829,7 +844,7 @@ def group_from_text(text: str) -> str | None:
     if not text:
         return None
     t = str(text).lower()
-    # precious metals (gold/silver/PGM) pool together — the correlated selloff risk
+    # precious metals (gold/silver/PGM) pool together - the correlated selloff risk
     if any(k in t for k in ("gold", "silver", "precious metal", "platinum", "palladium")):
         return "PreciousMetals"
     if any(k in t for k in ("copper", "steel", "aluminum", "iron ore", "industrial metal",
@@ -983,7 +998,15 @@ def load_finviz_cache() -> dict:
         return {}
     try:
         df = pd.read_parquet(FINVIZ_CACHE)
-        return {str(r.Ticker).upper(): (str(r.FvSector), str(r.FvIndustry)) for r in df.itertuples()}
+        out = {}
+        for r in df.itertuples():
+            sec, ind = str(r.FvSector), str(r.FvIndustry)
+            # Skip blank/poisoned rows (see pull_finviz) so they are re-pulled instead of
+            # counting as "already cached" forever. Mirrors 7__MacroFilter.load_finviz_cache.
+            if not ind or ind in ("nan", "None"):
+                continue
+            out[str(r.Ticker).upper()] = (sec, ind)
+        return out
     except Exception:
         return {}
 
@@ -994,20 +1017,56 @@ def _save_finviz_cache(cache: dict):
 
 
 def pull_finviz(tickers, cache: dict, sleep=0.4) -> dict:
-    """Best-effort FinViz Sector/Industry for tickers not already cached. Resumable."""
-    from finvizfinance.quote import finvizfinance
-    todo = [t for t in tickers if t.upper() not in cache]
-    print(f"FinViz pull: {len(todo)} tickers (of {len(tickers)}) not cached.")
+    """Best-effort FinViz Sector/Industry for tickers not already cached. Resumable.
+
+    2026-07-28, TWO bugs fixed here:
+
+    1. PARSER. This used finvizfinance's ticker_fundament(), which RAISES against FinViz's
+       current markup (it looks for `div.quote-links`, which FinViz renamed to
+       `a.quote-header_category` links). finvizfinance 1.3.0 ships the identical bug, so
+       there is no upgrade to wait for - we parse via finviz_compat instead.
+
+    2. POISON CACHE (and it made the "resumable" claim false). On failure this wrote
+       `cache[t] = ("", "")`. Because load_finviz_cache() returns those blanks and `todo`
+       skips anything already IN the cache, one bad run permanently marked a ticker as
+       "done" with empty sector/industry - no later run would ever retry it. Combined with
+       bug 1 (every call failing) a single pull would have blanked the whole universe.
+       Failures are no longer cached, so they simply retry next run.
+
+    Reports a failure count at the end; a 100% failure rate is called out loudly rather
+    than silently producing an empty map.
+    """
+    from auxiliary.finviz_compat import sector_industry
+    # Treat a cached-but-blank industry as NOT done, so previously poisoned rows self-heal.
+    todo = [t for t in tickers
+            if not (cache.get(t.upper()) or ("", ""))[1]]
+    print(f"FinViz pull: {len(todo)} tickers (of {len(tickers)}) missing sector/industry.")
+    fails = 0
+    first_err = None
     for i, t in enumerate(todo):
         try:
-            f = finvizfinance(t).ticker_fundament()
-            cache[t.upper()] = (str(f.get("Sector", "") or ""), str(f.get("Industry", "") or ""))
-        except Exception:
-            cache[t.upper()] = ("", "")
+            sec, ind = sector_industry(t)
+            if ind:
+                cache[t.upper()] = (sec, ind)
+            else:
+                fails += 1          # reachable but unclassified - do NOT cache a blank
+        except Exception as e:      # noqa: BLE001
+            fails += 1
+            if first_err is None:
+                first_err = f"{type(e).__name__}: {e}"
         if (i + 1) % 50 == 0:
-            print(f"  {i+1}/{len(todo)}"); _save_finviz_cache(cache)
+            print(f"  {i+1}/{len(todo)} (failures so far: {fails})"); _save_finviz_cache(cache)
         time.sleep(sleep)
     _save_finviz_cache(cache)
+    if todo:
+        print(f"FinViz pull done: {len(todo) - fails} resolved, {fails} failed "
+              f"(not cached, will retry next run).")
+        if fails == len(todo):
+            print(f"  !! FinViz resolved NOTHING ({fails}/{len(todo)} failed). First error: "
+                  f"{first_err}. FinViz likely changed their markup again - fix the "
+                  f"selectors in finviz_compat.py (check: python auxiliary/finviz_compat.py AAPL). "
+                  f"7__MacroFilter's concentration cap runs on the SIC sector map until "
+                  f"this is fixed.")
     return cache
 
 
@@ -1054,7 +1113,7 @@ def build_sector(finviz: bool = False, traded: bool = False,
 # ###########################################################################
 
 def _cmd_all(args) -> int:
-    """Build all three panels. Returns process exit code (0 = every panel OK)."""
+    """Build every panel. Returns process exit code (0 = every panel OK)."""
     # 1) refresh raw sources first (each fetcher self-skips when its file is fresh)
     if args.refresh_all:
         for fn in (refresh_insider_raw, refresh_submissions_raw, refresh_fundamentals_raw):
@@ -1074,6 +1133,12 @@ def _cmd_all(args) -> int:
         ("sector",       lambda: build_sector(finviz=args.finviz)),
         ("insider",      lambda: build_insider(runpercent=args.runpercent)),
         ("fundamentals", lambda: build_fundamentals(runpercent=args.runpercent, workers=args.workers)),
+        # Both read the ticker<->cik map out of fundamentals_panel.parquet, so they MUST run after
+        # the fundamentals panel. They feed FeatureTemplates/sfn_*, sfd_*, sfb_* -- if they stop
+        # running, those columns decay silently toward zero rather than erroring, which is why
+        # each writes a _BUILD_STAMP.json the feature helpers check for staleness.
+        ("filing_meta",     lambda: build_filing_meta_panel(workers=args.workers)),
+        ("filing_calendar", lambda: build_filing_calendar_panel(workers=args.workers)),
     ]
     for name, fn in panels:
         print(f"\n{'='*70}\n== Building panel: {name}\n{'='*70}")
@@ -1098,7 +1163,7 @@ def _cmd_all(args) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Unified builder for the SEC fundamentals, insider, and sector-map data panels.")
+        description="Unified builder for the SEC fundamentals, insider, sector-map, filing-meta and filing-calendar data panels.")
     sub = ap.add_subparsers(dest="command", required=True)
 
     pf = sub.add_parser("fundamentals", help="SEC companyfacts -> Data/Fundamentals/")
@@ -1119,7 +1184,13 @@ def main() -> None:
     ps.add_argument("--tickers", nargs="+", help="with --finviz: pull only these tickers")
     ps.add_argument("--limit", type=int, help="with --finviz: cap how many universe names to pull")
 
-    pa = sub.add_parser("all", help="build all three panels (the nightly pipeline entry point)")
+    pm = sub.add_parser("filing_meta", help="SEC companyfacts -> Data/Fundamentals/filing_meta/")
+    pm.add_argument("--workers", type=int, default=min(8, (os.cpu_count() or 4)))
+
+    pc = sub.add_parser("filing_calendar", help="SEC submissions -> Data/SEC/filing_calendar/")
+    pc.add_argument("--workers", type=int, default=min(8, (os.cpu_count() or 4)))
+
+    pa = sub.add_parser("all", help="build all five panels (the nightly pipeline entry point)")
     pa.add_argument("--refresh-all", action="store_true",
                     help="re-download ALL raw SEC sources first (companyfacts ~1-2 GB + ~10 GB extract, "
                          "submissions ~600-900 MB, insider). Fetchers self-skip files <20h old.")
@@ -1140,6 +1211,10 @@ def main() -> None:
         if args.refresh:
             refresh_insider_raw()
         build_insider(runpercent=args.runpercent, only_ticker=args.ticker)
+    elif args.command == "filing_meta":
+        build_filing_meta_panel(workers=args.workers)
+    elif args.command == "filing_calendar":
+        build_filing_calendar_panel(workers=args.workers)
     elif args.command == "sector":
         if args.refresh:
             refresh_submissions_raw()
@@ -1152,5 +1227,9 @@ def main() -> None:
     print(f"  wall: {time.perf_counter() - t0:.1f}s")
 
 
+
+
 if __name__ == "__main__":
     main()
+
+

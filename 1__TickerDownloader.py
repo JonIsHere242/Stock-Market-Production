@@ -10,10 +10,31 @@ from urllib3.util.retry import Retry
 import sys
 from Util import get_logger, LogPerformance, dprint
 
+
 CONFIG = {
     "url": "https://www.sec.gov/files/company_tickers_exchange.json",
     "parquet_file_path": "Data/TickerCikData/TickerCIKs_{date}.parquet",
     "user_agent": "MarketAnalysis NotMyRealEmail@gmail.com"
+}
+
+
+# Manually blacklisted tickers: confirmed reverse-split / dying-penny-stock
+# garbage found polluting the price data lakes. HUBC showed a +1,554,481%
+# one-day close jump on 39 shares of volume (outright data corruption).
+# CENN/DHAI and the rest are real reverse splits on real tickers that have
+# since decayed >50% from their post-split peak to under $1 (serial-dilution
+# zombie pattern) -- removed 2026-08-23 by explicit operator decision, which
+# knowingly trades some survivorship bias in the training set for a cleaner
+# live pool.
+
+
+MANUAL_TICKER_BLACKLIST = {
+    "HUBC", "CENN", "DHAI",
+    "ECDA", "RDGT", "VCIG", "PRPH", "ZCMD", "CJET", "HCTI", "ASNS", "ORGN",
+    "PHGE", "ONCO", "CREG", "CPOP", "JAGX", "VMAR", "UCAR", "BURU", "BIAF",
+    "KALA", "GOVX", "MBRX", "LGHL", "ARTL", "VNRX", "NITO", "FTFT", "XIN",
+    "NIVF", "KITT", "JYD", "IMG", "NCL", "WORX", "BJDX", "ILLR", "FPAY","RBLX","CMG",
+    "ADTX", "SBEV",
 }
 
 def setup_args():
@@ -77,8 +98,6 @@ def is_problematic_ticker(company_name):
         r'dividend fund',
         r'closed.*end',
         r'open.*end',
-        
-        # Popular fund providers
         r'vanguard',
         r'ishares',
         r'spdr',
@@ -182,8 +201,9 @@ def download_and_process_data(logger, args):
         with LogPerformance("Filtering problematic tickers", logger=logger):
             dprint("Identifying problematic tickers...", level="INFO")
             
-            # Apply filtering function to the 'name' column
-            problematic_mask = df['name'].apply(is_problematic_ticker)
+            # Apply filtering function to the 'name' column, plus the manual
+            # symbol blacklist (confirmed reverse-split garbage / dying tickers)
+            problematic_mask = df['name'].apply(is_problematic_ticker) | df['ticker'].isin(MANUAL_TICKER_BLACKLIST)
             problematic_count = problematic_mask.sum()
             clean_count = len(df) - problematic_count
             
@@ -235,6 +255,9 @@ def download_and_process_data(logger, args):
         dprint(f"Error: {e}", level="ERROR")
         raise
 
+
+
+
 if __name__ == "__main__":
     args = setup_args()
     
@@ -260,3 +283,4 @@ if __name__ == "__main__":
     
     dprint("Script completed", level="SUCCESS")
     logger.info("Script completed")
+

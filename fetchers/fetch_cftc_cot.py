@@ -1,4 +1,4 @@
-"""Download CFTC Commitments of Traders (COT) — weekly futures positioning.
+"""Download CFTC Commitments of Traders (COT) - weekly futures positioning.
 
 Every Tuesday the CFTC releases positioning for commercial hedgers, large
 speculators, and small traders across every futures market. Useful for
@@ -6,9 +6,9 @@ sector ETFs / index futures regime context. Free and downloadable as
 annual zips of CSVs.
 
 Available reports:
-  - Legacy (Futures-Only and Combined Futures+Options) — 1986-present
-  - Disaggregated Reports — 2006-present (split traders into more buckets)
-  - TFF (Traders in Financial Futures) — 2010-present (for financial markets)
+  - Legacy (Futures-Only and Combined Futures+Options) - 1986-present
+  - Disaggregated Reports - 2006-present (split traders into more buckets)
+  - TFF (Traders in Financial Futures) - 2010-present (for financial markets)
 
 URL pattern: https://www.cftc.gov/files/dea/history/{report}_{year}.zip
 """

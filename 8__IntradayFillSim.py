@@ -4,8 +4,8 @@ Intraday Fill & Exit Fidelity Simulator
 =======================================
 Replays every trade the backtester chose against REAL intraday bars (1-minute now,
 tick-ready) under the LIVE broker's execution rules (9_SuperFastBroker.py), then
-checks whether the entry's statistical properties — the thing the model was trained
-to produce — survive realistic fills.
+checks whether the entry's statistical properties - the thing the model was trained
+to produce - survive realistic fills.
 
 Why this exists
 ---------------
@@ -16,7 +16,7 @@ daily view hides three things that decide whether the headline survives with rea
   1. ENTRY TIMING.  The live broker (9_SuperFastBroker.py) does NOT buy at the open.
      It waits until 10:00 ET (EDA: 9:30->10:00 is +256% Sharpe), aborts the whole day
      if SPY <= -0.5% from its open, and skips any name that gapped up > 1.5%. So the
-     real entry price — and whether the trade is taken at all — differs from the backtest.
+     real entry price - and whether the trade is taken at all - differs from the backtest.
 
   2. STOP-vs-TARGET SEQUENCE.  On a daily bar, if BOTH the -1.9% stop and the +3.5%
      target are inside [Low, High], the backtest cannot know which was hit first. At
@@ -29,10 +29,10 @@ daily view hides three things that decide whether the headline survives with rea
      (the rule the 10:00-entry EDA was built on).
 
 The headline output is NOT "does the 232% survive" (the equity curve, not the per-trade
-ledger, drives that — see project_intraday_fill_check). It is: bucket the TAKEN trades by
+ledger, drives that - see project_intraday_fill_check). It is: bucket the TAKEN trades by
 the model's UpProbability and confirm (a) realized return rises monotonically with
-UpProbability and (b) the calibrated probability is honest — realized up-rate ~= predicted
-P(up) — once the trade is executed the way it is executed for real.
+UpProbability and (b) the calibrated probability is honest - realized up-rate ~= predicted
+P(up) - once the trade is executed the way it is executed for real.
 
 Resolution-agnostic / tick-ready
 --------------------------------
@@ -63,13 +63,15 @@ import numpy as np
 import pandas as pd
 
 # ── Live-broker rule constants (mirror 9_SuperFastBroker.py) ─────────────────────
+from auxiliary import bracket_config as BRACKET   # single source of truth; see auxiliary/bracket_config.py
+
 ENTRY_HOUR          = 10
 ENTRY_MINUTE        = 0
 SPY_ABORT_THRESHOLD = -0.5    # skip ALL trades that day if SPY <= this % from its open
 STOCK_GAP_SKIP      = 1.5     # skip a name that gapped up > this % from its own open
-HARD_STOP_PCT       = 1.9     # hard stop % below entry
-STOP_FOR_RISK_PCT   = 1.75    # risk basis the broker uses to size the 2:1 target
-TARGET_RR           = 2.0     # reward:risk -> target = entry*(1 + 2*1.75%) = +3.5%
+HARD_STOP_PCT       = BRACKET.HARD_STOP_PCT      # hard stop % below entry
+STOP_FOR_RISK_PCT   = BRACKET.STOP_FOR_RISK_PCT  # risk basis sizing the target
+TARGET_RR           = BRACKET.TARGET_RR          # reward:risk
 
 # ── IBKR commission (mirror IBKRAdaptiveCommission in the backtester) ────────────
 COMM_PER_SHARE = 0.0035
@@ -139,7 +141,7 @@ def simulate_trade(bars: pd.DataFrame, entry_date, exit_date, bt_entry_price: fl
     Walk the real intraday path for one trade under the live broker bracket.
 
     `entry_date` is the backtester SIGNAL day; the real fill (live AND backtest) is the
-    NEXT trading session's open, so we enter on the first session strictly after it — which
+    NEXT trading session's open, so we enter on the first session strictly after it - which
     is also when the live broker reads the evening signals and buys at 10:00. The live order
     is tif=DAY, so the fill must be the *immediate* next session: if that session is missing
     from the lake we return NO_DATA rather than silently entering weeks later.
@@ -181,7 +183,7 @@ def simulate_trade(bars: pd.DataFrame, entry_date, exit_date, bt_entry_price: fl
 
     # ── Live filters → a VERDICT, but we still simulate the trade either way ──────
     # Recording the verdict without short-circuiting lets us measure what a SKIPPED
-    # trade WOULD have returned under live 10:00 entry — the only fair way to judge
+    # trade WOULD have returned under live 10:00 entry - the only fair way to judge
     # whether a filter adds value (vs comparing to an unachievable daily-open backtest).
     spy_move = spy_moves.get(entry_day) if spy_moves else None
     open_gap_pct = (px10 / sess_open - 1.0) * 100.0
@@ -268,7 +270,7 @@ def sharpe(x: np.ndarray) -> float:
 
 
 def trimmed_mean(x: np.ndarray, pct: float = 0.02) -> float:
-    """Mean after clipping the top/bottom `pct` tails — robust to corrupt-bar outliers."""
+    """Mean after clipping the top/bottom `pct` tails - robust to corrupt-bar outliers."""
     x = np.asarray(x, dtype=float)
     x = x[~np.isnan(x)]
     if len(x) < 5:
@@ -443,24 +445,24 @@ def main():
         L.append("> This is the per-TRADE distribution, not the equity-curve headline. Prefer the "
                  "trimmed mean / median: a few corrupt intraday prints distort the raw mean.\n")
 
-        # Exit-reason mix — the daily backtest cannot see intraday stop/target touches.
+        # Exit-reason mix - the daily backtest cannot see intraday stop/target touches.
         stop_sh = t['SimExitReason'].isin(['STOP', 'STOP_GAP', 'STOP_AMBIG']).mean() * 100
         tgt_sh = t['SimExitReason'].isin(['TARGET', 'TARGET_GAP']).mean() * 100
         cls_sh = (t['SimExitReason'] == 'CLOSE').mean() * 100
         L.append(f"Intraday exit mix: **{stop_sh:.0f}% hit the −{HARD_STOP_PCT}% stop**, "
                  f"{tgt_sh:.0f}% hit the +2:1 target, {cls_sh:.0f}% exited at close. "
                  f"(The daily backtest logged its stop/target on daily H/L and recorded almost no "
-                 f"stop-outs — this is the fidelity gap.)\n")
+                 f"stop-outs - this is the fidelity gap.)\n")
 
     # 2b. Do the live filters actually add value? Judge SKIPPED trades by what they
-    #     WOULD have returned under live 10:00 entry — NOT by the unachievable
+    #     WOULD have returned under live 10:00 entry - NOT by the unachievable
     #     daily-open backtest number (the gap/dip is already gone by 10:00).
     L.append("## 2b. Do the live filters earn their keep? (counterfactual at 10:00)\n")
     sg = sim_df[ok & (sim_df['FilterVerdict'] == 'SKIP_GAP')]
     ss = sim_df[ok & (sim_df['FilterVerdict'] == 'SKIP_SPY')]
     L.append("Each skipped trade re-simulated as if it HAD been entered at 10:00 under the "
              "same bracket. A filter adds value only if the trades it removes are worse than "
-             "the ones it keeps — judged on the live sim, not the backtest.\n")
+             "the ones it keeps - judged on the live sim, not the backtest.\n")
     L.append("| group | n | backtest mean % | **sim-net mean %** | sim win % |")
     L.append("|---|---|---|---|---|")
     L.append(f"| TAKEN (kept) | {len(t)} | {t['BtPnLPct'].mean():+.3f} | "
@@ -474,14 +476,14 @@ def main():
     L.append("")
     if len(sg):
         verdict_gap = ("ADDS VALUE" if sg['SimPnLPctNet'].mean() < t['SimPnLPctNet'].mean()
-                       else "COSTS — removes trades that beat the kept set")
+                       else "COSTS - removes trades that beat the kept set")
         L.append(f"- **gap-skip**: dropped trades return {sg['SimPnLPctNet'].mean():+.2f}% live vs "
                  f"{t['SimPnLPctNet'].mean():+.2f}% for kept → **{verdict_gap}**. "
                  f"(Note the backtest's {sg['BtPnLPct'].mean():+.2f}% on these is NOT live-achievable "
-                 f"— it enters at the open and banks the gap the live system can't.)")
+                 f" - it enters at the open and banks the gap the live system can't.)")
     if len(ss):
         verdict_spy = ("ADDS VALUE" if ss['SimPnLPctNet'].mean() < t['SimPnLPctNet'].mean()
-                       else "COSTS on this sample — removes above-average trades")
+                       else "COSTS on this sample - removes above-average trades")
         L.append(f"- **SPY-abort**: dropped trades return {ss['SimPnLPctNet'].mean():+.2f}% live vs "
                  f"{t['SimPnLPctNet'].mean():+.2f}% for kept → **{verdict_spy}** "
                  f"(small n={len(ss)}; the live EDA that justified it used a different "
@@ -508,7 +510,7 @@ def main():
             L.append(f"Bucket mean-return monotonic in UpProbability: **{mono}**\n")
 
         # Calibration: predicted P(up) vs realized profitable-trade rate
-        L.append("### Calibration — predicted P(up) vs realized profitable-trade rate\n")
+        L.append("### Calibration - predicted P(up) vs realized profitable-trade rate\n")
         if not bt_tbl.empty:
             cal = bt_tbl[['up_prob_mean', 'realized_up_rate_%', 'n']].copy()
             cal['predicted_%'] = cal['up_prob_mean'] * 100
@@ -521,7 +523,7 @@ def main():
                      f"(SimExit > SimEntry under the bracket), which is a RELATED-BUT-DIFFERENT "
                      f"event from the model's training label (next-day up move). Read this as "
                      f"'does UpProbability track real trade profitability', not strict label "
-                     f"calibration. The tight match at 4/5 buckets says yes — except the "
+                     f"calibration. The tight match at 4/5 buckets says yes - except the "
                      f"top-confidence bucket, which is consistently overconfident.\n")
     else:
         L.append("_UpProbability not available on enough trades to validate._\n")
@@ -558,7 +560,7 @@ def main():
 
     # ── Console summary ──────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
-    print("  INTRADAY FILL SIM — SUMMARY")
+    print("  INTRADAY FILL SIM - SUMMARY")
     print("=" * 72)
     print(f"  Trades total : {n_total}")
     for k, v in status_counts.items():

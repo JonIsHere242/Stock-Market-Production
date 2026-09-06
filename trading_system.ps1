@@ -21,6 +21,29 @@ $brokerCutoffET = "10:30"           # stop retrying after this
 $lockFile       = "$logDir\.trading_system.lock"
 $alertFile      = "$logDir\BROKER_ALERT.txt"
 
+# Stage stdout is a pipe, so Python defaults it to cp1252 and any non-ASCII glyph a stage
+# prints raises UnicodeEncodeError (2026-08-04: killed 2__PriceDownloader's connection
+# retries). Force UTF-8 stdio for every stage; this does not change open() file defaults.
+$env:PYTHONIOENCODING = "utf-8"
+# BASELINE 2026-08-29 (memo project_exit_sweeps_trigger_arm_2026_08_29). Set HERE, above
+# the mode branches, so the evening nightly and the morning broker read one value. The
+# code defaults already carry these; the env pins them for hand runs and makes rollback
+# a one-line edit. Sim: gap gate 4%/2 + sell half at +15%, 8 paired seeds, AnnRet +45.5
+# t 9.3 8/8, maxDD -3.5 7/8, mean/TRADE +0.66 8/8.
+#   gap gate: auxiliary/trigger_entry.apply_gap_gate runs on the WIDE pool before the
+#   reach cut; the pool is widened 24 -> 36 so 12 names survive. Rollback:
+#   TRIGGER_GAP_GATE_N = "0". Scale-out rollback: BRACKET_RUNNER_TRIG = "10",
+#   BRACKET_RUNNER_KEEP = "0.2".
+$env:BT_SIGNAL_POOL_SIZE  = "36"
+$env:TRIGGER_GAP_GATE_N   = "2"
+$env:TRIGGER_GAP_GATE_PCT = "4.0"
+$env:BRACKET_RUNNER_TRIG  = "15"
+$env:BRACKET_RUNNER_KEEP  = "0.5"
+# And decode it as UTF-8 too: PowerShell reads native stdout with the OEM codepage
+# (cp437) by default, which turned the stages' UTF-8 glyphs into mojibake
+# (2026-08-04 evening run: an em dash printed as "GAMMA-C-CEDILLA-o").
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
 if (!(Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
 function Write-Log($message, $color = "White") {
@@ -82,10 +105,14 @@ function Run-Stage($name, $file, $argString) {
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     Push-Location $basePath
     try {
+        # PS 5.1 wraps native stderr lines in ErrorRecords when 2>&1 is used, so python's
+        # logging (which writes to stderr) rendered as red NativeCommandError blocks with
+        # CategoryInfo noise in the transcript. Unwrap them back to plain text.
+        $unwrap = { if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { $_ } }
         if ($argString) {
-            & $pythonExe $scriptPath ($argString -split " ") 2>&1 | Tee-Object -FilePath $transcript | Out-Host
+            & $pythonExe $scriptPath ($argString -split " ") 2>&1 | ForEach-Object $unwrap | Tee-Object -FilePath $transcript | Out-Host
         } else {
-            & $pythonExe $scriptPath 2>&1 | Tee-Object -FilePath $transcript | Out-Host
+            & $pythonExe $scriptPath 2>&1 | ForEach-Object $unwrap | Tee-Object -FilePath $transcript | Out-Host
         }
         $code = $LASTEXITCODE
     } finally { Pop-Location }
@@ -138,7 +165,7 @@ Set-Content -Path $lockFile -Value $PID
 if ($Mode -eq "auto") {
     # Wide windows, not exact-hour matches: with StartWhenAvailable the scheduler fires
     # missed triggers whenever the machine comes back, and the old `-eq 17` resolved a
-    # catch-up start at 18:05 to "do nothing" — one silent way the nightly pipeline
+    # catch-up start at 18:05 to "do nothing" - one silent way the nightly pipeline
     # never ran (07-06..07-10 stale-book incident). Morning 05:00-11:59; evening
     # 15:00-03:59 (a small-hours catch-up run still finishes ~70 min later, clear of
     # the 07:28 morning task and its lock).
@@ -166,7 +193,7 @@ try {
         }
 
         # Catch-up starts: past the broker cutoff there is nothing useful or safe
-        # left to do this morning — do not funnel midday, do not launch the broker.
+        # left to do this morning - do not funnel midday, do not launch the broker.
         if ((Get-ETNow) -ge (Get-ETToday $brokerCutoffET)) {
             Send-Alert "Morning run started after the $brokerCutoffET ET cutoff (catch-up start?). No trades today."
             exit 1
@@ -243,7 +270,17 @@ except Exception as e:
         do {
             $attempt++
             Write-Log "Broker attempt $attempt at $((Get-ETNow).ToString('HH:mm:ss')) ET" "Cyan"
-            $broker = Run-Stage "Daily Broker" "9_SuperFastBroker.py" ""
+            # Exit-order stack (2026-07-29): STP LMT floor 4 half-spreads + next-morning
+            # stranded-stop sweep, and MOC for timeout exits. Validated +0.031pp/signal,
+            # p<0.001, 8/8 books (analysis_output/EXEC_ORDER_TYPE_REPORT.md). Remove the
+            # flags to revert to bare STP / MKT exits.
+            # --exp-entry-escalate-min 3 REMOVED 2026-08-29: since 2026-08-28 the broker
+            # runs the trigger arm by default and rejects escalation at argparse
+            # (9_SuperFastBroker.py, 'mutually exclusive'), so the flag made every launch
+            # exit 2 before IBKR and the loop below relaunched to the cutoff with no
+            # orders. Escalation belongs to the old marketable-entry path only; to run
+            # that path again pass "--no-trigger-entry --exp-entry-escalate-min 3".
+            $broker = Run-Stage "Daily Broker" "9_SuperFastBroker.py" "--exp-stop-limit --exp-moc-exit"
             $outcome = Get-BrokerOutcome $broker
             switch ($outcome) {
                 "TRANSMITTED" {
@@ -281,7 +318,7 @@ except Exception as e:
 
         # Partial-bar guard: a StartWhenAvailable catch-up start during regular trading
         # hours would pull an in-progress daily bar and contaminate features/predictions.
-        # Exit instead — the regular 17:00 trigger fires again within 24h. (Normal 17:00
+        # Exit instead - the regular 17:00 trigger fires again within 24h. (Normal 17:00
         # local starts are after the 16:00 ET close and never hit this.)
         $etNow = Get-ETNow
         if ($etNow.DayOfWeek -ne 'Saturday' -and $etNow.DayOfWeek -ne 'Sunday' -and
@@ -303,6 +340,22 @@ except Exception as e:
         $stages = @(
             @{ Name = "Ticker Downloader";  File = "1__TickerDownloader.py";  Args = "--ImmediateDownload" },
             @{ Name = "Price Downloader";   File = "2__PriceDownloader.py";   Args = "--RefreshMode" },
+            # Market/macro lakes (Indexes, IndexesFull, FRED, Treasury, FINRA,
+            # KenFrench, CFTC, Shiller). ADDED 2026-07-28 because NOTHING in this
+            # pipeline ever refreshed them: the "Data Panels" stage below only
+            # delegates to three SEC fetchers (companyfacts/insider/submissions),
+            # so every market/macro lake had been frozen since 2026-05-28 -- the
+            # last time the fetchers were run by hand. Data/Indexes alone was
+            # ~17 trading sessions stale, which silently took ~88 index-relative
+            # panel columns (alpha_*/beta_*/corr_*, the whole cross-asset /
+            # beta_risk vein) to all-NaN and left the predictor's spy200v2
+            # neutralization beta leg inert. No error was raised anywhere.
+            # Skips lakes already current, so a normal night is cheap. Exits
+            # non-zero if a CRITICAL lake is still stale afterwards, which trips
+            # the Send-Alert below. Runs before Data Panels / Feature Framework
+            # so every consumer sees fresh data.
+            # Census/gate any time: python auxiliary/lake_freshness.py [--strict]
+            @{ Name = "Market Data Refresh"; File = "fetchers/refresh_market_data.py"; Args = "" },
             # Non-OHLCV data panels (SEC fundamentals + Form 4 insider + sector map) the feature
             # framework & macro filter consume. --refresh-all re-pulls every raw SEC source first
             # (fetchers self-skip files <20h old). Runs AFTER prices (needs the PriceData universe)
@@ -312,24 +365,87 @@ except Exception as e:
             # whose 29 cols the ship predictor drops anyway (--drop_feature_patterns) -- they
             # were ~16% of framework compute for ZERO model effect (benchmark 2026-06-19, no
             # dependents). Computing-then-dropping was pure waste.
-            @{ Name = "Feature Framework";  File = "3__FeatureFramework.py";  Args = "--all --exclude vvg vaq_vg rvg_wl volume_spectral_splatter" },
-            @{ Name = "Predictor";          File = "4__Predictor.py";         Args = "--predict_only --input_dir Data/ProcessedData_v2 --target_column percent_change_close --drop_features_exact percent_change_close,VIX_Close --drop_feature_patterns tda_embed,mp3_,vvg_,vaq_,rvg_wl,volume_spectral_splatter,vg_ --model_dir Data/_ship_v2/model" },
+            # --workers 16: the default (32) OOM'd on 2026-07-30 (BrokenProcessPool at
+            # ticker 682/4250, "Unable to allocate" in 8 workers); the 07-31 04:00 manual
+            # rerun at 16 workers finished 4250/4250 ok=all on the same panel.
+            @{ Name = "Feature Framework";  File = "3__FeatureFramework.py";  Args = "--all --exclude vvg vaq_vg rvg_wl volume_spectral_splatter --workers 16" },
+            # --neutralize (Phase 13, folded in from 4.5__NeutralizePreds.py on 2026-07-27):
             # SPY-200EMA adaptive pred-space factor neutralization (beta/atr/log-dollar-vol,
-            # per-day, zero fitted params): dose 0.15 above the SPY 200d EMA, 0.30 below,
-            # then swap into Data/RFpredictions (raw kept at _raw).
+            # per-day, zero fitted params): dose 0.15 above the SPY 200d EMA, 0.30 below.
+            # Runs in-memory at the end of inference, so Data/RFpredictions is written
+            # ALREADY neutralized (each row keeps its raw value in `raw_up_prob`).
             # Validated 07-12: live window 80.2% vs 52.2% for fixed 0.30 (2 seeds); fixed-0.30
             # history: pinned 4-seed +51pp (07-01), live-window 4-seed +19-24pp (07-03).
             # FAIL-SAFE: stale/missing SPY flag degrades that day to dose_below (=0.30, the old
-            # default); on gate failure it exits non-zero and leaves preds RAW.
-            @{ Name = "Neutralize Preds";   File = "4.5__NeutralizePreds.py"; Args = "--mode spy200v2 --dose_above 0.15 --dose_below 0.30" },
+            # default); on gate failure it writes RAW preds and exits non-zero (this stage is
+            # then reported failed, but the backtester still gets a usable signal).
+            @{ Name = "Predictor";          File = "4__Predictor.py";         Args = "--predict_only --input_dir Data/ProcessedData_v2 --target_column percent_change_close --drop_features_exact percent_change_close,VIX_Close --drop_feature_patterns tda_embed,mp3_,vvg_,vaq_,rvg_wl,volume_spectral_splatter,vg_ --model_dir Data/_ship_v2/model --neutralize --neut_mode spy200v2 --neut_dose_above 0.15 --neut_dose_below 0.30 --cm_k 0.5 --cm_spans 3,6,12" },
+            # CONVICTION MOMENTUM = Phase 14 of the predictor, ON BY DEFAULT since 2026-07-29
+            # (the --cm_k/--cm_spans above are the defaults, stated explicitly so the ship
+            # config is readable here; --no_conviction_momentum is the ablation switch). It was
+            # the standalone 4.6__ConvictionMomentum.py until the 07-28 fold-in and is now
+            # retired to _archive/ -- its A/B mode lives on as `4__Predictor.py --cm_retilt`.
+            # Per ticker, causally, on the FINAL (post-neutralization) UpProbability:
+            #     up' = clip(up + k * mean_over_spans(up - EMA_span(up)), 0.30, 0.70)
+            # = a tilt toward names whose model conviction is RISING. Mechanism: `can_buy` is a
+            # WITHIN-TICKER SPIKE DETECTOR (fires when a ticker clears its OWN rolling 90/95th
+            # percentile), so amplifying a name's deviation from its own trend makes genuine
+            # rising-conviction moves clear that bar. The exact inverse (EMA smoothing) LOST
+            # 27-32pp, so the sign is well identified.
+            # Full sim, main 252d window, seed 42: ann 59.4 -> 98.7, Sharpe 1.48 -> 2.40,
+            # maxDD 27.1 -> 12.2, DD duration 128 -> 41d, trades +1.7%. The 8-seed baseline null
+            # is 59.4-62.1 -> +36pp above its BEST seed, zero overlap on any metric. Favourable
+            # in all 3 backtest windows; parameter plateau over k .5/1.0 x span 3/6/12.
+            # !! REGIME-DEPENDENT: it wins while the level signal is DEGRADED (Jan-Jun 2026:
+            # base -7.9% vs cm +58.7%) and LOSES while it is healthy (Sep-Dec 2025: base +68.4%
+            # vs cm +16.1%). If the healthy regime returns, revisit -- drop this stage or lower --k.
+            # FAIL-SAFE: gates on ticker count, non-finite values, clip escape and an inert-
+            # transform check; on any gate failure Phase 14 ships the UN-TILTED preds and the
+            # predictor exits non-zero (stage reported failed, backtester still gets a signal).
+            # Rollback: every row keeps its pre-tilt value in the `pre_cm_up_prob` column.
+            # 2026-08-30: 5__ IS the live configuration now (generated from the trigger-arm
+            # fork by experimental/exit_sweeps/make_5v4.py --prod): trigger entry, gap gate,
+            # sell half at +15%, model exits off, honest cashadjust, pool 36 in UpProb order.
+            # The legacy open-entry nightly is in experimental/_rollback/2026-08-30-legacy-5__/.
             @{ Name = "Nightly BackTester"; File = "5__NightlyBackTester.py"; Args = "--force" }
         )
         # Pin the backtester tie-break seed: unseeded runs swing +-20-40pp on identical preds
         # (project_backtest_determinism_2026_06_29) and make nightly reports incomparable.
         $env:BT_SAMPLE_SEED = "42"
+        # Pin the candidate-ranking rule (low_atr: +14.07pp over 6 asof anchors, 6/6;
+        # also the arm the 2026-07-29 exit package was validated on). Without the pin,
+        # scheduled runs rank 'shipped' while hand runs may not, and books diverge.
+        $env:BT_SELRULE = "low_atr"
+        # 2026-08-29: the nightly's OWN simulation used to run model exits (momentum /
+        # prob_drop) that the broker never runs, so its headline described a different
+        # exit policy from the one trading. Match the broker: bracket, EOD ratchet,
+        # scale-out and the age clock only. Does not touch the signal pool.
+        $env:BT_PROD_EXITS = "1"
+        # Free-memory precondition for the Predictor (2026-08-29). 4__Predictor.py:1645
+        # allocates one (rows x 1414) float32 block, 16.2 GiB on the 2026-08-26 panel; the
+        # Feature Framework's 16 workers do not release pages inside the 20 s pause, and
+        # 08-19 / 08-26 both OOM'd there while a rerun on 44.6 GB free passed unchanged.
+        # Warns and proceeds rather than skipping, so a slow release never costs the session.
+        function Wait-FreeMemory($needGB, $maxMinutes, $stageName) {
+            $deadline = (Get-Date).AddMinutes($maxMinutes)
+            while ($true) {
+                $freeGB = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)
+                if ($freeGB -ge $needGB) {
+                    Write-Log "$stageName precondition OK: ${freeGB} GB free (need $needGB)." "Green"
+                    return $true
+                }
+                if ((Get-Date) -ge $deadline) {
+                    Send-Alert "$stageName starting with only ${freeGB} GB free (need $needGB) after $maxMinutes min. Expect an ArrayMemoryError at 4__Predictor.py:1645."
+                    return $false
+                }
+                Write-Log "$stageName waiting for RAM: ${freeGB} GB free, need $needGB. Retrying in 30s." "Yellow"
+                Start-Sleep -Seconds 30
+            }
+        }
         $okCount = 0
         for ($i = 0; $i -lt $stages.Count; $i++) {
             $s = $stages[$i]
+            if ($s.File -eq "4__Predictor.py") { Wait-FreeMemory 28 15 "Predictor" | Out-Null }
             $r = Run-Stage $s.Name $s.File $s.Args
             $stageOk = $r.ok
             # 2__PriceDownloader swallows exceptions and exits 0 - verify by output
@@ -348,7 +464,7 @@ except Exception as e:
         Write-Log "Evening pipeline: $okCount/$($stages.Count) stages OK." $col
 
         # End-to-end freshness proof: the whole point of this mode is a 12-pool dated
-        # for the NEXT session. Verify it, don't assume it — 07-06..07-10 the pipeline
+        # for the NEXT session. Verify it, don't assume it - 07-06..07-10 the pipeline
         # simply never ran and nothing noticed until the broker refused to trade.
         $poolCheckPy = @"
 import datetime, pandas as pd
@@ -366,6 +482,34 @@ except Exception as e:
             Write-Log "Signal pool verified fresh: $poolCheck" "Green"
         } else {
             Send-Alert "EVENING PIPELINE ENDED WITHOUT A FRESH SIGNAL POOL ($poolCheck). Tomorrow morning will NOT trade unless this is fixed tonight."
+        }
+
+        # Signal-drift monitor (added 2026-07-30). Read-only, non-blocking, and runs
+        # AFTER the predictor stage so it measures tonight's freshly written
+        # Data/RFpredictions. Top-decile lift is the metric that actually decays
+        # (+0.0451 in 2025Q3 down to +0.0139 in 2026Q1); logging it every night beats
+        # rediscovering the decay by hand a quarter late. --drift is a quick mode of
+        # signal_autopsy.py that may not exist yet, so a non-zero exit or a thrown
+        # error is written to the log and swallowed. This monitor must never block or
+        # fail the pipeline. History: analysis_output\signal_drift_log.txt
+        $driftLog = "$basePath\analysis_output\signal_drift_log.txt"
+        try {
+            New-Item -ItemType Directory -Path "$basePath\analysis_output" -Force | Out-Null
+            Add-Content -Path $driftLog -Value ""
+            Add-Content -Path $driftLog -Value "===== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') signal_autopsy --drift ====="
+            Push-Location $basePath
+            try {
+                $driftOut = & $pythonExe "$basePath\auxiliary\signal_autopsy.py" --drift 2>&1 | Out-String
+                $driftCode = $LASTEXITCODE
+            } finally { Pop-Location }
+            if ($driftCode -ne 0) {
+                Add-Content -Path $driftLog -Value "MONITOR FAILED exit=$driftCode (does signal_autopsy.py support --drift yet?)"
+            }
+            Add-Content -Path $driftLog -Value $driftOut
+            Write-Log "Signal drift monitor logged (exit=$driftCode) -> analysis_output\signal_drift_log.txt" "Gray"
+        } catch {
+            try { Add-Content -Path $driftLog -Value "MONITOR ERROR $($_.Exception.Message)" } catch {}
+            Write-Log "Signal drift monitor errored, ignored: $($_.Exception.Message)" "Yellow"
         }
     }
     else {

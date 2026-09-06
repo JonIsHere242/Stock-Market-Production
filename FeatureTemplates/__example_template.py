@@ -1,6 +1,6 @@
 """
 ================================================================================
-FEATURE BLOCK TEMPLATE  —  READ THIS BEFORE WRITING A NEW FEATURE
+FEATURE BLOCK TEMPLATE - READ THIS BEFORE WRITING A NEW FEATURE
 ================================================================================
 
 PURPOSE
@@ -15,21 +15,21 @@ HOW THE PIPELINE WORKS (brief)
 -------------------------------
 1. 3__FeatureFramework.py scans the FeatureTemplates/ folder at runtime.
 2. It imports every .py file whose name does NOT start with an underscore (_).
-   This file starts with __ so it is skipped — it is documentation only.
+   This file starts with __ so it is skipped - it is documentation only.
 3. From each imported file it reads two things:
-     - METADATA  (dict)  — describes the block and its column dependencies
-     - compute() (func)  — the actual feature computation
+     - METADATA  (dict) - describes the block and its column dependencies
+     - compute() (func) - the actual feature computation
 4. It builds a dependency graph from METADATA["requires"] / METADATA["produces"]
    and runs blocks in the correct order so no block ever sees a missing column.
 5. After all blocks run the columns are reordered:
-     Date, Ticker, Open, High, Low, Close, Volume  →  then everything else A–Z
+     Date, Ticker, Open, High, Low, Close, Volume  →  then everything else A-Z
 
 WHAT YOU NEED TO PROVIDE
 -------------------------
 Every feature file must expose exactly two things at module level:
 
-    METADATA : dict   — see the template below for every required key
-    compute  : func   — signature: (df: pd.DataFrame) -> pd.DataFrame
+    METADATA : dict - see the template below for every required key
+    compute  : func - signature: (df: pd.DataFrame) -> pd.DataFrame
 
 Nothing else is required. Keep files focused: one feature or one tightly related
 family of features per file. If a file grows past ~150 lines, split it.
@@ -97,7 +97,7 @@ compute() CONTRACT
     - Do NOT drop, rename, or modify any existing column.
     - Do NOT sort or reindex df (the orchestrator handles that).
     - Do NOT import from 3__AlphaSensitivity.py or other pipeline files.
-    - Handle NaN gracefully: rolling windows produce NaN at the start — that
+    - Handle NaN gracefully: rolling windows produce NaN at the start - that
       is expected and fine. Do not fill or drop NaN rows.
     - Keep it stateless: no globals, no side effects, no file I/O.
 
@@ -126,7 +126,7 @@ EXAMPLE: RSI (Relative Strength Index, 14-period)
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# METADATA  —  fill this in for every new feature file
+# METADATA - fill this in for every new feature file
 # ---------------------------------------------------------------------------
 METADATA = {
     "name":        "example_rsi",
@@ -139,7 +139,7 @@ METADATA = {
 }
 
 # ---------------------------------------------------------------------------
-# compute()  —  the feature logic goes here
+# compute() - the feature logic goes here
 # ---------------------------------------------------------------------------
 def compute(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -148,7 +148,7 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
     RSI = 100 - 100 / (1 + RS)   where RS = avg_gain / avg_loss over 14 bars.
     Values near 100 = strongly overbought.
     Values near 0   = strongly oversold.
-    First 13 rows will be NaN (insufficient history) — this is expected.
+    First 13 rows will be NaN (insufficient history) - this is expected.
     """
 
     # ---- Step 1: compute daily price changes --------------------------------

@@ -1,4 +1,4 @@
-"""Download SEC Insider Transactions Data Sets — pre-parsed Form 3/4/5 by quarter.
+"""Download SEC Insider Transactions Data Sets - pre-parsed Form 3/4/5 by quarter.
 
 Each quarter (2006 Q1 onward) the SEC's Office of Structured Disclosure publishes a
 clean tab-delimited extract of every ownership filing (Forms 3, 4, 5 and amendments):
@@ -17,7 +17,7 @@ clean tab-delimited extract of every ownership filing (Forms 3, 4, 5 and amendme
   DERIV_HOLDING.tsv     derivative holdings
   FOOTNOTES.tsv / OWNER_SIGNATURE.tsv
 
-These are the clean full-universe source for an insider buying/selling feature — no need
+These are the clean full-universe source for an insider buying/selling feature - no need
 to parse millions of raw Form 4 XML filings. ~8-15 MB per quarter compressed (the entire
 2006-present archive is well under ~1 GB).
 

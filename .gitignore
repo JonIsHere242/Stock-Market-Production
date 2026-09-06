@@ -1,5 +1,5 @@
 # =====================================================================
-#  Stock-Market — push CODE, never data / secrets / scratch.
+#  Stock-Market - push CODE, never data / secrets / scratch.
 #  Philosophy: track the running system (main whole-number pipeline +
 #  FeatureFramework + FeatureDiscovery + fetchers + libs). Everything
 #  regenerable, machine-local, or experimental stays off GitHub.
@@ -10,6 +10,8 @@
 Claud-API-KEY.txt
 .alpaca_keys
 .env
+.env.*
+!.env.example
 *.pem
 *.key
 
@@ -43,12 +45,23 @@ Data/
 # --- editor / scratch backups ---
 *.bak
 
+# --- machine-local optimized xgboost build (CPU-only, clang-cl znver4; see
+#     memory/project_xgb_znver4_build_2026_08_06.md for rebuild recipe) ---
+xgb_znver4/
+run_42_fast.ps1
+
 # --- research scratch & backups (not the running system) ---
 analysis_output/
 _backups/
 _archive/
 experimental/
 FeatureTemplates/_audit_backups/
+
+# --- the attic: staging for code evacuated from the working tree (2026-08-28).
+#     Moved, never deleted; every entry is recorded in _ATTIC/MANIFEST.csv and can
+#     be put back with `python tools/attic.py restore <path>`. This directory is
+#     meant to be moved off C: by hand, see _ATTIC/README.md. ---
+_ATTIC/
 
 # --- ungated candidate feature blocks (~200k LOC of machine-generated churn) ---
 # The factory emits FeatureTemplates/_cand_*.py by the hundred; the vast majority
@@ -80,4 +93,79 @@ wait_then_sizer.py
 .claude/settings.local.json
 .claude/docs/
 
-# Note: showcase/*.pdf and showcase/*.html are intentionally tracked (portfolio).
+# --- PUBLISHED SURFACE (2026-09-06) --------------------------------------------
+# The public repo is the pipeline and the libraries it imports, nothing else.
+# Everything below is kept local on purpose. Rules are last-match-wins, so the
+# un-ignore lines at the end of each group are what actually ships.
+
+# Portfolio and job-application material. Contains a resume and firm-branded
+# cover letters, so the whole tree stays private.
+showcase/
+
+# Read-only autopsy pages. Every production caller imports it behind a
+# try/except with a no-op stand-in, so the pipeline runs identically without it.
+diagnostics/
+
+# Agent skills, classification notes and machine state.
+.claude/
+docs/
+
+# Ledger and dashboard tool, plus the two auxiliary modules only it and the
+# diagnostics suite import.
+10__FinalSolution.py
+auxiliary/final_dashboard.py
+auxiliary/final_report.py
+
+# Retired trees still present in some working copies.
+v2/
+_parity/
+
+# Loose data at the repo root. Correlations.parquet, the trade history and the
+# live book were all tracked by accident until 2026-09-06.
+/*.parquet
+/*.html
+
+# Markdown, except the one file that documents the repo. The un-ignore is
+# anchored to the root, otherwise it matches every nested README.md too.
+*.md
+!/README.md
+
+# Editor config, dated backups the *.bak rule misses, the paper-broker launcher
+# whose target is not published, and the curated changelog.
+.vscode/
+*.bak_*
+launchers/run_paper_trigger.bat
+ledger/
+
+# THE FEATURE LIBRARY IS NOT PUBLISHED. The promoted blocks are the model's edge
+# and the candidate blocks are ~200k lines of machine-generated churn that would
+# own GitHub's language stats. What ships is the block contract (the documented
+# template) plus ten candidate blocks as worked examples, none of them promoted.
+FeatureTemplates/*
+!FeatureTemplates/__example_template.py
+!FeatureTemplates/_cand_ext5_abnormal_vol_response.py
+!FeatureTemplates/_cand_ff06280034a_info_theory_sampen_vol_120.py
+!FeatureTemplates/_cand_ff06280034b_volume_price_obv_divergence_40.py
+!FeatureTemplates/_cand_ff06282240_factor_covar_conditional_meanret.py
+!FeatureTemplates/_cand_ff06282347f_distribution_conditional_skew_downup_60.py
+!FeatureTemplates/_cand_ff06290023j_intangible_revenue_per_share_growth.py
+!FeatureTemplates/_cand_ff0703c_path_geometry_vertex_angle_sharpness_mean_60.py
+!FeatureTemplates/_cand_ff0703g_ohlc_range_kunitomo_bridge.py
+!FeatureTemplates/_cand_ff0801p_anchoring_cgo_reference_gap.py
+!FeatureTemplates/_cand_gap0903_rce_inside_outside.py
+
+# Feature discovery: the gate and the audit tools ship, the idea banks do not.
+FeatureDiscovery/*
+!FeatureDiscovery/validate_feature.py
+!FeatureDiscovery/audit_features.py
+!FeatureDiscovery/book_target.py
+
+# --- execution client: venv and packaged customer bundles ---
+client_env/
+_dist/
+
+# --- curated system changelog: kept local. It was briefly un-ignored as
+#     "knowledge, not data", but the published surface is the pipeline only, and
+#     a change log is internal history. Generated ledger artifacts under
+#     Data/ledger/ were always ignored.
+ledger/

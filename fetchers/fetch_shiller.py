@@ -51,7 +51,7 @@ def fetch() -> None:
         df = df[df[num_cols].notna().any(axis=1)].reset_index(drop=True)
         out = OUT_DIR / "shiller_data.parquet"
         df.to_parquet(out, index=False)
-        log(f"  parsed Data sheet → {out.name} ({len(df):,} rows, {fmt_bytes(out.stat().st_size)})")
+        log(f"  parsed Data sheet -> {out.name} ({len(df):,} rows, {fmt_bytes(out.stat().st_size)})")
     except Exception as e:
         log(f"  WARN: could not parse Data sheet to parquet ({e}); raw xls saved")
 

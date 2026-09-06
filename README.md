@@ -10,10 +10,15 @@ describes what the code does today, including the parts that exist only because 
 
 ## What is in this repository
 
-Code and configuration, about 930 tracked files. The `Data/` tree (per-ticker price parquets, processed
-feature panels, SEC bulk downloads, the trained model), API keys, `experimental/`, `analysis_output/` and
-the machine-generated candidate feature blocks are excluded by `.gitignore`. `setup.ps1` scaffolds the
-directory tree and drops key templates so a fresh clone can rebuild the data side from scratch.
+The pipeline and the libraries it imports, 80 files. What is kept out on purpose: the `Data/` tree
+(per-ticker price parquets, processed feature panels, SEC bulk downloads, the trained model), API keys,
+the A/B rigs under `experimental/`, the diagnostics suite, and the feature library. `setup.ps1` scaffolds
+the directory tree and drops key templates so a fresh clone can rebuild the data side from scratch.
+
+The feature library is the omission worth naming. `FeatureTemplates/` holds close to 2,000 blocks locally,
+and none of the promoted ones are published, because those are the model's edge. What ships is the block
+contract, `FeatureTemplates/__example_template.py`, plus ten candidate blocks as worked examples of the
+format. The framework that loads them is here in full.
 
 ```text
 1__TickerDownloader.py     universe from SEC company_tickers
@@ -25,7 +30,8 @@ fetchers/                  raw source downloaders (SEC, FINRA, FRED, Treasury, C
 build_data_panels.py       SEC fundamentals, Form 4 insider, sector map
 builders/                  the filing-meta and filing-calendar panel builders it shells out to
 3__FeatureFramework.py     plugin feature engine -> Data/ProcessedData_v2/
-FeatureTemplates/          the feature blocks themselves, one file per block
+FeatureTemplates/          the block contract plus ten candidate blocks as examples; the
+                           promoted library is not published
 4__Predictor.py            XGBoost train and inference, plus pred-space neutralization and the
                            conviction tilt -> Data/RFpredictions/
 5__NightlyBackTester.py    backtrader sim of the live configuration -> Data/0__Signals.parquet,
@@ -42,8 +48,7 @@ auxiliary/bracket_config.py the one place the exit bracket is defined
 launchers/                 the .bat files that start the broker (dry, live, paper)
 Util.py                    shared library: can_buy(), PositionSizer, logging, calendars
 trading_system.ps1         the orchestrator both scheduled tasks call
-diagnostics/               read-only HTML autopsy of the whole funnel, money out to features
-FeatureDiscovery/          the candidate gate (validate_feature.py) and the idea banks
+FeatureDiscovery/          the candidate gate (validate_feature.py) and the audit tools
 8__IntradayFillSim.py      fill realism against 5 minute bars, under broker rules
 backtest_diagnostics.py    trade-book autopsy, imported lazily by 5__
 tools/attic.py             moves dead code to _ATTIC/, reversibly, with a manifest
@@ -52,8 +57,8 @@ client/                    packager for a thin execution client: the broker, the
 6__TickerRelator.py        cross-asset correlation clustering (no caller, kept for reference)
 ```
 
-`.claude/CLASSIFICATION.md` says which of these the live account depends on and which are research or
-diagnostics. Read it before deleting anything.
+Files 1 through 9 are the scheduled path. Everything else is a library the path imports, a screen that
+annotates the pool, or an offline harness. Nothing outside 1 through 9 writes to the live signal files.
 
 ## Nightly run
 
@@ -123,9 +128,10 @@ run without touching any registry or import list.
 
 The underscore prefix carves out the namespace. Double-underscore files are tooling and are never imported
 as blocks. Single-underscore files are either shared helpers (`_marketcap`, `_indexes`, `_fundamentals`,
-`_insider`) or candidate blocks that a production build skips. The working tree currently holds 191
-promoted blocks, 1,667 machine-generated candidates from the feature factory, 92 ports of published
-research, and 10 tooling files. Only gated candidates are tracked in git; the rest is churn.
+`_insider`) or candidate blocks that a production build skips. Locally that comes to 191 promoted blocks,
+1,667 machine-generated candidates from the feature factory, 92 ports of published research, and 10
+tooling files. The ten `_cand_` blocks published here are examples of the format, drawn from the ungated
+pool.
 
 Candidates are gated before promotion rather than after. `FeatureDiscovery/validate_feature.py` runs four
 stages, cheapest and most decisive first: a static leakage scan plus a causality test that recomputes the
@@ -134,7 +140,7 @@ pooled in-sample against out-of-sample IC durability check; a redundancy correla
 feature set; then a verdict of PASS, WEAK or FAIL. For machine-generated code a high IC is usually a leak
 rather than alpha, which is why the causality test runs first.
 
-`FeatureTemplates/__tail_screen.py` measures marginal lift in the top decile, which is the only region the
+The screen that follows the gate measures marginal lift in the top decile, which is the only region the
 strategy trades. Global rank IC rewards features that sort the middle of the book, and the middle of the
 book is never held. A candidate has to survive at least four seeds to move. Single-seed wins are noise, and
 enough of them have been chased here to say that with confidence.
@@ -349,18 +355,6 @@ Most of these are dated because each one is a repair.
 - Alerts that are hard to miss. Console, log file, `BROKER_ALERT.txt`, three beeps, and a non-blocking
   popup, because during the July 2026 incident the first three went unnoticed for four consecutive days.
 
-## Diagnostics
-
-`python diagnostics/run.py` renders one self-contained HTML page per pipeline stage plus an index that
-walks the funnel backwards, from the cash that left the account to the feature templates. It reads files
-already on disk, never launches a stage, and never writes under `Data/`. Pages cover money out, execution
-and slippage, the pool-to-orders funnel, the backtester's gates and ranking, inference, training, and
-feature coverage.
-
-Sections that need a count only a running script can see say so. Setting `DIAG_OUT` and running a stage the
-way the nightly does fills those in; with `DIAG_OUT` unset the hooks are no-ops and the production scripts
-behave identically.
-
 ## Offline research code
 
 `8__IntradayFillSim.py` replays the backtester's chosen trades against 5 minute bars under the live
@@ -396,7 +390,6 @@ Manual invocation:
 .\trading_system.ps1 -Mode morning   # funnel and broker before the open
 .\trading_system.ps1                 # picks a mode from the current hour
 python run_optimal_backtest.py       # sandboxed backtest of the shipped configuration
-python diagnostics/run.py --open     # render and open the diagnostics pages
 ```
 
 ## On the performance numbers

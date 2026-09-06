@@ -1,12 +1,12 @@
 """Download FRED (St. Louis Fed) macroeconomic series via the official API.
 
-Requires a free API key — register once at
+Requires a free API key - register once at
   https://fredaccount.stlouisfed.org/apikey
 then set the env var:
   PowerShell: $env:FRED_API_KEY = 'your_key_here'
   bash:       export FRED_API_KEY='your_key_here'
 The script also reads C:/Users/Masam/Desktop/Stock-Market/.fred_api_key if
-present (single line containing the key) — convenient for refresh runs.
+present (single line containing the key) - convenient for refresh runs.
 
 ~50 macro series covering: Treasury yields, yield curve spreads, credit
 spreads, VIX, Fed Funds, financial conditions, employment, inflation, GDP,
@@ -149,7 +149,7 @@ def fetch(workers: int = 2, force: bool = False) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     api_key = _get_api_key()
     if not api_key:
-        log("FRED_API_KEY not set — skipping FRED fetch.")
+        log("FRED_API_KEY not set - skipping FRED fetch.")
         log("  Register a free key at https://fredaccount.stlouisfed.org/apikey")
         log(f"  Then either set $env:FRED_API_KEY or write the key to {KEY_FILE}")
         return

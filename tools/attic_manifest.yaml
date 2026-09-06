@@ -1,0 +1,236 @@
+# ---------------------------------------------------------------------------
+#  attic_manifest.yaml: the curated evacuation list.
+#
+#  Read by tools/attic.py. Every path here is MOVED to _ATTIC/<bucket>/, never
+#  deleted, and recorded in _ATTIC/MANIFEST.csv so `attic.py restore <path>`
+#  puts it back.
+#
+#  Adding a path here is a decision that it is not part of the running system.
+#  The reason field is the evidence for that decision, so keep it specific enough
+#  that a future reader can check it.
+#
+#  NOT in this file, deliberately:
+#    FeatureTemplates/           1,681 candidate blocks, left in place by choice
+#    experimental/canbuy_flow, _rollback, canbuy_groundup, _backups, tests
+#                               touched since 2026-08-14 and referenced
+#    experimental/backtesters/5v2__NightlyBackTester_CanBuyV2.py
+#                               11 real referencing files
+#    auxiliary/0__ApproximateMarketCaps.py, build_beta_lookup.py,
+#    build_market_state.py      silent producers of parquets live code reads
+#    Data/_backups/ (the dir)   live, written by 7__MacroFilter.py:1003
+#    analysis_output/ (the dir) live, trading_system.ps1:448 writes the drift log
+# ---------------------------------------------------------------------------
+
+steps:
+
+  # =========================================================================
+  - id: "2a"
+    title: "Stale research labs"
+    bucket: research-labs
+    reason: "experimental/ subdir with no .py touched since 2026-08-14"
+    entries:
+      - path: experimental/stable_predictor
+        reason: "12.6 GB, newest .py 2026-08-10; artifacts, not code"
+      - path: experimental/rank_objective_lab
+        reason: "9.6 GB, 1 .py, untouched since 2026-07-21"
+      - path: experimental/retrain_2026_08
+        reason: "8.6 GB, zero .py, pure model output"
+      - path: experimental/walkforward_lake
+        reason: "3.5 GB, 1 .py, newest 2026-08-05"
+      - path: experimental/earnings_distress_eda
+        reason: "1.1 GB, newest .py 2026-08-13; verdict is in memory/"
+      - path: experimental/decay_lab
+        reason: "442 MB; _prun/ is 8 copies of the root pipeline, regenerable from prun.py. Keep _ablation/*.log and _out/ adjacent, they are the only record of the verdict"
+      - path: experimental/signal_eda
+        reason: "279 MB, newest .py 2026-08-02"
+      - path: experimental/overnight_2026_08_10
+        reason: "122 MB, dated lab, newest .py 2026-08-10"
+      - path: experimental/exit_truth
+        reason: "112 MB, newest .py 2026-08-10"
+      - path: experimental/numerology_lab
+        reason: "29 MB, newest .py 2026-07-27"
+      - path: experimental/feature_improve
+        reason: "27 MB, newest .py 2026-08-12"
+      - path: experimental/macrofilter_v2
+        reason: "17 MB, newest .py 2026-08-04"
+      - path: experimental/canbuy_volume_lab
+        reason: "newest .py 2026-08-04"
+      - path: experimental/exit_lab
+        reason: "newest .py 2026-08-04"
+      - path: experimental/bt_profiling
+        reason: "newest .py 2026-08-04"
+      - path: experimental/phonetics_lab
+        reason: "newest .py 2026-07-28"
+      - path: experimental/_parity
+        reason: "newest .py 2026-07-25"
+      - path: experimental/_archive
+        reason: "already self-declared archive, newest .py 2026-08-07"
+
+  # =========================================================================
+  - id: "2b"
+    title: "Loose experimental scripts and unreferenced backtester forks"
+    bucket: research-loose
+    reason: "no caller anywhere in the tree; newest 2026-08-10"
+    entries:
+      - path: experimental/5__NightlyBackTester_asof.py
+        reason: "docstring says SUPERSEDED 2026-07-29, use BT_AS_OF on the root backtester"
+      - path: experimental/5.1__NightlyBackTester.py
+        reason: "7.1k LOC fork, lab defaults, no caller"
+      - path: experimental/5__NightlyBackTester_exitlab.py
+        reason: "5.7k LOC fork, exit-stack lab, no caller"
+      - path: experimental/5__NightlyBackTester_selexp.py
+        reason: "6.5k LOC fork, selection experiments, no caller"
+      - path: experimental/5__NightlyBackTester_selexp2.py
+        reason: "6.6k LOC fork, selection experiments round 2, no caller"
+      - path: experimental/3__AlphaSensitivity.py
+        reason: "retired stage 3, superseded by 3__FeatureFramework.py"
+      - path: experimental/4c__PredictorBrokerTarget.py
+        reason: "predictor variant, broker-target labels, no caller"
+      - path: experimental/2.1_DeepPriceDownloader.py
+      - path: experimental/2.2__TradeHistoryIntradayDownloader.py
+      - path: experimental/2.3__YahooIntradayDownloader.py
+      - path: experimental/2__IntradayHistoricalDownloader.py
+      - path: experimental/8_2__MultiSeedFillPipeline.py
+      - path: experimental/convert_v2_to_f32.py
+        reason: "one-shot float64->float32 converter, already run"
+      - path: experimental/map_pipeline.py
+        reason: "referenced by setup.ps1:333 at the wrong path; that step already warns and skips"
+      - path: experimental/run_bagAB_full.py
+      - path: experimental/run_bagAB_gentle.py
+      - path: experimental/run_fulluniv_AB.py
+        reason: "near-duplicate of run_overnight_gauntlet.py, identical docstring"
+      - path: experimental/run_overnight_gauntlet.py
+      - path: experimental/wait_then_sizer.py
+        reason: "poller for sizer_ab.py, which is gitignored and gone"
+
+  # =========================================================================
+  - id: "2c"
+    title: "Unreferenced backtester forks"
+    bucket: backtester-forks
+    reason: "zero import or subprocess references anywhere; cited only in prose"
+    entries:
+      - path: experimental/backtesters/5c__ComboLab.py
+      - path: experimental/backtesters/5c__NightlyBackTester_CONTROL.py
+      - path: experimental/backtesters/5f__FaithfulBackTester.py
+      - path: experimental/backtesters/5r__FaithfulRanker.py
+      - path: experimental/backtesters/5v3__GapTriggerLab.py
+      - path: experimental/backtesters/5x__IsolatedControl.py
+
+  # =========================================================================
+  - id: "2d"
+    title: "Root _backups (NOT Data/_backups, which is live)"
+    bucket: old-backups
+    reason: "ad-hoc pre-change snapshots, newest 2026-06-22; only mention is a line in an archived doc"
+    entries:
+      - path: _backups
+
+  # =========================================================================
+  - id: "2e"
+    title: "analysis_output scripts and artifacts"
+    bucket: analysis-scripts
+    reason: "hand-written one-off analysis; no import, no subprocess, no ps1 stage"
+    entries:
+      - path: analysis_output/*.py
+      - path: analysis_output/*.ps1
+      - path: analysis_output/edge_trace
+        reason: "426 MB; the 16 .py are a real documented 8-stage pipeline, kept together with their output"
+      - path: analysis_output/live_param_sim
+      - path: analysis_output/reentry_cooldown_referee
+      - path: analysis_output/feature_review
+      - path: analysis_output/parity
+      - path: analysis_output/lens_cross_sectional
+      - path: analysis_output/GRIND
+      - path: analysis_output/final_solution
+      - path: analysis_output/sweeps
+      - path: analysis_output/intraday_fill_eda
+      - path: analysis_output/intraday_fill_eda_pooled
+      - path: analysis_output/gap_gate_referee
+      - path: analysis_output/account_fill_replay
+      - path: analysis_output/_archive_md
+
+  # =========================================================================
+  - id: "2f"
+    title: "Scripts living inside the data lake"
+    bucket: data-scripts
+    reason: "no entry point or ps1 stage reaches these; parquet data left untouched"
+    entries:
+      - path: Data/_overnight_cyber
+        reason: "18 .py, self-contained overnight cluster with its own run_all.py"
+      - path: Data/_sizing_exp
+        reason: "10 .py; 5__NightlyBackTester.py:1398 names bt_sizeexp.py only as provenance for a constant"
+      - path: Data/__visuals
+      - path: Data/_feat_ablation/scripts
+      - path: Data/_meta_target_eda/meta_eda.py
+      - path: Data/_rsilab/pre_v2_backup.py
+      - path: Data/_canbuyv2/seeds/PATCH_wave2.py
+      - path: Data/_backups/*.py
+        reason: "dated .py snapshots inside the otherwise-live Data/_backups; the directory itself stays"
+
+  # =========================================================================
+  - id: "2g"
+    title: "FeatureDiscovery orphans"
+    bucket: discovery-orphans
+    reason: "superseded by the feature-factory skill; validate_feature.py and audit_features.py stay"
+    entries:
+      - path: FeatureDiscovery/_rejected
+        reason: "30 gated-and-rejected blocks, outside FeatureTemplates so the loader can never see them; several already broken by a missing _indexes.py sibling"
+      - path: FeatureDiscovery/sources
+        reason: "14 modules, reachable only from fetch_papers.py"
+      - path: FeatureDiscovery/altsources
+        reason: "10 modules, reachable only from fetch_alt.py"
+      - path: FeatureDiscovery/author_geo
+        reason: "one-off bibliometric study, no inbound refs"
+      - path: FeatureDiscovery/sector_rotation
+      - path: FeatureDiscovery/fetch_papers.py
+      - path: FeatureDiscovery/fetch_alt.py
+      - path: FeatureDiscovery/arxiv_fetch.py
+      - path: FeatureDiscovery/relevance_score.py
+        reason: "rel_score is miscalibrated per memory/project_factory_ledger_meta_2026_08_24.md"
+      - path: FeatureDiscovery/generate_feature.py
+      - path: FeatureDiscovery/5__NightlyBackTester_v2.py
+        reason: "3.9k LOC backtester fork, referenced only in prose"
+
+  # =========================================================================
+  - id: "2h"
+    title: "Orphaned auxiliary rigs and fetchers"
+    bucket: orphan-tools
+    reason: "no import, no subprocess, no ps1 stage, no skill reference"
+    entries:
+      - path: auxiliary/intraday_engine.py
+        reason: "shared library for the four rigs below; moved as one cluster"
+      - path: auxiliary/8_4__LiveParamSim.py
+      - path: auxiliary/account_ordertype_counterfactual.py
+      - path: auxiliary/replay_account_fills.py
+      - path: auxiliary/slot_replay.py
+      - path: auxiliary/8_1__IntradayFillEDA.py
+      - path: auxiliary/8_3__OrderTypeLab.py
+        reason: "cited in a 9_SuperFastBroker.py:204 comment as the rig behind a decision, not called"
+      - path: auxiliary/8b__BookPostmortem.py
+      - path: auxiliary/9b__SuperFastBroker_paper.py
+        reason: "superseded by 9p__PaperTriggerBroker.py"
+      - path: auxiliary/0__AssetCorrolator.py
+      - path: auxiliary/0__EDA_IntradayDownloader.py
+      - path: auxiliary/0__Feeds.py
+      - path: auxiliary/0__RiskCorr.py
+      - path: auxiliary/0__RollingBSScores.py
+      - path: auxiliary/0__RollingCorrelations.py
+      - path: auxiliary/0__WIKI.py
+      - path: auxiliary/Z-NLP.py
+      - path: auxiliary/account_deep_dive.py
+      - path: auxiliary/download_1min_for_scope.py
+      - path: auxiliary/interpret_predictor.py
+      - path: auxiliary/referee_gap_gate.py
+      - path: auxiliary/referee_reentry_cooldown.py
+      - path: auxiliary/scan_dashes.py
+      - path: fetchers/fetch_edgar_access_logs.py
+      - path: fetchers/fetch_sec_dera.py
+      - path: fetchers/fetch_sec_form_indexes.py
+      - path: fetchers/fetch_wikipedia_pageviews.py
+
+  # =========================================================================
+  - id: "2i"
+    title: "Vendored xgboost build"
+    bucket: vendored
+    reason: "never imported; opt-in via PYTHONPATH in two launch scripts that are themselves stale. Rebuild recipe in memory/project_xgb_znver4_build_2026_08_06.md"
+    entries:
+      - path: xgb_znver4

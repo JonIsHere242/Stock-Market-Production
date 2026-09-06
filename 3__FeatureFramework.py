@@ -18,6 +18,9 @@ USAGE
   # List every registered block in execution order, then exit
   python 3__FeatureFramework.py --list
 
+  # Full per-block timing tables and slow-ticker detail (default output is compact)
+  python 3__FeatureFramework.py --all --report full
+
 HOW TO ADD A NEW FEATURE
 ------------------------
   1. Copy FeatureTemplates/__example_template.py to a new file,
@@ -40,12 +43,23 @@ import random
 import statistics
 import sys
 import time
+import warnings
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
-from tqdm import tqdm
+from auxiliary._quiet_progress import tqdm
+
+# Diagnostics sidecars (diagnostics/hooks.py). No-op unless DIAG_OUT is set; only
+# main() calls it, never the pool workers. The stand-in keeps this file independent.
+try:
+    from diagnostics import hooks as _diag
+except Exception:
+    class _diag:
+        enabled = staticmethod(lambda: False)
+        outdir = staticmethod(lambda: None)
+        dump_json = dump_parquet = append_jsonl = stamp = staticmethod(lambda *a, **k: None)
 
 # ---------------------------------------------------------------------------
 # Paths  (all relative to this file so workers in subprocesses find them too)
@@ -76,6 +90,39 @@ _DEFRAG_NBLOCKS = 200
 # made that ~0.09s of pure re-import PER TICKER, and is why helpers like
 # _marketcap.py resort to stashing their panel on the `sys` module to survive.
 _BLOCK_CACHE: dict[bool, dict] = {}
+
+# False inside worker processes. Discovery/dedup warnings are identical in every
+# worker (same block files), and per-ticker block [ERROR] lines are carried back in
+# the timing dict and tallied once by _print_integrity_report -- so with 16-32
+# workers x 4250 tickers, printing them here too is pure duplicate spam.
+_IS_MAIN_PROCESS = True
+
+
+def _warn(msg: str) -> None:
+    if _IS_MAIN_PROCESS:
+        print(msg, file=sys.stderr)
+
+
+def _silence_noisy_warnings() -> None:
+    """
+    Suppress the warning classes that blocks emit BY DESIGN, which otherwise
+    repeat per ticker per worker (a full --all run printed tens of thousands
+    of them, drowning the [FAIL]/[ERROR] lines that matter):
+
+      - pandas PerformanceWarning (fragmentation): blocks insert columns one at
+        a time on purpose; the framework already defragments via _DEFRAG_NBLOCKS.
+      - numpy nan/degenerate-slice RuntimeWarnings: rolling windows are EXPECTED
+        to hit all-NaN and short slices during warm-up rows.
+
+    Real failures still surface -- block exceptions are caught, tallied and
+    printed by _print_integrity_report.
+    """
+    warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
+    for msg in ("Mean of empty slice", "All-NaN slice encountered",
+                "Degrees of freedom <= 0", "invalid value encountered",
+                "divide by zero encountered"):
+        warnings.filterwarnings("ignore", message=f".*{msg}.*",
+                                category=RuntimeWarning)
 
 
 def discover_blocks(include_candidates: bool = False, *, refresh: bool = False) -> dict:
@@ -117,20 +164,18 @@ def discover_blocks(include_candidates: bool = False, *, refresh: bool = False) 
         try:
             spec.loader.exec_module(mod)
         except Exception as exc:
-            print(f"  [WARN] Cannot import {path.name}: {exc}", file=sys.stderr)
+            _warn(f"  [WARN] Cannot import {path.name}: {exc}")
             continue
 
         if not hasattr(mod, "METADATA") or not hasattr(mod, "compute"):
-            print(f"  [WARN] {path.name} missing METADATA or compute() -- skipped",
-                  file=sys.stderr)
+            _warn(f"  [WARN] {path.name} missing METADATA or compute() -- skipped")
             continue
 
         meta = mod.METADATA
         name = meta.get("name", path.stem)
 
         if name in blocks:
-            print(f"  [WARN] Duplicate block name '{name}' in {path.name} -- skipped",
-                  file=sys.stderr)
+            _warn(f"  [WARN] Duplicate block name '{name}' in {path.name} -- skipped")
             continue
 
         blocks[name] = {"meta": meta, "fn": mod.compute, "path": path}
@@ -156,10 +201,9 @@ def resolve_order(blocks: dict) -> list[str]:
     for name, block in blocks.items():
         for col in block["meta"].get("produces", []):
             if col in produced_by:
-                print(
+                _warn(
                     f"  [WARN] Column '{col}' claimed by both "
-                    f"'{produced_by[col]}' and '{name}' -- keeping '{name}'",
-                    file=sys.stderr,
+                    f"'{produced_by[col]}' and '{name}' -- keeping '{name}'"
                 )
             produced_by[col] = name
 
@@ -276,7 +320,7 @@ def run_pipeline_timed(
             keep = [c for c in cols_before if c in df.columns]
             if len(keep) != len(df.columns):
                 df = df[keep]                          # discard partial mutation
-            print(f"  [ERROR] {name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            _warn(f"  [ERROR] {name}: {type(exc).__name__}: {exc}")
             timing["errors"][name] = f"{type(exc).__name__}: {exc}"
             continue
         elapsed = time.perf_counter() - t0
@@ -338,6 +382,10 @@ def _worker_init(exclude: list[str]) -> None:
     Warm-up failures are swallowed: a worker must still start, and any genuine
     problem will resurface (reported properly) on the real run.
     """
+    global _IS_MAIN_PROCESS
+    _IS_MAIN_PROCESS = False   # silence per-worker duplicates of main-process warnings
+    _silence_noisy_warnings()
+
     try:
         blocks = discover_blocks()
     except Exception:
@@ -459,12 +507,14 @@ def _print_ticker_report(
     result:  pd.DataFrame,
     timing:  dict,
     wall_ms: float,
+    full:    bool = False,
 ) -> None:
     """
-    Two-section debug report for --ticker mode.
+    Debug report for --ticker mode.
 
     Section 1  Block run table: name | time | +N cols | first few col names
-    Section 2  Last-row values grouped by the block that produced them
+    Section 2  (--report full only) Last-row values grouped by producing block --
+               one line per output column, several hundred lines on a full build.
     """
     W           = 80
     SEP         = "=" * W
@@ -516,6 +566,10 @@ def _print_ticker_report(
     )
 
     if len(result) == 0:
+        return
+    if not full:
+        print("  (--report full for the last-row value dump)")
+        print()
         return
 
     # ---- section 2: last-row values grouped by block -------------------------
@@ -573,9 +627,17 @@ def _print_timing_report(
     wall_clock_s: float,
     n_workers:    int,
     top_n:        int = 10,
+    full:         bool = False,
 ) -> None:
     """
-    Aggregate per-ticker timing dicts and print two sections:
+    Aggregate per-ticker timing dicts.
+
+    Default (compact): one header plus the top blocks by total cost. A full run
+    has ~190 blocks; printing a row for each, then a slow-ticker table for each,
+    was ~3000 lines of terminal per run -- almost all of it about blocks costing
+    single-digit ms.
+
+    full=True restores both original sections:
 
     SECTION A -- Block summary table
         Block / Calls / Total / Mean / p50 / p95 / Max
@@ -590,7 +652,7 @@ def _print_timing_report(
         print("[timing report] No data collected.")
         return
 
-    W = 85  # report width
+    W = 100  # report width (block names run to ~40 chars)
 
     # ---- Build per-block data structures ------------------------------------
     # block_samples[bname] = [(ms, ticker, n_rows), ...]
@@ -620,6 +682,22 @@ def _print_timing_report(
     block_samples = {b: [e[0] for e in v] for b, v in block_entries.items()}
     serial_equiv_s = sum(sum(ms) / 1_000.0 for ms in block_samples.values())
 
+    # Per-block stats, computed once for both report shapes
+    grand_total_ms = 0.0
+    block_stats: dict[str, tuple] = {}   # name -> (calls, total, mean, p50, p95, max)
+    for bname in order:
+        if bname not in block_samples:
+            continue
+        ms          = sorted(block_samples[bname])
+        calls       = len(ms)
+        total_ms    = sum(ms)
+        grand_total_ms += total_ms
+        mean_ms     = statistics.mean(ms)
+        p50_ms      = statistics.median(ms)
+        idx95       = max(0, int(calls * 0.95) - 1)
+        p95_ms      = ms[idx95] if calls >= 5 else ms[-1]
+        block_stats[bname] = (calls, total_ms, mean_ms, p50_ms, p95_ms, ms[-1])
+
     # =========================================================================
     # SECTION A -- aggregate summary
     # =========================================================================
@@ -632,44 +710,41 @@ def _print_timing_report(
     print(
         f"Wall clock : {wall_clock_s:.1f}s   |   "
         f"Serial equiv : {serial_equiv_s:.1f}s   |   "
-        f"Speedup : {serial_equiv_s / max(wall_clock_s, 0.001):.1f}x"
+        f"Speedup : {serial_equiv_s / max(wall_clock_s, 0.001):.1f}x   |   "
+        f"{n_tickers / max(wall_clock_s, 0.001):.1f} tickers/s"
     )
     print("=" * W)
-    print(f"  {'Block':<28}  {'Calls':>6}  {'Total':>8}  {'Mean':>8}  {'p50':>8}  {'p95':>8}  {'Max':>8}")
+    print(f"  {'Block':<42}  {'Calls':>6}  {'Total':>8}  {'Mean':>8}  {'p50':>8}  {'p95':>8}  {'Max':>8}")
     print("-" * W)
 
-    grand_total_ms = 0.0
-    block_means: dict[str, float] = {}
-    for bname in order:
-        if bname not in block_samples:
-            continue
-        ms          = sorted(block_samples[bname])
-        calls       = len(ms)
-        total_ms    = sum(ms)
-        grand_total_ms += total_ms
-        mean_ms     = statistics.mean(ms)
-        p50_ms      = statistics.median(ms)
-        idx95       = max(0, int(calls * 0.95) - 1)
-        p95_ms      = ms[idx95] if calls >= 5 else ms[-1]
-        max_ms      = ms[-1]
-        block_means[bname] = mean_ms
+    if full:
+        shown = [b for b in order if b in block_stats]
+    else:
+        shown = sorted(block_stats, key=lambda b: -block_stats[b][1])[:top_n]
 
+    for bname in shown:
+        calls, total_ms, mean_ms, p50_ms, p95_ms, max_ms = block_stats[bname]
         print(
-            f"  {bname:<28}  {calls:>6}  {_fmt_ms(total_ms):>8}  "
+            f"  {bname:<42}  {calls:>6}  {_fmt_ms(total_ms):>8}  "
             f"{_fmt_ms(mean_ms):>8}  {_fmt_ms(p50_ms):>8}  "
             f"{_fmt_ms(p95_ms):>8}  {_fmt_ms(max_ms):>8}"
         )
 
+    n_rest = len(block_stats) - len(shown)
+    if n_rest > 0:
+        rest_ms = grand_total_ms - sum(block_stats[b][1] for b in shown)
+        print(f"  {f'... {n_rest} more blocks':<42}  {'':>6}  {_fmt_ms(rest_ms):>8}"
+              f"   (--report full for all)")
+
     print("-" * W)
-    print(f"  {'TOTAL (all blocks)':<28}  {n_tickers:>6}  {_fmt_ms(grand_total_ms):>8}")
-    print(
-        f"  Throughput: {n_tickers / max(wall_clock_s, 0.001):.1f} tickers/s  |  "
-        f"{total_rows / max(wall_clock_s, 0.001):,.0f} rows/s"
-    )
+    print(f"  {'TOTAL (all blocks)':<42}  {n_tickers:>6}  {_fmt_ms(grand_total_ms):>8}")
     print("=" * W)
 
+    if not full:
+        return
+
     # =========================================================================
-    # SECTION B -- slow ticker detail
+    # SECTION B -- slow ticker detail (--report full only)
     # =========================================================================
     print()
     print("=" * W)
@@ -680,7 +755,7 @@ def _print_timing_report(
         if bname not in block_entries:
             continue
         entries = block_entries[bname]
-        mean_ms = block_means.get(bname, 1.0) or 1.0
+        mean_ms = block_stats[bname][2] or 1.0
         # sort descending by ms so slowest is first
         slowest = sorted(entries, key=lambda e: e[0], reverse=True)[:top_n]
 
@@ -775,6 +850,9 @@ def process_all(
             for p in paths
         }
 
+        # _quiet_progress.tqdm never redraws: one plain line per 5% of tickers,
+        # so a full run costs ~20 progress lines whether the output is a live
+        # terminal or a captured nightly log.
         with tqdm(total=len(futures), desc="Features", unit="ticker") as pbar:
             for future in as_completed(futures):
                 success, ticker, timing, err = future.result()
@@ -786,12 +864,49 @@ def process_all(
                     fail += 1
                     tqdm.write(f"  [FAIL] {ticker}: {err}")
 
+                if fail:
+                    pbar.set_postfix(ok=ok, fail=fail)
                 pbar.update(1)
-                pbar.set_description(f"ok={ok} fail={fail}")
 
     print(f"\nCompleted: {ok} ok, {fail} failed, {len(paths)} total")
     _print_integrity_report(all_timings)
     return all_timings
+
+
+def _integrity_summary(timings: list[dict]):
+    """The two tallies _print_integrity_report prints, as data, so the diagnostics
+    sidecar and the printed report cannot disagree."""
+    err_tickers: dict[str, list[str]] = defaultdict(list)
+    err_first:   dict[str, str] = {}
+    for t in timings:
+        for bname, msg in t.get("errors", {}).items():
+            err_tickers[bname].append(t.get("ticker", "?"))
+            err_first.setdefault(bname, msg)
+    schemas: dict[tuple, list[str]] = defaultdict(list)
+    for t in timings:
+        sc = t.get("schema")
+        if sc:
+            schemas[sc].append(t.get("ticker", "?"))
+    return err_tickers, err_first, schemas
+
+
+def _integrity_payload(timings: list[dict]) -> dict:
+    err_tickers, err_first, schemas = _integrity_summary(timings)
+    ranked = sorted(schemas.items(), key=lambda kv: -len(kv[1]))
+    majority = set(ranked[0][0]) if ranked else set()
+    skip_reasons: dict[str, int] = defaultdict(int)
+    for t in timings:
+        for bname in t.get("skipped", []) or []:
+            skip_reasons[str(bname)] += 1
+    return {
+        "errors": {b: {"n": len(tks), "example": tks[0], "first_msg": err_first[b][:200]}
+                   for b, tks in err_tickers.items()},
+        "schemas": [{"n_tickers": len(tks), "n_cols": len(cols), "example": tks[0],
+                     "missing_vs_majority": sorted(majority - set(cols))[:40],
+                     "extra_vs_majority": sorted(set(cols) - majority)[:40]}
+                    for cols, tks in ranked],
+        "skip_reasons": dict(skip_reasons),
+    }
 
 
 def _print_integrity_report(timings: list[dict]) -> None:
@@ -810,12 +925,7 @@ def _print_integrity_report(timings: list[dict]) -> None:
     if not timings:
         return
 
-    err_tickers: dict[str, list[str]] = defaultdict(list)
-    err_first:   dict[str, str] = {}
-    for t in timings:
-        for bname, msg in t.get("errors", {}).items():
-            err_tickers[bname].append(t.get("ticker", "?"))
-            err_first.setdefault(bname, msg)
+    err_tickers, err_first, schemas = _integrity_summary(timings)
 
     if err_tickers:
         n = len(timings)
@@ -826,12 +936,6 @@ def _print_integrity_report(timings: list[dict]) -> None:
         for bname, tks in sorted(err_tickers.items(), key=lambda kv: -len(kv[1])):
             print(f"  {bname:<40} {len(tks):>5}/{n} tickers   e.g. {tks[0]}")
             print(f"  {'':<40} {err_first[bname][:100]}")
-
-    schemas: dict[tuple, list[str]] = defaultdict(list)
-    for t in timings:
-        sc = t.get("schema")
-        if sc:
-            schemas[sc].append(t.get("ticker", "?"))
 
     if len(schemas) > 1:
         ranked = sorted(schemas.items(), key=lambda kv: -len(kv[1]))
@@ -953,6 +1057,7 @@ def _list_blocks() -> None:
 # ===========================================================================
 
 def main() -> None:
+    _silence_noisy_warnings()
     cpu_count = os.cpu_count() or 4
 
     parser = argparse.ArgumentParser(
@@ -978,8 +1083,12 @@ def main() -> None:
     parser.add_argument("--verify_metadata", action="store_true",
                         help="Run one ticker and report blocks whose METADATA['produces'] "
                              "does not match the columns they actually emit, then exit")
+    parser.add_argument("--report",      choices=["compact", "full"], default="compact",
+                        help="Report size. compact (default): top blocks by total cost only. "
+                             "full: every block, slow-ticker detail, last-row dump in --ticker mode.")
     parser.add_argument("--top_n",       type=int, default=10,
-                        help="Slow-ticker detail: how many tickers to show per block (default: 10)")
+                        help="How many blocks (compact) / slow tickers per block (full) to show "
+                             "(default: 10)")
     parser.add_argument("--save_timing", metavar="PATH",
                         help="Save full per-ticker timing matrix to this CSV path")
     args = parser.parse_args()
@@ -1006,11 +1115,15 @@ def main() -> None:
 
         print(f"\nRunning pipeline on {args.ticker} ({len(df):,} rows) ...")
 
+        # Live per-block lines duplicate the block table printed right after, so
+        # they are full-report-only; compact mode prints each block exactly once.
         t_wall = time.perf_counter()
-        result, timing = run_pipeline_timed(df, exclude=args.exclude, verbose=True)
+        result, timing = run_pipeline_timed(df, exclude=args.exclude,
+                                            verbose=(args.report == "full"))
         wall_ms = (time.perf_counter() - t_wall) * 1_000
 
-        _print_ticker_report(args.ticker, result, timing, wall_ms)
+        _print_ticker_report(args.ticker, result, timing, wall_ms,
+                             full=(args.report == "full"))
         return
 
     # ---- batch (parallel) ---------------------------------------------------
@@ -1043,7 +1156,21 @@ def main() -> None:
         all_timing = process_all(paths, out, args.exclude, n_work)
         wall_s     = time.perf_counter() - t0
 
-        _print_timing_report(all_timing, wall_s, n_work, top_n=args.top_n)
+        if _diag.enabled():
+            try:
+                _diag.stamp("3__FeatureFramework")
+                _payload = _integrity_payload(all_timing)
+                _payload.update({"n_paths": len(paths), "n_workers": n_work, "exclude": list(args.exclude or []),
+                                 "wall_s": wall_s, "active_blocks": active_blocks,
+                                 "n_ok": sum(1 for t in all_timing if t), "out_dir": str(out),
+                                 "runpercent": args.runpercent})
+                _diag.dump_json("F_run", _payload)
+                _save_timing_csv(all_timing, os.path.join(_diag.outdir(), "F_timing.csv"))
+            except Exception:
+                pass
+
+        _print_timing_report(all_timing, wall_s, n_work, top_n=args.top_n,
+                             full=(args.report == "full"))
 
         if args.save_timing:
             _save_timing_csv(all_timing, args.save_timing)

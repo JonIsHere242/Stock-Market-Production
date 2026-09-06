@@ -1,4 +1,4 @@
-"""Download SEC submissions.zip — filing metadata for every CIK.
+"""Download SEC submissions.zip - filing metadata for every CIK.
 
 For each filer this contains a JSON list of every form they've filed
 (form type, filing date, accession number, primary document, etc.).
@@ -29,16 +29,16 @@ def fetch(force: bool = False, extract: bool = False, max_age_hours: float = 20.
 
     age = file_age_hours(ZIP_PATH)
     if not force and age < max_age_hours:
-        log(f"submissions.zip is {age:.1f}h old — skipping. Use --force to override.")
+        log(f"submissions.zip is {age:.1f}h old - skipping. Use --force to override.")
     else:
-        log(f"Downloading {URL} → {ZIP_PATH}")
+        log(f"Downloading {URL} -> {ZIP_PATH}")
         session = make_session(host="www.sec.gov", sec=True)
         n = stream_download(session, URL, ZIP_PATH, rate_limited_get=sec_get)
         log(f"  wrote {fmt_bytes(n)}")
 
     if extract:
         EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
-        log(f"Extracting → {EXTRACT_DIR}")
+        log(f"Extracting -> {EXTRACT_DIR}")
         with zipfile.ZipFile(ZIP_PATH) as zf:
             members = zf.namelist()
             log(f"  {len(members):,} JSON files in archive")

@@ -1,10 +1,10 @@
 # =============================================================================
-#  Stock-Market — curated core requirements
+#  Stock-Market - curated core requirements
 # =============================================================================
 #  These are the third-party packages the codebase actually imports, pinned to
 #  the versions currently known-good in the stock_env venv (Python 3.13).
 #
-#  DO NOT `pip install -r` this file by itself for a full setup — two things are
+#  DO NOT `pip install -r` this file by itself for a full setup - two things are
 #  handled separately by setup.ps1 because they are platform-/source-specific:
 #
 #    * torch         -> installed from the correct CPU or CUDA wheel index
@@ -54,11 +54,11 @@ xmltodict==0.14.2
 watchdog==6.0.0
 nest-asyncio==1.6.0
 pyperclip==1.9.0
-pywin32==311                  # win32clipboard — Windows only
+pywin32==311                  # win32clipboard - Windows only
 anthropic==0.75.0             # 7__MacroFilter (LLM macro overlay)
 
 # =============================================================================
-#  Handled by setup.ps1 — listed here for reference only (do not uncomment
+#  Handled by setup.ps1 - listed here for reference only (do not uncomment
 #  unless you know which variant your machine needs):
 #
 #    torch                      # CPU:  --index-url https://download.pytorch.org/whl/cpu
