@@ -36,6 +36,7 @@ HOW TO REMOVE / DISABLE A FEATURE
 import argparse
 import importlib.util
 import os
+import random
 import statistics
 import sys
 import time
@@ -58,12 +59,26 @@ OUT_DIR       = ROOT / "Data" / "ProcessedData_v2"
 # Feature blocks must NEVER overwrite or drop any of these.
 OHLCV_COLS = ["Date", "Ticker", "Open", "High", "Low", "Close", "Volume"]
 
+# Defragment the frame only once pandas' block manager has actually fragmented.
+# Blocks add columns one at a time, so nblocks climbs toward the column count;
+# copying at every block costs more than it saves (measured: 3.23s every-block vs
+# 2.91s with this trigger vs 3.14s never).
+_DEFRAG_NBLOCKS = 200
+
 
 # ===========================================================================
 # SECTION 1 -- Block discovery
 # ===========================================================================
 
-def discover_blocks(include_candidates: bool = False) -> dict:
+# Discovery is memoized per PROCESS. Block modules load via exec_module, which
+# deliberately bypasses sys.modules -- so without this cache every call re-executes
+# all ~190 module bodies. run_pipeline_timed() calls discover once per ticker, which
+# made that ~0.09s of pure re-import PER TICKER, and is why helpers like
+# _marketcap.py resort to stashing their panel on the `sys` module to survive.
+_BLOCK_CACHE: dict[bool, dict] = {}
+
+
+def discover_blocks(include_candidates: bool = False, *, refresh: bool = False) -> dict:
     """
     Import every .py file in FeatureTemplates/ whose name does NOT start with
     an underscore.  Files starting with _ or __ are skipped (they are
@@ -76,12 +91,18 @@ def discover_blocks(include_candidates: bool = False) -> dict:
         ``_indexes``, ...) lack METADATA/compute and are still skipped by the check
         below; double-underscore tooling files are never imported. Default False
         keeps the production build to promoted blocks only.
+    refresh : bypass the per-process cache and re-import from disk. Only tooling that
+        edits block files inside a live session needs this.
 
     Returns
     -------
     dict[str, dict]
         {block_name: {"meta": METADATA dict, "fn": compute fn, "path": Path}}
+        The SAME dict object comes back on repeat calls -- treat it as read-only.
     """
+    if not refresh and include_candidates in _BLOCK_CACHE:
+        return _BLOCK_CACHE[include_candidates]
+
     blocks: dict = {}
 
     for path in sorted(TEMPLATES_DIR.glob("*.py")):
@@ -114,6 +135,7 @@ def discover_blocks(include_candidates: bool = False) -> dict:
 
         blocks[name] = {"meta": meta, "fn": mod.compute, "path": path}
 
+    _BLOCK_CACHE[include_candidates] = blocks
     return blocks
 
 
@@ -213,7 +235,8 @@ def run_pipeline_timed(
         "n_rows":       len(df),
         "total_s":      0.0,
         "blocks":       {},
-        "skipped":      [],
+        "skipped":      [],   # requires not satisfied -- an EXPECTED, benign outcome
+        "errors":       {},   # name -> "ExcType: msg"  -- a BUG; never conflate with skipped
         # extras used by _print_ticker_report
         "order":        order,
         "meta":         {n: {"produces": blocks[n]["meta"].get("produces", []),
@@ -234,20 +257,39 @@ def run_pipeline_timed(
                 print(f"  [skip]  {name:<26}  needs: {', '.join(missing)}")
             continue
 
+        # Blocks assign columns in place (df["x"] = ...), so a mid-compute raise
+        # leaves PARTIAL columns behind and those get written to parquet -- silent
+        # schema drift across tickers. `before = df` would be a mere alias (in-place
+        # writes hit it too), so snapshot the COLUMN LIST and restore that on failure.
+        cols_before = list(df.columns)
         t0 = time.perf_counter()
         try:
             df = block["fn"](df)
             if df.columns.duplicated().any():
                 df = df.loc[:, ~df.columns.duplicated(keep="last")]
-            df = df.copy()   # defragment between blocks
+            # Defragment only once fragmentation has actually built up. Copying after
+            # EVERY block costs more than it saves; the nblocks trigger measured
+            # fastest of the strategies tried (3.23s every-block -> 2.91s here).
+            if getattr(df, "_mgr", None) is not None and df._mgr.nblocks > _DEFRAG_NBLOCKS:
+                df = df.copy()
         except Exception as exc:
-            print(f"  [ERROR] {name}: {exc}", file=sys.stderr)
-            timing["skipped"].append(name)
+            keep = [c for c in cols_before if c in df.columns]
+            if len(keep) != len(df.columns):
+                df = df[keep]                          # discard partial mutation
+            print(f"  [ERROR] {name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            timing["errors"][name] = f"{type(exc).__name__}: {exc}"
             continue
         elapsed = time.perf_counter() - t0
 
         timing["blocks"][name]  = elapsed
         timing["total_s"]      += elapsed
+
+        # The OHLCV contract ("blocks must NEVER overwrite or drop these") was
+        # documented but unenforced. Catch the violation at the block that caused
+        # it rather than discovering a mangled Close downstream.
+        dropped = [c for c in cols_before if c in OHLCV_COLS and c not in df.columns]
+        if dropped:
+            raise RuntimeError(f"block '{name}' dropped protected column(s): {dropped}")
 
         if verbose:
             produces = block["meta"].get("produces", [])
@@ -273,6 +315,77 @@ def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ===========================================================================
 # SECTION 5 -- Worker function  (top-level so ProcessPoolExecutor can pickle it)
 # ===========================================================================
+
+# Shared external-data helpers. Each exposes available(), which forces its panel
+# load; warming them here means the cost is paid once per worker at startup instead
+# of being billed to whichever ticker happens to touch them first.
+_SHARED_HELPERS = ("_indexes", "_marketcap", "_fundamentals", "_insider")
+
+
+def _worker_init(exclude: list[str]) -> None:
+    """
+    Runs ONCE per worker process, before any ticker.
+
+    Two jobs:
+      1. Warm the block-discovery cache so the first ticker doesn't pay the ~4.5s
+         cold import of every block module.
+      2. Warm the shared external panels (market caps, indexes, fundamentals,
+         insider). _marketcap's panel alone takes ~1.7s. Without this it lands on
+         whichever ticker got there first, which is why amihud_size_illiquidity
+         reported 1682ms on one ticker and 6ms on all the others -- a permanent
+         false entry at the top of the SLOW TICKER DETAIL table.
+
+    Warm-up failures are swallowed: a worker must still start, and any genuine
+    problem will resurface (reported properly) on the real run.
+    """
+    try:
+        blocks = discover_blocks()
+    except Exception:
+        return
+
+    # Warm helpers that stash their panel process-globally (e.g. _marketcap on the
+    # `sys` module) -- these are shared by every block instance.
+    for helper in _SHARED_HELPERS:
+        path = TEMPLATES_DIR / f"{helper}.py"
+        if not path.exists():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(helper, path)
+            mod  = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if hasattr(mod, "available"):
+                mod.available()
+        except Exception:
+            pass
+
+    # Helpers that cache per module INSTANCE (e.g. _indexes._FRAME_CACHE) can only be
+    # warmed through the block that owns the instance. Run those blocks once on a
+    # TRUNCATED frame: panel loads are O(1) in rows, so a 150-row slice pays the load
+    # without paying the compute.
+    try:
+        blocks = {k: v for k, v in blocks.items() if k not in set(exclude or [])}
+        seed_paths = sorted(PRICE_DATA_DIR.glob("*.parquet"))
+        if not seed_paths:
+            return
+        df = pd.read_parquet(seed_paths[0])
+        if "Date" not in df.columns and df.index.name == "Date":
+            df = df.reset_index()
+        df = df.head(150)
+
+        for name in resolve_order(blocks):
+            blk = blocks[name]
+            src = blk["path"].read_text(encoding="utf-8", errors="replace")
+            if not any(h in src for h in _SHARED_HELPERS):
+                continue                      # block touches no shared panel
+            if any(r not in df.columns for r in blk["meta"].get("requires", [])):
+                continue
+            try:
+                blk["fn"](df.copy())
+            except Exception:
+                pass                          # warm-up only
+    except Exception:
+        pass
+
 
 def _worker_fn(
     file_path: str,
@@ -308,6 +421,9 @@ def _worker_fn(
         return False, ticker, None, f"write error: {exc}"
 
     timing["ticker"] = ticker
+    # Carry the output schema back so the parent can detect drift across tickers
+    # without re-reading 4250 parquets.
+    timing["schema"] = tuple(result.columns)
     return True, ticker, timing, None
 
 
@@ -355,17 +471,20 @@ def _print_ticker_report(
     order       = timing.get("order", list(timing["blocks"].keys()))
     meta        = timing.get("meta", {})
     skip_reason = timing.get("skip_reasons", {})
+    errors      = timing.get("errors", {})
     n_ran       = len(timing["blocks"])
     n_skip      = len(timing["skipped"])
+    n_err       = len(errors)
     n_feat_cols = result.shape[1] - sum(1 for c in OHLCV_COLS if c in result.columns)
 
     # ---- section 1: block run table ------------------------------------------
     print()
     print(SEP)
+    err_bit = f"  {n_err} ERRORED" if n_err else ""
     print(
         f"  {ticker}  |  {timing['n_rows']:,} rows in  |  "
         f"{result.shape[1]} cols out (+{n_feat_cols} features)  |  "
-        f"{n_ran} ran  {n_skip} skipped"
+        f"{n_ran} ran  {n_skip} skipped{err_bit}"
     )
     print(SEP)
     print(f"  {'Block':<26}  {'Time':>8}  {'Added':>6}  Columns produced")
@@ -384,7 +503,10 @@ def _print_ticker_report(
             )
         else:
             reason     = skip_reason.get(name, [])
-            reason_str = f"needs: {', '.join(reason)}" if reason else "excluded"
+            if name in errors:
+                reason_str = f"ERROR: {errors[name][:60]}"
+            else:
+                reason_str = f"needs: {', '.join(reason)}" if reason else "excluded"
             print(f"  {'[skip] ' + name:<26}  {'':>8}  {'':>6}  {reason_str}")
 
     print("  " + "-" * (W - 2))
@@ -427,7 +549,10 @@ def _print_ticker_report(
     for name in order:
         if name not in timing["blocks"]:
             reason     = skip_reason.get(name, [])
-            reason_str = f"needs: {', '.join(reason)}" if reason else "excluded"
+            if name in errors:
+                reason_str = f"ERROR: {errors[name][:60]}"
+            else:
+                reason_str = f"needs: {', '.join(reason)}" if reason else "excluded"
             print(f"  [skip: {name}]  {reason_str}")
             continue
         produces  = meta.get(name, {}).get("produces", [])
@@ -640,7 +765,11 @@ def process_all(
     ok = fail = 0
     all_timings: list[dict] = []
 
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_worker_init,
+        initargs=(exclude,),
+    ) as executor:
         futures = {
             executor.submit(_worker_fn, str(p), str(out_dir), exclude): p
             for p in paths
@@ -661,12 +790,141 @@ def process_all(
                 pbar.set_description(f"ok={ok} fail={fail}")
 
     print(f"\nCompleted: {ok} ok, {fail} failed, {len(paths)} total")
+    _print_integrity_report(all_timings)
     return all_timings
+
+
+def _print_integrity_report(timings: list[dict]) -> None:
+    """
+    Two things that used to fail silently across a 4250-ticker run:
+
+      BLOCK ERRORS -- a block raising on a subset of tickers printed to a worker's
+      stderr under the tqdm bar and was otherwise indistinguishable from a
+      deliberate --exclude. Here every erroring block is tallied with its ticker
+      count and first message.
+
+      SCHEMA DRIFT -- when a block errors on some tickers and not others, those
+      parquets end up with different column sets. Nothing checked. Downstream that
+      surfaces in 4__Predictor, far from the cause.
+    """
+    if not timings:
+        return
+
+    err_tickers: dict[str, list[str]] = defaultdict(list)
+    err_first:   dict[str, str] = {}
+    for t in timings:
+        for bname, msg in t.get("errors", {}).items():
+            err_tickers[bname].append(t.get("ticker", "?"))
+            err_first.setdefault(bname, msg)
+
+    if err_tickers:
+        n = len(timings)
+        print()
+        print("=" * 85)
+        print(f"BLOCK ERRORS  --  {len(err_tickers)} block(s) raised on at least one ticker")
+        print("=" * 85)
+        for bname, tks in sorted(err_tickers.items(), key=lambda kv: -len(kv[1])):
+            print(f"  {bname:<40} {len(tks):>5}/{n} tickers   e.g. {tks[0]}")
+            print(f"  {'':<40} {err_first[bname][:100]}")
+
+    schemas: dict[tuple, list[str]] = defaultdict(list)
+    for t in timings:
+        sc = t.get("schema")
+        if sc:
+            schemas[sc].append(t.get("ticker", "?"))
+
+    if len(schemas) > 1:
+        ranked = sorted(schemas.items(), key=lambda kv: -len(kv[1]))
+        majority_cols, majority_tks = ranked[0]
+        print()
+        print("=" * 85)
+        print(f"SCHEMA DRIFT  --  {len(schemas)} distinct column sets across {len(timings)} tickers")
+        print("=" * 85)
+        print(f"  majority ({len(majority_tks)} tickers): {len(majority_cols)} columns")
+        for cols, tks in ranked[1:6]:
+            missing = sorted(set(majority_cols) - set(cols))
+            extra   = sorted(set(cols) - set(majority_cols))
+            print(f"  {len(tks):>5} ticker(s) differ ({len(cols)} cols) e.g. {tks[0]}")
+            if missing:
+                print(f"        missing: {', '.join(missing[:8])}{' ...' if len(missing) > 8 else ''}")
+            if extra:
+                print(f"        extra  : {', '.join(extra[:8])}{' ...' if len(extra) > 8 else ''}")
+        print("  -> downstream concat/predict will see ragged columns. Fix the erroring block above.")
+    elif schemas:
+        print(f"Schema: uniform across all {len(timings)} tickers "
+              f"({len(next(iter(schemas)))} columns).")
 
 
 # ===========================================================================
 # SECTION 8 -- CLI helpers
 # ===========================================================================
+
+def _verify_metadata(ticker: str | None, exclude: list[str]) -> None:
+    """
+    Compare each block's declared METADATA["produces"] against the columns it
+    actually emits, on one real ticker.
+
+    Why this matters beyond tidiness: __tail_screen.py builds its feature list from
+    `produces`, so a column that is declared but never emitted silently drops out of
+    the screen -- the feature looks like it was tested when it never was. The reverse
+    (emitted but undeclared) means a column nothing will ever screen.
+    """
+    ticker = ticker or "AAPL"
+    path = PRICE_DATA_DIR / f"{ticker}.parquet"
+    if not path.exists():
+        candidates = sorted(PRICE_DATA_DIR.glob("*.parquet"))
+        if not candidates:
+            sys.exit(f"No parquets in {PRICE_DATA_DIR}")
+        path = candidates[0]
+        ticker = path.stem
+
+    df = pd.read_parquet(path)
+    if "Date" not in df.columns and df.index.name == "Date":
+        df = df.reset_index()
+
+    blocks = {k: v for k, v in discover_blocks().items() if k not in set(exclude or [])}
+    order  = resolve_order(blocks)
+
+    print(f"\nVerifying METADATA against actual output on {ticker} ({len(df):,} rows)\n")
+    ghost: dict[str, list[str]] = {}
+    undeclared: dict[str, list[str]] = {}
+
+    for name in order:
+        blk = blocks[name]
+        if any(r not in df.columns for r in blk["meta"].get("requires", [])):
+            continue
+        cols_before = set(df.columns)
+        try:
+            out = blk["fn"](df.copy())
+        except Exception as exc:
+            print(f"  [ERROR] {name}: {type(exc).__name__}: {exc}")
+            continue
+        emitted  = set(out.columns) - cols_before
+        declared = set(blk["meta"].get("produces", []))
+        if declared - emitted:
+            ghost[name] = sorted(declared - emitted)
+        if emitted - declared:
+            undeclared[name] = sorted(emitted - declared)
+        df = out
+
+    w = 85
+    print("=" * w)
+    print(f"DECLARED BUT NEVER EMITTED  --  {sum(len(v) for v in ghost.values())} column(s) "
+          f"across {len(ghost)} block(s)")
+    print("=" * w)
+    for name, cols in sorted(ghost.items()):
+        print(f"  {name:<34} {', '.join(cols)}")
+    print()
+    print("=" * w)
+    print(f"EMITTED BUT NOT DECLARED  --  {sum(len(v) for v in undeclared.values())} column(s) "
+          f"across {len(undeclared)} block(s)")
+    print("=" * w)
+    for name, cols in sorted(undeclared.items()):
+        print(f"  {name:<34} {', '.join(cols[:8])}{' ...' if len(cols) > 8 else ''}")
+    if not ghost and not undeclared:
+        print("\nAll blocks: METADATA matches emitted columns exactly.")
+    print()
+
 
 def _list_blocks() -> None:
     """Print every registered block in dependency-resolved execution order."""
@@ -713,7 +971,13 @@ def main() -> None:
     parser.add_argument("--workers",      type=int, default=min(32, cpu_count),
                         help=f"Parallel worker processes (default: {min(32, cpu_count)})")
     parser.add_argument("--runpercent",  type=int, default=100,
-                        help="Percentage of tickers to process in --all mode (default: 100)")
+                        help="Percentage of tickers to process in --all mode (default: 100). "
+                             "Taken as a seeded RANDOM sample, not an alphabetical prefix.")
+    parser.add_argument("--sample_seed", type=int, default=42,
+                        help="Seed for --runpercent ticker sampling (default: 42)")
+    parser.add_argument("--verify_metadata", action="store_true",
+                        help="Run one ticker and report blocks whose METADATA['produces'] "
+                             "does not match the columns they actually emit, then exit")
     parser.add_argument("--top_n",       type=int, default=10,
                         help="Slow-ticker detail: how many tickers to show per block (default: 10)")
     parser.add_argument("--save_timing", metavar="PATH",
@@ -723,6 +987,11 @@ def main() -> None:
     # ---- list ---------------------------------------------------------------
     if args.list:
         _list_blocks()
+        return
+
+    # ---- metadata verification ----------------------------------------------
+    if args.verify_metadata:
+        _verify_metadata(args.ticker, args.exclude)
         return
 
     # ---- single ticker (in-process, live timing) ----------------------------
@@ -750,14 +1019,24 @@ def main() -> None:
         if not all_paths:
             sys.exit(f"No parquets found in {PRICE_DATA_DIR}")
 
-        n      = max(1, int(len(all_paths) * args.runpercent / 100))
-        paths  = all_paths[:n]
+        n = max(1, int(len(all_paths) * args.runpercent / 100))
+        if n >= len(all_paths):
+            paths = all_paths
+        else:
+            # A prefix slice (all_paths[:n]) gives you tickers A-B, not a 10% sample.
+            # Every screening tool in FeatureTemplates/ uses a seeded random sample;
+            # match that so partial runs are representative and reproducible.
+            paths = sorted(random.Random(args.sample_seed).sample(all_paths, n))
+            print(f"Sampling {n}/{len(all_paths)} tickers (seed {args.sample_seed})")
         n_work = min(args.workers, len(paths))
         out    = Path(args.out_dir)
 
         active_blocks = [b for b in discover_blocks() if b not in args.exclude]
         print(f"FeatureFramework  --  {len(paths)} tickers | {n_work} workers | -> {out}")
-        print(f"Active blocks ({len(active_blocks)}): {active_blocks}")
+        excluded = [b for b in args.exclude] if args.exclude else []
+        print(f"Active blocks: {len(active_blocks)}"
+              + (f"  |  excluded: {', '.join(excluded)}" if excluded else "")
+              + "   (--list for the full roster)")
         print()
 
         t0         = time.perf_counter()

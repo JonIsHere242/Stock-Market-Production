@@ -169,6 +169,36 @@ def _rule() -> None:
     print("  " + _c("-" * (W - 4), DIM))
 
 
+# ---------------------------------------------------------------------------
+# Scoring primitives come from __common.py -- ONE definition, shared with
+# __tail_screen. (The ANSI helpers above are deliberately NOT shared: this file
+# uses full escape sequences while __common uses bare SGR parameters, so they are
+# not interchangeable and unifying them would only churn output formatting.)
+#
+# COMPARABILITY WARNING: this tool's add_context() builds gates/interaction
+# partners, and its neut_* transforms residualize against _vol_z / _trend /
+# _dvol_z. __tail_screen builds a different context and residualizes against its
+# NEUT_FACTORS (_ret1, _ret5, _volabs, _logprice, _logdvol). A `neut` lift from
+# this tool is NOT comparable to a `neut` lift from that one.
+# ---------------------------------------------------------------------------
+_cspec = importlib.util.spec_from_file_location(
+    "__common", Path(__file__).resolve().parent / "__common.py")
+_common = importlib.util.module_from_spec(_cspec)
+_cspec.loader.exec_module(_common)
+
+compute_ic = _common.compute_ic
+_within_z  = _common.within_z
+
+
+def _xs_neutralize(panel, col, factor):
+    """Per-day residual of `col` regressed on `factor` (see __common.xs_neutralize).
+
+    Wrapped to return a Series on panel.index: __common returns a bare ndarray and
+    this tool's transform registry expects panel-aligned Series.
+    """
+    return pd.Series(_common.xs_neutralize(panel, col, factor), index=panel.index)
+
+
 # ===========================================================================
 # SECTION 1 -- Panel loading + context signals
 # ===========================================================================
@@ -270,19 +300,6 @@ def add_context(panel: pd.DataFrame) -> pd.DataFrame:
     return panel
 
 
-def _within_z(panel: pd.DataFrame, series: pd.Series, win: int) -> pd.Series:
-    """Within-ticker rolling z-score of an arbitrary series aligned to panel."""
-    tmp = series.copy()
-    grp = panel["Ticker"]
-    mean = tmp.groupby(grp).transform(lambda s: s.rolling(win, min_periods=max(10, win // 4)).mean())
-    std = tmp.groupby(grp).transform(lambda s: s.rolling(win, min_periods=max(10, win // 4)).std())
-    return (tmp - mean) / std.replace(0, np.nan)
-
-
-# ===========================================================================
-# SECTION 2 -- Transform registry  (ONLY reordering transforms live here)
-# ===========================================================================
-
 def _ts_roll_z(panel, col, w):
     return _within_z(panel, panel[col], w)
 
@@ -362,31 +379,6 @@ def _xfeat(panel, col, partner, op):
     if op == "mul":
         return panel[col] * panel[partner]
     return panel[col] / panel[partner].replace(0, np.nan)
-
-
-def _xs_neutralize(panel, col, factor):
-    """WorldQuant `vector_neut`: per-day residual of feature regressed on `factor`.
-
-    Isolates the part of the feature ORTHOGONAL to a risk factor (e.g. trend) --
-    i.e. the edge that ISN'T just that factor. This is the direct antidote when
-    the battery shows a transform's lift is really the context's own edge.
-    NON-monotone, cross-sectional -> reorders, real new info for a tree.
-    """
-    f = panel[col].to_numpy(dtype=float)
-    x = panel[factor].to_numpy(dtype=float)
-    out = np.full(len(panel), np.nan)
-    codes, _ = pd.factorize(panel["Date"].to_numpy())
-    for g in np.unique(codes):
-        idx = np.where(codes == g)[0]
-        ff, xx = f[idx], x[idx]
-        m = np.isfinite(ff) & np.isfinite(xx)
-        if m.sum() < 10:
-            continue
-        xc = xx[m] - xx[m].mean()
-        denom = float((xc * xc).sum())
-        beta = float((xc * (ff[m] - ff[m].mean())).sum()) / denom if denom > 0 else 0.0
-        out[idx] = ff - (ff[m].mean() + beta * (xx - xx[m].mean()))
-    return pd.Series(out, index=panel.index)
 
 
 def _grp_rank(panel, col, group_factor, n_buckets=5):
@@ -604,24 +596,6 @@ try:
     _HAVE_SCIPY = True
 except ImportError:
     _HAVE_SCIPY = False
-
-
-def compute_ic(values: pd.Series, fwd: np.ndarray) -> float:
-    """Pooled Spearman IC of a transform's values vs next-day log-return."""
-    v = values.to_numpy(dtype=float)
-    m = np.isfinite(v) & np.isfinite(fwd)
-    if m.sum() < 100:
-        return np.nan
-    if _HAVE_SCIPY:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            corr, _ = _scipy_stats.spearmanr(v[m], fwd[m])
-        return float(corr) if np.isfinite(corr) else np.nan
-    # fallback: pearson on ranks
-    a = pd.Series(v[m]).rank().to_numpy()
-    b = pd.Series(fwd[m]).rank().to_numpy()
-    c = np.corrcoef(a, b)[0, 1]
-    return float(c) if np.isfinite(c) else np.nan
 
 
 def compute_tail_lift(

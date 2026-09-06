@@ -175,48 +175,22 @@ def crosscheck_feature(panel: pd.DataFrame, col: str, trades: pd.DataFrame,
 # ---------------------------------------------------------------------------
 # panel construction (reuse the tail-screen builder if available)
 # ---------------------------------------------------------------------------
-def _load_block(name):
-    spec = importlib.util.spec_from_file_location(name, HERE / f"{name}.py")
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    return m
+_cspec = importlib.util.spec_from_file_location("__common", HERE / "__common.py")
+_common = importlib.util.module_from_spec(_cspec)
+_cspec.loader.exec_module(_common)
+
+_load_block = _common.load_block
 
 
 def build_panel(n, seed, blocks):
-    paths = sorted(PRICE_DIR.glob("*.parquet"))
-    rng = random.Random(seed)
-    sample = rng.sample(paths, min(n, len(paths)))
-    mods, feat_cols, family = [], [], {}
-    for b in blocks:
-        try:
-            m = _load_block(b)
-        except Exception as exc:
-            print(f"  [skip block {b}: {exc}]")
-            continue
-        mods.append((b, m))
-        for col in m.METADATA["produces"]:
-            feat_cols.append(col)
-            family[col] = b
-    base = ["Date", "Ticker", "Open", "High", "Low", "Close", "Volume"]
-    frames = []
-    for p in sample:
-        try:
-            df = pd.read_parquet(p)
-        except Exception:
-            continue
-        if "Ticker" not in df.columns:
-            df["Ticker"] = p.stem
-        df = df.sort_values("Date").reset_index(drop=True)
-        for _b, m in mods:
-            try:
-                df = m.compute(df)
-            except Exception:
-                pass
-        keep = base + [c for c in feat_cols if c in df.columns]
-        frames.append(df[keep])
-    panel = pd.concat(frames, ignore_index=True)
-    panel["Date"] = pd.to_datetime(panel["Date"])
-    return panel, feat_cols, family
+    """Dependency-correct panel build -- see __common.build_panel.
+
+    This file used to carry a byte-for-byte copy of the broken version (no
+    resolve_order, no requires check, `except Exception: pass`), so any block
+    with a dependency silently contributed nothing and read as 'no edge'.
+    sort_panel=False preserves this tool's original row order.
+    """
+    return _common.build_panel(n, seed, blocks, price_dir=PRICE_DIR, sort_panel=False)
 
 
 def _c(t, code):
